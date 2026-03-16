@@ -160,7 +160,17 @@ async def extract_global_parameters(
 
         parsed = json.loads(content)
         gp = parsed.get("global_parameters", {})
-        reasoning = parsed.get("reasoning_log", [])
+        raw_reasoning = parsed.get("reasoning_log", [])
+        # Normalize: LLM may return list of dicts like {"Step 1": "..."} instead of strings
+        reasoning = []
+        for entry in raw_reasoning:
+            if isinstance(entry, str):
+                reasoning.append(entry)
+            elif isinstance(entry, dict):
+                for k, v in entry.items():
+                    reasoning.append(f"{k}: {v}")
+            else:
+                reasoning.append(str(entry))
 
         return (
             GlobalParameters(
