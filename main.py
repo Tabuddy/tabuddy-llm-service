@@ -1,0 +1,145 @@
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
+import asyncio
+import logging
+import time
+
+from normalizer import normalize_skills
+from resume_parser import extract_text
+from resume_zoner import zone_resume
+from candidate_extractor import extract_candidate_details
+from nlp_filter import filter_blocks
+from block_tagger import tag_all_blocks
+from global_parameter_extractor import extract_global_parameters
+from meta_tag_extractor import extract_context_meta_tags
+from aggregator import aggregate
+from models import ResumeTaggingResponse
+
+logger = logging.getLogger(__name__)
+
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI(
+    title="TABuddy – Resume Meta-Tagging Service",
+    description="Contextual resume parsing, skill extraction, and global parameter tagging for HR tech.",
+    version="0.3.0",
+)
+
+templates = Jinja2Templates(directory="templates")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+# ── Skill Normalization models (existing) ──
+class SkillsRequest(BaseModel):
+    skills: list[str] = Field(..., min_length=1, max_length=500)
+
+
+class NormalizedSkillItem(BaseModel):
+    original: str
+    normalized: str
+    method: str  # dictionary | fuzzy | llm | unmatched
+    confidence: float
+
+
+class SkillsResponse(BaseModel):
+    normalized_skills: list[str]
+    details: list[NormalizedSkillItem]
+
+
+# ── Existing: Skill normalization endpoint ──
+@app.post("/normalize-skills", response_model=SkillsResponse)
+async def normalize_skills_endpoint(req: SkillsRequest):
+    results = await normalize_skills(req.skills)
+    return SkillsResponse(
+        normalized_skills=[r.normalized for r in results],
+        details=[
+            NormalizedSkillItem(
+                original=r.original,
+                normalized=r.normalized,
+                method=r.method,
+                confidence=r.confidence,
+            )
+            for r in results
+        ],
+    )
+
+
+# ── NEW: Resume upload & contextual meta-tagging endpoint ──
+@app.post("/parse-resume", response_model=ResumeTaggingResponse)
+async def parse_resume_endpoint(file: UploadFile = File(...)):
+    """Full resume parsing pipeline:
+
+    1. Parse file → raw text (PDF/DOCX/TXT)
+    2. Extract candidate details (name, email, phone, LinkedIn, GitHub)
+    3. Zone resume into blocks (Header, Summary, Experience_0..N, Project_0..N,
+       Skills_Dump, Education) — experience & project sections sub-split
+       into per-role/per-project blocks using date patterns
+    4. NLP Filter: POS-tag Summary; reclassify as Skills_Dump if verb_count < 3
+    5. Block Tagging: Single LLM call extracts per-block:
+       - Skills with action_verb, context, co_dependent_skills, metrics
+       - Experience details: company, role, duration, achievements, quantifiers, tech
+       - Project details: name, description, tech_stack, quantifiers, highlights
+    6. Global Parameter Extraction: 7 taxonomy parameters via LLM
+    7. Context Meta-Tag Extraction: Builds summary/experience/project meta-tags,
+       categorizes skills, generates resume strength signals
+    8. Aggregate into final JSON with trajectory-based global_skill_index
+    """
+    # Step 1: Parse
+    t0 = time.perf_counter()
+    raw_text = await extract_text(file)
+    logger.info("Step 1 (parse) took %.2fs", time.perf_counter() - t0)
+
+    # Step 2 + 3: Candidate details & Zone resume (both need only raw_text)
+    t1 = time.perf_counter()
+    candidate = extract_candidate_details(raw_text)
+    blocks = zone_resume(raw_text)
+    logger.info("Steps 2+3 (candidate+zone) took %.2fs",
+                time.perf_counter() - t1)
+
+    # Step 4: NLP Filter
+    t2 = time.perf_counter()
+    blocks = filter_blocks(blocks)
+    logger.info("Step 4 (NLP filter) took %.2fs", time.perf_counter() - t2)
+
+    # Steps 5+6+7 PARALLEL:
+    #   Chain A: tag_all_blocks → extract_context_meta_tags (step 5 → step 7)
+    #   Chain B: extract_global_parameters (step 6)
+    # Step 7 starts as soon as step 5 finishes, while step 6 may still run.
+    t3 = time.perf_counter()
+
+    async def _tag_and_build_meta(blks):
+        t5 = time.perf_counter()
+        br = await tag_all_blocks(blks)
+        logger.info("  Step 5 (block tagging) took %.2fs",
+                    time.perf_counter() - t5)
+        t7 = time.perf_counter()
+        cmt = await extract_context_meta_tags(br)
+        logger.info("  Step 7 (meta-tags) took %.2fs",
+                    time.perf_counter() - t7)
+        return br, cmt
+
+    (block_results, context_meta_tags), (global_params, reasoning_log) = (
+        await asyncio.gather(
+            _tag_and_build_meta(blocks),
+            extract_global_parameters(blocks),
+        )
+    )
+    logger.info("Steps 5+6+7 (parallel) took %.2fs", time.perf_counter() - t3)
+
+    # Step 8: Aggregate
+    response = aggregate(
+        candidate, block_results, global_params,
+        context_meta_tags, reasoning_log,
+    )
+    logger.info("Total pipeline took %.2fs", time.perf_counter() - t0)
+
+    return response
