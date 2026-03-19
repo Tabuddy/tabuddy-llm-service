@@ -20,6 +20,13 @@ class ResumeBlock(BaseModel):
     block_type: str  # summary | experience | project | skills_dump | education | other
 
 
+# ── Zoned block preview (for debugging: what text went into each block before LLM) ──
+class ZonedBlockPreview(BaseModel):
+    block_name: str
+    block_type: str
+    raw_text: str
+
+
 # ── Skill Trace (per-occurrence in a block) ──
 class SkillTrace(BaseModel):
     provenance: str  # block_name it came from
@@ -147,3 +154,6 @@ class ResumeTaggingResponse(BaseModel):
     blocks: list[BlockTagResult]
     global_parameters: GlobalParameters
     reasoning_log: list[str] = []
+    # Debug: parsed text from file and zoned blocks (to verify parsing/zoning vs LLM)
+    parsed_text: str = ""
+    zoned_blocks_preview: list[ZonedBlockPreview] = []

@@ -442,6 +442,28 @@
       color: var(--primary);
     }
 
+    /* Parsed text (debug) */
+    .section-hint { font-size: 0.75rem; color: var(--text-dim); font-weight: normal; margin-left: 0.5rem; }
+    .parsed-intro { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 0.75rem; }
+    .parsed-pre, .zoned-block-text {
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 0.8rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 20rem;
+      overflow-y: auto;
+      color: var(--text);
+    }
+    .zoned-heading { margin: 1rem 0 0.5rem; font-size: 0.95rem; }
+    .zoned-block { margin-bottom: 1rem; }
+    .zoned-block-header { font-weight: 600; margin-bottom: 0.25rem; font-size: 0.9rem; }
+    .zoned-block .zoned-block-text { max-height: 12rem; }
+
     /* Raw JSON toggle */
     .json-toggle {
       background: var(--surface2);
@@ -638,6 +660,22 @@
           <span class="chevron">▾</span>
         </div>
         <div class="section-body" id="logBody"></div>
+      </div>
+
+      <!-- Parsed text (debug: what was extracted from the file / sent to LLM) -->
+      <div class="section collapsed" id="sec-parsed">
+        <div class="section-header" onclick="toggleSection('sec-parsed')">
+          <span class="icon">📄</span>
+          <h2>Parsed text</h2>
+          <span class="section-hint">Check if parsing/zoning contains everything</span>
+          <span class="chevron">▾</span>
+        </div>
+        <div class="section-body">
+          <p class="parsed-intro">Full text extracted from the file (parsing). Below: text per zoned block that was sent to the LLM (zoning).</p>
+          <div class="parsed-full" id="parsedTextBody"></div>
+          <h4 class="zoned-heading">Zoned blocks (input to LLM)</h4>
+          <div id="zonedBlocksBody"></div>
+        </div>
       </div>
 
       <!-- Raw JSON -->
@@ -961,6 +999,22 @@
       logHtml += '</ul>';
       if (!log.length) logHtml = '<p style="color:var(--text-dim)">No reasoning log entries.</p>';
       document.getElementById('logBody').innerHTML = logHtml;
+
+      // Parsed text (full text from file + zoned blocks preview)
+      const parsedText = data.parsed_text || '';
+      document.getElementById('parsedTextBody').innerHTML = parsedText
+        ? '<pre class="parsed-pre">' + esc(parsedText) + '</pre>'
+        : '<p style="color:var(--text-dim)">No parsed text.</p>';
+      const zonedBlocks = data.zoned_blocks_preview || [];
+      let zonedHtml = '';
+      zonedBlocks.forEach(z => {
+        zonedHtml += '<div class="zoned-block">';
+        zonedHtml += '<div class="zoned-block-header"><span class="block-type-badge ' + esc(z.block_type) + '">' + esc(z.block_type) + '</span> ' + esc(z.block_name) + '</div>';
+        zonedHtml += '<pre class="zoned-block-text">' + esc(z.raw_text) + '</pre>';
+        zonedHtml += '</div>';
+      });
+      if (!zonedHtml) zonedHtml = '<p style="color:var(--text-dim)">No zoned blocks.</p>';
+      document.getElementById('zonedBlocksBody').innerHTML = zonedHtml;
 
       // Raw JSON
       document.getElementById('rawJsonContent').textContent = JSON.stringify(data, null, 2);

@@ -16,6 +16,7 @@ from models import (
     GlobalSkillEntry,
     SkillTrace,
     ResumeTaggingResponse,
+    ZonedBlockPreview,
 )
 
 
@@ -69,8 +70,20 @@ def aggregate(
     global_params: GlobalParameters,
     context_meta_tags: ContextMetaTags,
     reasoning_log: list[str],
+    parsed_text: str = "",
+    zoned_blocks: list | None = None,
 ) -> ResumeTaggingResponse:
     """Assemble the final response."""
+    zoned_preview = []
+    if zoned_blocks:
+        zoned_preview = [
+            ZonedBlockPreview(
+                block_name=b.block_name,
+                block_type=b.block_type,
+                raw_text=b.raw_text,
+            )
+            for b in zoned_blocks
+        ]
     return ResumeTaggingResponse(
         candidate=candidate,
         context_meta_tags=context_meta_tags,
@@ -78,4 +91,6 @@ def aggregate(
         blocks=block_results,
         global_parameters=global_params,
         reasoning_log=reasoning_log,
+        parsed_text=parsed_text,
+        zoned_blocks_preview=zoned_preview,
     )

@@ -135,10 +135,12 @@ async def parse_resume_endpoint(file: UploadFile = File(...)):
     )
     logger.info("Steps 5+6+7 (parallel) took %.2fs", time.perf_counter() - t3)
 
-    # Step 8: Aggregate
+    # Step 8: Aggregate (include parsed text and zoned blocks for frontend debug)
     response = aggregate(
         candidate, block_results, global_params,
         context_meta_tags, reasoning_log,
+        parsed_text=raw_text,
+        zoned_blocks=blocks,
     )
     logger.info("Total pipeline took %.2fs", time.perf_counter() - t0)
 
