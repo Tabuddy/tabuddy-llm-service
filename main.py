@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 import asyncio
 import logging
 import time
+import tempfile
+from pathlib import Path
 
 from normalizer import normalize_skills
 from resume_parser import extract_text
@@ -17,6 +19,8 @@ from global_parameter_extractor import extract_global_parameters
 from meta_tag_extractor import extract_context_meta_tags
 from aggregator import aggregate
 from models import ResumeTaggingResponse
+from docling_api import docling_router
+from hybrid_block_builder import build_hybrid_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,8 @@ app = FastAPI(
     description="Contextual resume parsing, skill extraction, and global parameter tagging for HR tech.",
     version="0.3.0",
 )
+
+app.include_router(docling_router)
 
 templates = Jinja2Templates(directory="templates")
 
@@ -135,11 +141,103 @@ async def parse_resume_endpoint(file: UploadFile = File(...)):
     )
     logger.info("Steps 5+6+7 (parallel) took %.2fs", time.perf_counter() - t3)
 
-    # Step 8: Aggregate
+    # Step 8: Aggregate (include parsed text and zoned blocks for frontend debug)
     response = aggregate(
         candidate, block_results, global_params,
         context_meta_tags, reasoning_log,
+        parsed_text=raw_text,
+        zoned_blocks=blocks,
     )
     logger.info("Total pipeline took %.2fs", time.perf_counter() - t0)
 
+    return response
+
+
+@app.post("/parse-resume-hybrid", response_model=ResumeTaggingResponse)
+async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
+    """Hybrid pipeline:
+    - normal parser text + docling markdown in parallel
+    - one LLM call builds blocks compatible with the existing pipeline
+    - then reuse the same downstream workflow as /parse-resume
+    """
+    t0 = time.perf_counter()
+
+    # We need bytes for both parsers, so read once.
+    raw_bytes = await file.read()
+    filename = (file.filename or "upload").lower()
+
+    # Run both parsers concurrently to save time:
+    # - normal parser -> raw_text
+    # - docling -> docling_markdown
+    #
+    # These are CPU-heavy/sync operations, so we run them in threads.
+    from resume_parser import _parse_docx, _parse_pdf
+
+    def _normal_parse() -> str:
+        if filename.endswith(".pdf"):
+            return _parse_pdf(raw_bytes)
+        if filename.endswith(".docx") or filename.endswith(".doc"):
+            return _parse_docx(raw_bytes)
+        # txt and fallback
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    def _docling_parse() -> str:
+        try:
+            from docling.document_converter import DocumentConverter
+
+            # Write to temp so Docling can infer format.
+            suffix = Path(filename).suffix or ".pdf"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                converter = DocumentConverter()
+                result = converter.convert(tmp_path)
+                return result.document.export_to_markdown()
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("Docling conversion failed in hybrid flow: %s", e)
+            return ""
+
+    raw_text, docling_markdown = await asyncio.gather(
+        asyncio.to_thread(_normal_parse),
+        asyncio.to_thread(_docling_parse),
+    )
+
+    # Candidate + zoning downstream uses raw_text.
+    candidate = extract_candidate_details(raw_text)
+
+    # Build blocks via LLM using both texts (fallback inside builder if needed).
+    blocks = await build_hybrid_blocks(
+        raw_text,
+        docling_markdown,
+    )
+
+    # Same deterministic filter + tagging/meta/global flow as default.
+    blocks = filter_blocks(blocks)
+
+    async def _tag_and_build_meta(blks):
+        br = await tag_all_blocks(blks)
+        cmt = await extract_context_meta_tags(br)
+        return br, cmt
+
+    (block_results, context_meta_tags), (global_params, reasoning_log) = (
+        await asyncio.gather(
+            _tag_and_build_meta(blocks),
+            extract_global_parameters(blocks),
+        )
+    )
+
+    response = aggregate(
+        candidate,
+        block_results,
+        global_params,
+        context_meta_tags,
+        reasoning_log,
+        parsed_text=raw_text,
+        zoned_blocks=blocks,
+    )
+
+    logger.info("Hybrid pipeline total took %.2fs", time.perf_counter() - t0)
     return response

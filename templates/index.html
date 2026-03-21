@@ -80,6 +80,29 @@
     .upload-btn:hover { background: #5b4bd5; transform: translateY(-1px); }
     .upload-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
     .file-name { color: var(--accent); margin-top: 0.8rem; font-size: 0.9rem; }
+    .parser-select-wrap {
+      margin-top: 1rem;
+      display: flex;
+      gap: 0.75rem;
+      justify-content: center;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .parser-select-label {
+      color: var(--text-dim);
+      font-size: 0.85rem;
+    }
+    select#parserSelect {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem 0.8rem;
+      font-size: 0.9rem;
+      outline: none;
+      cursor: pointer;
+    }
+    select#parserSelect:focus { border-color: rgba(108,92,231,0.65); }
 
     /* Loading */
     .loading {
@@ -442,6 +465,28 @@
       color: var(--primary);
     }
 
+    /* Parsed text (debug) */
+    .section-hint { font-size: 0.75rem; color: var(--text-dim); font-weight: normal; margin-left: 0.5rem; }
+    .parsed-intro { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 0.75rem; }
+    .parsed-pre, .zoned-block-text {
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 0.8rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 20rem;
+      overflow-y: auto;
+      color: var(--text);
+    }
+    .zoned-heading { margin: 1rem 0 0.5rem; font-size: 0.95rem; }
+    .zoned-block { margin-bottom: 1rem; }
+    .zoned-block-header { font-weight: 600; margin-bottom: 0.25rem; font-size: 0.9rem; }
+    .zoned-block .zoned-block-text { max-height: 12rem; }
+
     /* Raw JSON toggle */
     .json-toggle {
       background: var(--surface2);
@@ -519,6 +564,14 @@
       <input type="file" id="fileInput" accept=".pdf,.docx,.doc,.txt">
       <button class="upload-btn" id="browseBtn">Choose File</button>
       <div class="file-name" id="fileName"></div>
+      <div class="parser-select-wrap">
+        <div class="parser-select-label">Parser:</div>
+        <select id="parserSelect">
+          <option value="default" selected>Default parser</option>
+          <option value="docling">Docling markdown only</option>
+          <option value="hybrid">Hybrid (Normal + Docling) parser</option>
+        </select>
+      </div>
     </div>
 
     <!-- Error -->
@@ -640,6 +693,22 @@
         <div class="section-body" id="logBody"></div>
       </div>
 
+      <!-- Parsed text (debug: what was extracted from the file / sent to LLM) -->
+      <div class="section collapsed" id="sec-parsed">
+        <div class="section-header" onclick="toggleSection('sec-parsed')">
+          <span class="icon">📄</span>
+          <h2>Parsed text</h2>
+          <span class="section-hint">Check if parsing/zoning contains everything</span>
+          <span class="chevron">▾</span>
+        </div>
+        <div class="section-body">
+          <p class="parsed-intro">Full text extracted from the file (parsing). Below: text per zoned block that was sent to the LLM (zoning).</p>
+          <div class="parsed-full" id="parsedTextBody"></div>
+          <h4 class="zoned-heading">Zoned blocks (input to LLM)</h4>
+          <div id="zonedBlocksBody"></div>
+        </div>
+      </div>
+
       <!-- Raw JSON -->
       <button class="json-toggle" onclick="toggleJson()">Toggle Raw JSON Output</button>
       <div class="raw-json" id="rawJson">
@@ -657,6 +726,7 @@
     const results = document.getElementById('results');
     const errorMsg = document.getElementById('errorMsg');
     const elapsedEl = document.getElementById('elapsed');
+    const parserSelect = document.getElementById('parserSelect');
     let elapsedTimer = null;
 
     browseBtn.addEventListener('click', () => fileInput.click());
@@ -689,6 +759,7 @@
       results.classList.remove('active');
       loading.classList.add('active');
       browseBtn.disabled = true;
+      parserSelect.disabled = true;
 
       let seconds = 0;
       elapsedEl.textContent = '0s';
@@ -701,7 +772,12 @@
       form.append('file', file);
 
       try {
-        const resp = await fetch('/parse-resume', { method: 'POST', body: form });
+        const parser = parserSelect.value;
+        const endpoint =
+          parser === 'docling' ? '/docling/convert'
+          : (parser === 'hybrid' ? '/parse-resume-hybrid' : '/parse-resume');
+
+        const resp = await fetch(endpoint, { method: 'POST', body: form });
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
           throw new Error(err.detail || resp.statusText);
@@ -709,7 +785,11 @@
         const data = await resp.json();
         clearInterval(elapsedTimer);
         loading.classList.remove('active');
-        renderResults(data, seconds);
+        if (endpoint === '/docling/convert') {
+          renderDoclingResults(data, seconds);
+        } else {
+          renderResults(data, seconds);
+        }
       } catch (e) {
         clearInterval(elapsedTimer);
         loading.classList.remove('active');
@@ -717,6 +797,7 @@
         errorMsg.classList.add('active');
       } finally {
         browseBtn.disabled = false;
+        parserSelect.disabled = false;
       }
     }
 
@@ -962,7 +1043,59 @@
       if (!log.length) logHtml = '<p style="color:var(--text-dim)">No reasoning log entries.</p>';
       document.getElementById('logBody').innerHTML = logHtml;
 
+      // Parsed text (full text from file + zoned blocks preview)
+      const parsedText = data.parsed_text || '';
+      document.getElementById('parsedTextBody').innerHTML = parsedText
+        ? '<pre class="parsed-pre">' + esc(parsedText) + '</pre>'
+        : '<p style="color:var(--text-dim)">No parsed text.</p>';
+      const zonedBlocks = data.zoned_blocks_preview || [];
+      let zonedHtml = '';
+      zonedBlocks.forEach(z => {
+        zonedHtml += '<div class="zoned-block">';
+        zonedHtml += '<div class="zoned-block-header"><span class="block-type-badge ' + esc(z.block_type) + '">' + esc(z.block_type) + '</span> ' + esc(z.block_name) + '</div>';
+        zonedHtml += '<pre class="zoned-block-text">' + esc(z.raw_text) + '</pre>';
+        zonedHtml += '</div>';
+      });
+      if (!zonedHtml) zonedHtml = '<p style="color:var(--text-dim)">No zoned blocks.</p>';
+      document.getElementById('zonedBlocksBody').innerHTML = zonedHtml;
+
       // Raw JSON
+      document.getElementById('rawJsonContent').textContent = JSON.stringify(data, null, 2);
+
+      results.classList.add('active');
+      results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function renderDoclingResults(data, elapsed) {
+      document.getElementById('pipelineTime').innerHTML =
+        'Docling conversion completed in <strong>' + elapsed + 's</strong>';
+
+      // Clear other sections (Docling parser returns only markdown).
+      document.getElementById('candidateBody').innerHTML =
+        '<p style="color:var(--text-dim);font-style:italic">Docling parser output only (no candidate meta-tags).</p>';
+      document.getElementById('signalsBody').innerHTML = '';
+      document.getElementById('signalCount').textContent = '0';
+      document.getElementById('summaryBody').innerHTML = '';
+      document.getElementById('experienceBody').innerHTML = '';
+      document.getElementById('expCount').textContent = '0';
+      document.getElementById('projectsBody').innerHTML = '';
+      document.getElementById('projCount').textContent = '0';
+      document.getElementById('skillsBody').innerHTML = '';
+      document.getElementById('gsiBody').innerHTML = '';
+      document.getElementById('gsiCount').textContent = '0';
+      document.getElementById('paramsBody').innerHTML = '';
+      document.getElementById('blocksBody').innerHTML = '';
+      document.getElementById('blockCount').textContent = '0';
+      document.getElementById('logBody').innerHTML = '';
+
+      const md = data.markdown || '';
+      document.getElementById('parsedTextBody').innerHTML = md
+        ? '<pre class="parsed-pre">' + esc(md) + '</pre>'
+        : '<p style="color:var(--text-dim)">No Docling markdown returned.</p>';
+
+      document.getElementById('zonedBlocksBody').innerHTML =
+        '<p style="color:var(--text-dim);font-style:italic">zoned blocks not available for Docling parser.</p>';
+
       document.getElementById('rawJsonContent').textContent = JSON.stringify(data, null, 2);
 
       results.classList.add('active');

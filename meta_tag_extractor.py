@@ -26,7 +26,7 @@ from models import (
 logger = logging.getLogger(__name__)
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
-_AZURE_DEPLOYMENT = "o4-mini"
+_AZURE_DEPLOYMENT = "gpt-4o-mini"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 _client: AsyncAzureOpenAI | None = None
@@ -160,6 +160,26 @@ def _build_experience_tags(
     for br in block_results:
         if br.block_type == "experience" and br.experience_detail:
             ed = br.experience_detail
+
+            # If the LLM didn't return key_achievements for this role but we have
+            # skills with rich contexts for this block, synthesize achievements
+            # from those contexts so the UI can display bullet points.
+            if not ed.key_achievements:
+                contexts: list[str] = []
+                seen_ctx: set[str] = set()
+                for s in br.skills:
+                    ctx = (s.context or "").strip()
+                    if not ctx or ctx == "Listed in skills section":
+                        continue
+                    if ctx.lower() in seen_ctx:
+                        continue
+                    seen_ctx.add(ctx.lower())
+                    contexts.append(ctx)
+                    if len(contexts) >= 6:
+                        break
+                if contexts:
+                    ed.key_achievements = contexts
+
             timeline.append(ed)
             all_quantifiers.extend(ed.quantifiers)
             all_tech.extend(ed.tech_stack)
