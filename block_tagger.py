@@ -24,7 +24,7 @@ from models import (
 logger = logging.getLogger(__name__)
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
-_AZURE_DEPLOYMENT = "o4-mini"
+_AZURE_DEPLOYMENT = "gpt-4o-mini"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 _client: AsyncAzureOpenAI | None = None
