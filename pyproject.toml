@@ -15,5 +15,21 @@ dependencies = [
     "python-docx>=1.1.0",
     "spacy>=3.7.0",
     "jinja2>=3.1.6",
+    # Direct pins so uv applies [tool.uv.sources] (transitive-only torch stays on PyPI/CUDA on Linux).
+    "torch>=2.10.0,<2.11",
+    "torchvision>=0.25.0,<0.26",
     "docling>=2.80.0",
+    # Lets Docling/RapidOCR use ONNX instead of torch for OCR when available (lower RAM peak).
+    "onnxruntime>=1.20.0",
 ]
+
+# CPU-only PyTorch on all platforms — same as Docker; no nvidia-* wheels.
+# See: https://docs.astral.sh/uv/guides/integration/pytorch/
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]

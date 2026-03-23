@@ -80,8 +80,6 @@ async def convert_file(file: UploadFile = File(...)):
             detail=f"Docling is not available. Install with: pip install docling. Import error: {_DOC_IMPORT_ERROR}",
         )
 
-    from docling.document_converter import DocumentConverter
-
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Empty file.")
@@ -93,8 +91,15 @@ async def convert_file(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        converter = DocumentConverter()
-        result = converter.convert(tmp_path)
+        from docling_client import convert_path_best_effort
+
+        result = convert_path_best_effort(tmp_path)
+        if result is None or result.document is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Docling could not convert this document (out of memory or unsupported layout). "
+                "Try a smaller PDF, export as PDF from Word, or use /parse-resume without hybrid.",
+            )
 
         doc = result.document
         markdown = None
@@ -351,6 +356,8 @@ async def convert_file(file: UploadFile = File(...)):
             markdown = doc.export_to_markdown()
 
         return ConvertResponse(markdown=markdown, filename=file.filename or "upload")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=422,
