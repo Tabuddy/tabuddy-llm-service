@@ -183,7 +183,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
 
     def _docling_parse() -> str:
         try:
-            from docling.document_converter import DocumentConverter
+            from docling_client import convert_path_to_markdown
 
             # Write to temp so Docling can infer format.
             suffix = Path(filename).suffix or ".pdf"
@@ -191,9 +191,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
                 tmp.write(raw_bytes)
                 tmp_path = tmp.name
             try:
-                converter = DocumentConverter()
-                result = converter.convert(tmp_path)
-                return result.document.export_to_markdown()
+                return convert_path_to_markdown(tmp_path)
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
         except Exception as e:

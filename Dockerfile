@@ -4,10 +4,24 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
-# Install spacy model dependency (needs build tools for some packages)
+# This service should stay CPU-only.
+ENV CUDA_VISIBLE_DEVICES=""
+
+# Docling's PDF preprocessing may require XCB/X11 libs even on CPU.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ && \
-    rm -rf /var/lib/apt/lists/*
+    gcc g++ \
+    # Docling/PDF preprocessing sometimes relies on OpenGL (libGL.so.1)
+    libgl1 \
+    # ONNX Runtime often needs OpenMP runtime
+    libgomp1 \
+    # Common runtime deps for GL/X11 stacks used by docling preprocess
+    libglib2.0-0 \
+    libxcb1 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libfontconfig1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files first for layer caching
 COPY pyproject.toml uv.lock .python-version ./
