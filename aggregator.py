@@ -17,6 +17,7 @@ from models import (
     SkillTrace,
     ResumeTaggingResponse,
     ZonedBlockPreview,
+    ExtractedLink,
 )
 
 
@@ -72,6 +73,7 @@ def aggregate(
     reasoning_log: list[str],
     parsed_text: str = "",
     zoned_blocks: list | None = None,
+    extracted_links: list[ExtractedLink] | None = None,
 ) -> ResumeTaggingResponse:
     """Assemble the final response."""
     zoned_preview = []
@@ -86,6 +88,7 @@ def aggregate(
         ]
     return ResumeTaggingResponse(
         candidate=candidate,
+        extracted_links=extracted_links or [],
         context_meta_tags=context_meta_tags,
         global_skill_index=build_global_skill_index(block_results),
         blocks=block_results,
