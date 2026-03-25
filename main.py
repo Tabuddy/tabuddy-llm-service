@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from normalizer import normalize_skills
-from resume_parser import extract_text
+from resume_parser import extract_text, extract_pdf_links
 from resume_zoner import zone_resume
 from candidate_extractor import extract_candidate_details
 from nlp_filter import filter_blocks
@@ -61,6 +61,25 @@ class SkillsResponse(BaseModel):
     details: list[NormalizedSkillItem]
 
 
+class PdfLinkItem(BaseModel):
+    uri: str
+    page: int
+    anchor_text: str | None = None
+    title: str | None = None
+    x0: float | None = None
+    y0: float | None = None
+    x1: float | None = None
+    y1: float | None = None
+    top: float | None = None
+    bottom: float | None = None
+    width: float | None = None
+    height: float | None = None
+
+
+class PdfLinksResponse(BaseModel):
+    links: list[PdfLinkItem]
+
+
 # ── Existing: Skill normalization endpoint ──
 @app.post("/normalize-skills", response_model=SkillsResponse)
 async def normalize_skills_endpoint(req: SkillsRequest):
@@ -77,6 +96,23 @@ async def normalize_skills_endpoint(req: SkillsRequest):
             for r in results
         ],
     )
+
+
+@app.post("/extract-pdf-links", response_model=PdfLinksResponse)
+async def extract_pdf_links_endpoint(file: UploadFile = File(...)):
+    """Return hyperlink targets (URI annotations) from a PDF upload."""
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported for link extraction.",
+        )
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file.")
+
+    links = await asyncio.to_thread(extract_pdf_links, raw)
+    return PdfLinksResponse(links=[PdfLinkItem(**item) for item in links])
 
 
 # ── NEW: Resume upload & contextual meta-tagging endpoint ──
@@ -169,6 +205,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
     # Run both parsers concurrently to save time:
     # - normal parser -> raw_text
     # - docling -> docling_markdown
+    # - pdf links -> extracted_links (pdf only)
     #
     # These are CPU-heavy/sync operations, so we run them in threads.
     from resume_parser import _parse_docx, _parse_pdf
@@ -198,10 +235,18 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
             logger.warning("Docling conversion failed in hybrid flow: %s", e)
             return ""
 
-    raw_text, docling_markdown = await asyncio.gather(
+    parse_tasks = [
         asyncio.to_thread(_normal_parse),
         asyncio.to_thread(_docling_parse),
-    )
+    ]
+    wants_pdf_links = filename.endswith(".pdf")
+    if wants_pdf_links:
+        parse_tasks.append(asyncio.to_thread(extract_pdf_links, raw_bytes))
+
+    parse_results = await asyncio.gather(*parse_tasks)
+    raw_text = parse_results[0]
+    docling_markdown = parse_results[1]
+    extracted_links = parse_results[2] if wants_pdf_links else []
 
     # Candidate + zoning downstream uses raw_text.
     candidate = extract_candidate_details(raw_text)
@@ -235,6 +280,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
         reasoning_log,
         parsed_text=raw_text,
         zoned_blocks=blocks,
+        extracted_links=extracted_links,
     )
 
     logger.info("Hybrid pipeline total took %.2fs", time.perf_counter() - t0)

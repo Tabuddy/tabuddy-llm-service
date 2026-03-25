@@ -598,6 +598,17 @@
         <div class="section-body" id="candidateBody"></div>
       </div>
 
+      <!-- Extracted Links -->
+      <div class="section" id="sec-links">
+        <div class="section-header" onclick="toggleSection('sec-links')">
+          <span class="icon">🔗</span>
+          <h2>Extracted Links</h2>
+          <span class="badge" id="linksCount"></span>
+          <span class="chevron">▾</span>
+        </div>
+        <div class="section-body" id="linksBody"></div>
+      </div>
+
       <!-- Strength Signals -->
       <div class="section" id="sec-signals">
         <div class="section-header" onclick="toggleSection('sec-signals')">
@@ -829,6 +840,34 @@
       if (c.github_url) candHtml += candidateItem('GitHub', '<a href="' + esc(c.github_url) + '" target="_blank">' + esc(c.github_url) + '</a>');
       candHtml += '</div>';
       document.getElementById('candidateBody').innerHTML = candHtml;
+
+      // Extracted Links
+      const links = Array.isArray(data.extracted_links) ? data.extracted_links : [];
+      document.getElementById('linksCount').textContent = links.length + ' links';
+      let linksHtml = '';
+      if (!links.length) {
+        linksHtml = '<p style="color:var(--text-dim);font-style:italic">No extracted links found.</p>';
+      } else {
+        linksHtml = '<div class="candidate-grid">';
+        links.forEach(l => {
+          const uri = l.uri || '';
+          const anchorText = l.anchor_text || l.title || '';
+          const uriText = (typeof uri === 'string' && uri.toLowerCase().startsWith('mailto:'))
+            ? uri.slice('mailto:'.length)
+            : uri;
+          const labelText = anchorText || uriText || 'Link';
+          const safeUri = esc(uri);
+          const safeLabel = esc(labelText);
+          const safeUriText = esc(uriText);
+          const isMail = (typeof uri === 'string') && uri.toLowerCase().startsWith('mailto:');
+          const valueHtml = uri
+            ? '<a href="' + safeUri + '"' + (isMail ? '' : ' target="_blank" rel="noreferrer"') + '>' + safeUriText + '</a>'
+            : '<span style="color:var(--text-dim)">(no uri)</span>';
+          linksHtml += candidateItem(safeLabel, valueHtml);
+        });
+        linksHtml += '</div>';
+      }
+      document.getElementById('linksBody').innerHTML = linksHtml;
 
       // Strength Signals
       const meta = data.context_meta_tags || {};
@@ -1073,6 +1112,8 @@
       // Clear other sections (Docling parser returns only markdown).
       document.getElementById('candidateBody').innerHTML =
         '<p style="color:var(--text-dim);font-style:italic">Docling parser output only (no candidate meta-tags).</p>';
+      document.getElementById('linksBody').innerHTML = '';
+      document.getElementById('linksCount').textContent = '0 links';
       document.getElementById('signalsBody').innerHTML = '';
       document.getElementById('signalCount').textContent = '0';
       document.getElementById('summaryBody').innerHTML = '';

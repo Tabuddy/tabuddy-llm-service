@@ -146,9 +146,25 @@ class GlobalSkillEntry(BaseModel):
     traces: list[SkillTrace]
 
 
+class ExtractedLink(BaseModel):
+    uri: str
+    page: int
+    anchor_text: str | None = None
+    title: str | None = None
+    x0: float | None = None
+    y0: float | None = None
+    x1: float | None = None
+    y1: float | None = None
+    top: float | None = None
+    bottom: float | None = None
+    width: float | None = None
+    height: float | None = None
+
+
 # ── Final Aggregated Output ──
 class ResumeTaggingResponse(BaseModel):
     candidate: CandidateDetails
+    extracted_links: list[ExtractedLink] = []
     context_meta_tags: ContextMetaTags
     global_skill_index: list[GlobalSkillEntry]
     blocks: list[BlockTagResult]
