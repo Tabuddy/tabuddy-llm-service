@@ -18,7 +18,13 @@ from block_tagger import tag_all_blocks
 from global_parameter_extractor import extract_global_parameters
 from meta_tag_extractor import extract_context_meta_tags
 from aggregator import aggregate
-from models import ResumeTaggingResponse
+from models import (
+    ResumeTaggingResponse,
+    HybridParseStage1Response,
+    ZonedBlockPreview,
+    ExtractedLink,
+    ResumeBlock,
+)
 from docling_api import docling_router
 from hybrid_block_builder import build_hybrid_blocks
 
@@ -284,4 +290,126 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
     )
 
     logger.info("Hybrid pipeline total took %.2fs", time.perf_counter() - t0)
+    return response
+
+
+@app.post("/parse-resume-hybrid-stage1", response_model=HybridParseStage1Response)
+async def parse_resume_hybrid_stage1_endpoint(file: UploadFile = File(...)):
+    """Stage 1 of hybrid flow: parse + extracted links + hybrid blocks.
+
+    Returns the same content your UI shows in Parsed Text / Zoned Blocks,
+    without running downstream tagging/meta/global extraction.
+    """
+    t0 = time.perf_counter()
+    raw_bytes = await file.read()
+    filename = (file.filename or "upload").lower()
+
+    from resume_parser import _parse_docx, _parse_pdf
+
+    def _normal_parse() -> str:
+        if filename.endswith(".pdf"):
+            return _parse_pdf(raw_bytes)
+        if filename.endswith(".docx") or filename.endswith(".doc"):
+            return _parse_docx(raw_bytes)
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    def _docling_parse() -> str:
+        try:
+            from docling_client import convert_path_to_markdown
+
+            suffix = Path(filename).suffix or ".pdf"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                return convert_path_to_markdown(tmp_path)
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("Docling conversion failed in hybrid stage1: %s", e)
+            return ""
+
+    parse_tasks = [
+        asyncio.to_thread(_normal_parse),
+        asyncio.to_thread(_docling_parse),
+    ]
+    wants_pdf_links = filename.endswith(".pdf")
+    if wants_pdf_links:
+        parse_tasks.append(asyncio.to_thread(extract_pdf_links, raw_bytes))
+
+    parse_results = await asyncio.gather(*parse_tasks)
+    raw_text = parse_results[0]
+    docling_markdown = parse_results[1]
+    extracted_links_raw = parse_results[2] if wants_pdf_links else []
+
+    candidate = extract_candidate_details(raw_text)
+    blocks = await build_hybrid_blocks(raw_text, docling_markdown)
+
+    zoned_preview = [
+        ZonedBlockPreview(
+            block_name=b.block_name,
+            block_type=b.block_type,
+            raw_text=b.raw_text,
+        )
+        for b in (blocks or [])
+    ]
+
+    resp = HybridParseStage1Response(
+        candidate=candidate,
+        extracted_links=[ExtractedLink(**x) for x in extracted_links_raw],
+        parsed_text=raw_text,
+        zoned_blocks_preview=zoned_preview,
+    )
+    logger.info("Hybrid stage1 total took %.2fs", time.perf_counter() - t0)
+    return resp
+
+
+@app.post("/parse-resume-hybrid-stage2", response_model=ResumeTaggingResponse)
+async def parse_resume_hybrid_stage2_endpoint(
+    payload: HybridParseStage1Response,
+):
+    """Stage 2 of hybrid flow: run the downstream pipeline after blocks are built.
+
+    Input payload should be exactly the response from:
+    - `/parse-resume-hybrid-stage1`
+    """
+    t0 = time.perf_counter()
+
+    # Rebuild the internal ResumeBlock objects from the stage1 preview.
+    stage1_blocks: list[ResumeBlock] = [
+        ResumeBlock(
+            block_name=z.block_name,
+            block_type=z.block_type,
+            raw_text=z.raw_text,
+        )
+        for z in (payload.zoned_blocks_preview or [])
+    ]
+
+    # Deterministic filter (may reclassify "summary" -> "skills_dump")
+    blocks = filter_blocks(stage1_blocks)
+
+    async def _tag_and_build_meta(blks):
+        br = await tag_all_blocks(blks)
+        cmt = await extract_context_meta_tags(br)
+        return br, cmt
+
+    (block_results, context_meta_tags), (global_params, reasoning_log) = (
+        await asyncio.gather(
+            _tag_and_build_meta(blocks),
+            extract_global_parameters(blocks),
+        )
+    )
+
+    response = aggregate(
+        payload.candidate,
+        block_results,
+        global_params,
+        context_meta_tags,
+        reasoning_log,
+        parsed_text=payload.parsed_text,
+        zoned_blocks=stage1_blocks,  # keep stage1 preview in UI/debug
+        extracted_links=payload.extracted_links,
+    )
+
+    logger.info("Hybrid stage2 total took %.2fs", time.perf_counter() - t0)
     return response

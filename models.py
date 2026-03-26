@@ -161,6 +161,13 @@ class ExtractedLink(BaseModel):
     height: float | None = None
 
 
+class HybridParseStage1Response(BaseModel):
+    candidate: CandidateDetails
+    extracted_links: list[ExtractedLink] = []
+    parsed_text: str = ""
+    zoned_blocks_preview: list[ZonedBlockPreview] = []
+
+
 # ── Final Aggregated Output ──
 class ResumeTaggingResponse(BaseModel):
     candidate: CandidateDetails
