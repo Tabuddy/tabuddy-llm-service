@@ -111,6 +111,98 @@ Return ONLY the following JSON structure. Do not use ```json markdown.
 """
 
 
+def _normalize_reasoning_log(raw_reasoning: list) -> list[str]:
+    reasoning: list[str] = []
+    for entry in raw_reasoning:
+        if isinstance(entry, str):
+            reasoning.append(entry)
+        elif isinstance(entry, dict):
+            for k, v in entry.items():
+                reasoning.append(f"{k}: {v}")
+        else:
+            reasoning.append(str(entry))
+    return reasoning
+
+
+def _normalize_scale_anchors(items: object) -> list[ScaleAnchor]:
+    out: list[ScaleAnchor] = []
+    bad_count = 0
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if isinstance(item, dict):
+            try:
+                out.append(
+                    ScaleAnchor(
+                        extracted_metric=str(item.get("extracted_metric", "")).strip(),
+                        extracted_unit=str(item.get("extracted_unit", "")).strip(),
+                        provenance=str(item.get("provenance", "Unknown")).strip(),
+                        raw_evidence=str(item.get("raw_evidence", "")).strip(),
+                    )
+                )
+            except Exception:
+                bad_count += 1
+        elif isinstance(item, str):
+            s = item.strip()
+            if s:
+                out.append(
+                    ScaleAnchor(
+                        extracted_metric=s,
+                        extracted_unit="Unknown",
+                        provenance="Unknown",
+                        raw_evidence=s,
+                    )
+                )
+            else:
+                bad_count += 1
+        else:
+            bad_count += 1
+    if bad_count:
+        logger.warning("Global params: dropped/coerced %d invalid scale_anchors items", bad_count)
+    return out
+
+
+def _normalize_enum_items(field_name: str, items: object) -> list[EnumExtraction]:
+    out: list[EnumExtraction] = []
+    bad_count = 0
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if isinstance(item, dict):
+            normalized_value = str(item.get("normalized_value", "")).strip()
+            if not normalized_value:
+                bad_count += 1
+                continue
+            out.append(
+                EnumExtraction(
+                    normalized_value=normalized_value,
+                    provenance=str(item.get("provenance", "Unknown")).strip(),
+                    raw_evidence=str(item.get("raw_evidence", normalized_value)).strip(),
+                )
+            )
+        elif isinstance(item, str):
+            s = item.strip()
+            if not s:
+                bad_count += 1
+                continue
+            out.append(
+                EnumExtraction(
+                    normalized_value=s,
+                    provenance="Unknown",
+                    raw_evidence=s,
+                )
+            )
+        else:
+            bad_count += 1
+    if bad_count:
+        logger.warning(
+            "Global params: dropped/coerced %d invalid %s items",
+            bad_count,
+            field_name,
+        )
+    return out
+
+
 async def extract_global_parameters(
     blocks: list[ResumeBlock],
 ) -> tuple[GlobalParameters, list[str]]:
@@ -161,39 +253,29 @@ async def extract_global_parameters(
         parsed = json.loads(content)
         gp = parsed.get("global_parameters", {})
         raw_reasoning = parsed.get("reasoning_log", [])
-        # Normalize: LLM may return list of dicts like {"Step 1": "..."} instead of strings
-        reasoning = []
-        for entry in raw_reasoning:
-            if isinstance(entry, str):
-                reasoning.append(entry)
-            elif isinstance(entry, dict):
-                for k, v in entry.items():
-                    reasoning.append(f"{k}: {v}")
-            else:
-                reasoning.append(str(entry))
+        reasoning = _normalize_reasoning_log(raw_reasoning)
 
         return (
             GlobalParameters(
-                scale_anchors=[ScaleAnchor(**a)
-                               for a in gp.get("scale_anchors", [])],
-                codebase_lifecycle=[
-                    EnumExtraction(**e) for e in gp.get("codebase_lifecycle", [])
-                ],
-                product_domain=[
-                    EnumExtraction(**e) for e in gp.get("product_domain", [])
-                ],
-                architectural_paradigm=[
-                    EnumExtraction(**e) for e in gp.get("architectural_paradigm", [])
-                ],
-                compliance_exposure=[
-                    EnumExtraction(**e) for e in gp.get("compliance_exposure", [])
-                ],
-                leadership_footprint=[
-                    EnumExtraction(**e) for e in gp.get("leadership_footprint", [])
-                ],
-                cross_functional_area=[
-                    EnumExtraction(**e) for e in gp.get("cross_functional_area", [])
-                ],
+                scale_anchors=_normalize_scale_anchors(gp.get("scale_anchors", [])),
+                codebase_lifecycle=_normalize_enum_items(
+                    "codebase_lifecycle", gp.get("codebase_lifecycle", [])
+                ),
+                product_domain=_normalize_enum_items(
+                    "product_domain", gp.get("product_domain", [])
+                ),
+                architectural_paradigm=_normalize_enum_items(
+                    "architectural_paradigm", gp.get("architectural_paradigm", [])
+                ),
+                compliance_exposure=_normalize_enum_items(
+                    "compliance_exposure", gp.get("compliance_exposure", [])
+                ),
+                leadership_footprint=_normalize_enum_items(
+                    "leadership_footprint", gp.get("leadership_footprint", [])
+                ),
+                cross_functional_area=_normalize_enum_items(
+                    "cross_functional_area", gp.get("cross_functional_area", [])
+                ),
             ),
             reasoning,
         )

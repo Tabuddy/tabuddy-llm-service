@@ -12,7 +12,7 @@ from resume_zoner import zone_resume
 logger = logging.getLogger(__name__)
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
-_AZURE_DEPLOYMENT = "gpt-5-mini"
+_AZURE_DEPLOYMENT = "gpt-4o-mini"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 _BLOCK_BUILDER_SYSTEM_PROMPT = """\
