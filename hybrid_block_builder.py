@@ -35,7 +35,12 @@ Hard rules:
    - docling_markdown: Docling markdown for layout-aware hints
 4) Do not invent content. Only copy/paraphrase small portions from the inputs.
 5) Prefer accurate boundaries: identify section headings (Summary, Experience, Projects, Skills, Education).
-6) Exclude section headings from `raw_text` when possible. `raw_text` should start with the first meaningful content line under the heading.
+6) Exclude top-level section headings (e.g. "EXPERIENCE", "WORK EXPERIENCE") from `raw_text` when possible.
+7) CRITICAL for `block_type="experience"`: each experience `raw_text` MUST begin with the **verbatim** job header from the inputs before any narrative bullets:
+   - Line 1: job title and date range as written (often contains "|", "–", or month names).
+   - Line 2 (if present in source): company name and location line.
+   Only after those lines, include responsibilities / bullet paragraphs.
+   Never start an experience block with mid-role prose (e.g. "Working as a lead...") if the title+company lines exist above it in `normal_text` or `docling_markdown`.
 
 Naming conventions (for consistency with the existing pipeline):
 - Header/intro content before the first known section: block_name = "Header", block_type="other"
@@ -50,7 +55,7 @@ Naming conventions (for consistency with the existing pipeline):
 
 Content size guidance:
 - Keep each `raw_text` reasonably sized so the downstream LLM can extract from it.
-  If needed, truncate to the most informative part of the section while preserving company/role/bullets for experience.
+  If needed, truncate body text but **never** drop the title + company/date header lines for experience blocks.
 """
 
 

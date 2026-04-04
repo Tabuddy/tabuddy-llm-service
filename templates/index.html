@@ -43,6 +43,7 @@
       font-weight: 700;
       background: linear-gradient(135deg, var(--primary-light), var(--accent));
       -webkit-background-clip: text;
+      background-clip: text;
       -webkit-text-fill-color: transparent;
       margin-bottom: 0.3rem;
     }
@@ -991,8 +992,16 @@
       skillHtml += '</div>';
       document.getElementById('skillsBody').innerHTML = skillHtml;
 
-      // Global Skill Index
-      const gsi = data.global_skill_index || [];
+      // Global Skill Index — hide skills whose traces are ONLY from Skills_Dump
+      const gsiAll = data.global_skill_index || [];
+      const gsi = gsiAll.filter(entry => {
+        const traces = entry.traces || [];
+        if (!traces.length) return true;
+        const onlySkillsDump = traces.every(
+          tr => (tr.provenance || '').trim() === 'Skills_Dump'
+        );
+        return !onlySkillsDump;
+      });
       document.getElementById('gsiCount').textContent = gsi.length + ' skills';
       let gsiHtml = '<div style="overflow-x:auto"><table class="gsi-table"><thead><tr>';
       gsiHtml += '<th>Skill</th><th>Occurrences</th><th>Traces</th></tr></thead><tbody>';
