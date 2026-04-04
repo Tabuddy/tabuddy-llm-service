@@ -61,13 +61,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 from download_models_from_azure import download_models_from_azure
 import os
 
+# Download models synchronously before Uvicorn starts the ASGI lifespan.
+# This strictly evades the Uvicorn 60-second lifespan timeout logic.
+if os.getenv("ENV") == "PROD":
+    logger.info("☁️ Production environment detected. Syncing models from Azure before starting server...")
+    download_models_from_azure()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load SetFit models on startup; unload on shutdown."""
-    if os.getenv("ENV") == "PROD":
-        logger.info("☁️ Production environment detected. Syncing models from Azure before loading...")
-        await asyncio.to_thread(download_models_from_azure)
-
     logger.info("🚀 Loading SetFit classification models...")
     loaded = clf.load_setfit_models()
     if loaded:
