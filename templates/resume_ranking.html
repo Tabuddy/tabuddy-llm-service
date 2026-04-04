@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TABuddy – Resume Ranking</title>
+  <meta name="description" content="Deterministic AI-powered resume ranking system — score and rank candidates against your job description with transparent, reproducible scoring." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0d14;
+      --bg2: #0f1420;
+      --bg3: #141927;
+      --card: #1a2035;
+      --card2: #1e2540;
+      --border: #2a3350;
+      --border-bright: #3a4870;
+      --accent: #6366f1;
+      --accent2: #818cf8;
+      --accent-glow: rgba(99,102,241,0.25);
+      --cyan: #22d3ee;
+      --cyan-dim: rgba(34,211,238,0.15);
+      --green: #10b981;
+      --green-dim: rgba(16,185,129,0.15);
+      --yellow: #f59e0b;
+      --yellow-dim: rgba(245,158,11,0.15);
+      --red: #ef4444;
+      --red-dim: rgba(239,68,68,0.15);
+      --text: #e2e8f0;
+      --text-dim: #94a3b8;
+      --text-dimmer: #475569;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 4px 24px rgba(0,0,0,0.4);
+      --shadow-lg: 0 8px 48px rgba(0,0,0,0.6);
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Animated background ────────────────────── */
+    .bg-grid {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background-image:
+        linear-gradient(rgba(99,102,241,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(99,102,241,0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      animation: gridDrift 20s ease-in-out infinite alternate;
+    }
+    @keyframes gridDrift { from { background-position: 0 0; } to { background-position: 30px 30px; } }
+
+    .orbs {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+    }
+    .orb {
+      position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.12;
+      animation: orbFloat 12s ease-in-out infinite alternate;
+    }
+    .orb1 { width: 600px; height: 600px; background: var(--accent); top: -200px; left: -100px; }
+    .orb2 { width: 400px; height: 400px; background: var(--cyan); bottom: -100px; right: -80px; animation-delay: -4s; }
+    .orb3 { width: 300px; height: 300px; background: var(--green); top: 40%; left: 50%; animation-delay: -8s; }
+    @keyframes orbFloat {
+      from { transform: translate(0, 0) scale(1); }
+      to { transform: translate(30px, -40px) scale(1.05); }
+    }
+
+    /* ── Layout ─────────────────────────────────── */
+    .wrapper { position: relative; z-index: 1; max-width: 1400px; margin: 0 auto; padding: 0 24px; }
+
+    header {
+      padding: 32px 0 24px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+    }
+    .header-inner { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .logo-badge {
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      border-radius: var(--radius-sm);
+      padding: 8px 14px;
+      font-size: 12px; font-weight: 700; letter-spacing: 0.1em;
+      text-transform: uppercase; color: #fff;
+      box-shadow: 0 0 24px var(--accent-glow);
+    }
+    h1 { font-size: clamp(22px, 3vw, 32px); font-weight: 800; letter-spacing: -0.02em; }
+    h1 span { color: var(--accent2); }
+    .status-pill {
+      margin-left: auto;
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 14px; border-radius: 999px;
+      font-size: 12px; font-weight: 600;
+    }
+    .status-pill.ok { background: var(--green-dim); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }
+    .status-pill.warn { background: var(--yellow-dim); color: var(--yellow); border: 1px solid rgba(245,158,11,0.3); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: pulse 2s ease infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* ── Two-column input area ───────────────────── */
+    .input-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 900px) { .input-grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      transition: border-color 0.2s;
+    }
+    .panel:hover { border-color: var(--border-bright); }
+    .panel-title {
+      font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--text-dim); margin-bottom: 16px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .panel-title .icon { font-size: 16px; }
+
+    label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 8px; font-weight: 500; }
+    textarea, input[type="text"] {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text); padding: 12px 14px;
+      font-family: 'Inter', sans-serif; font-size: 14px; resize: vertical;
+      transition: border-color 0.2s, box-shadow 0.2s; outline: none;
+    }
+    textarea:focus, input[type="text"]:focus {
+      border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+    #jd-input { min-height: 280px; font-size: 13px; line-height: 1.6; }
+
+    /* Drop zone */
+    .dropzone {
+      border: 2px dashed var(--border-bright);
+      border-radius: var(--radius);
+      padding: 32px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: var(--bg2);
+      position: relative;
+    }
+    .dropzone:hover, .dropzone.drag-over {
+      border-color: var(--accent);
+      background: var(--accent-glow);
+    }
+    .dropzone input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .drop-icon { font-size: 36px; margin-bottom: 12px; }
+    .drop-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+    .drop-sub { font-size: 12px; color: var(--text-dimmer); }
+    .file-list {
+      margin-top: 16px; display: flex; flex-direction: column; gap: 8px;
+    }
+    .file-chip {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 10px 14px; font-size: 13px;
+    }
+    .file-chip .file-icon { font-size: 18px; }
+    .file-chip .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-chip .file-size { color: var(--text-dimmer); font-size: 11px; }
+    .file-chip .remove-btn {
+      color: var(--text-dimmer); cursor: pointer; background: none; border: none;
+      font-size: 16px; padding: 2px; transition: color 0.2s;
+    }
+    .file-chip .remove-btn:hover { color: var(--red); }
+
+    /* ── Action bar ──────────────────────────────── */
+    .action-bar {
+      display: flex; align-items: center; gap: 12px; margin-bottom: 32px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 24px; border-radius: var(--radius-sm);
+      font-size: 14px; font-weight: 600; cursor: pointer;
+      border: none; transition: all 0.2s; font-family: 'Inter', sans-serif;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      color: #fff;
+      box-shadow: 0 4px 20px var(--accent-glow);
+    }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 28px var(--accent-glow); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-secondary {
+      background: var(--card2); color: var(--text); border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--accent2); }
+
+    .progress-wrap {
+      flex: 1; min-width: 200px; display: none;
+    }
+    .progress-bar {
+      height: 6px; background: var(--border); border-radius: 99px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; background: linear-gradient(90deg, var(--accent), var(--cyan));
+      border-radius: 99px; width: 0%;
+      transition: width 0.4s ease;
+      animation: shimmer 1.5s ease infinite;
+    }
+    @keyframes shimmer {
+      0%   { filter: brightness(1); }
+      50%  { filter: brightness(1.4); }
+      100% { filter: brightness(1); }
+    }
+    .progress-label { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+
+    /* ── JD Atom Preview ────────────────────────── */
+    #jd-preview { display: none; margin-bottom: 24px; }
+    .atoms-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;
+      margin-top: 12px;
+    }
+    .atom-chip {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 10px 12px;
+    }
+    .atom-type { font-size: 10px; color: var(--text-dimmer); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+    .atom-value { font-size: 12px; color: var(--cyan); font-weight: 500; }
+    .tier-badge-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .tier-badge {
+      padding: 4px 12px; border-radius: 99px; font-size: 11px; font-weight: 700;
+      background: var(--accent-glow); color: var(--accent2); border: 1px solid rgba(99,102,241,0.3);
+    }
+    .tier-arrow { color: var(--text-dimmer); font-size: 12px; }
+
+    /* ── Results Section ─────────────────────────── */
+    #results-section { display: none; }
+    .results-header {
+      display: flex; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap;
+    }
+    .results-header h2 { font-size: 20px; font-weight: 700; }
+    .results-meta { color: var(--text-dim); font-size: 13px; }
+
+    /* Score histogram */
+    .histogram {
+      display: flex; align-items: flex-end; gap: 6px;
+      height: 60px; padding: 0 4px; margin-bottom: 24px;
+    }
+    .hist-bar {
+      flex: 1; border-radius: 4px 4px 0 0; min-height: 4px;
+      background: linear-gradient(180deg, var(--accent), #8b5cf6);
+      opacity: 0.7; position: relative; cursor: pointer; transition: opacity 0.2s;
+    }
+    .hist-bar:hover { opacity: 1; }
+    .hist-bar::after {
+      content: attr(data-label);
+      position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%);
+      font-size: 9px; color: var(--text-dimmer); white-space: nowrap;
+    }
+
+    /* Ranking table */
+    .rank-list { display: flex; flex-direction: column; gap: 12px; }
+    .rank-card {
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+      overflow: hidden; transition: border-color 0.2s, box-shadow 0.2s;
+      cursor: pointer;
+    }
+    .rank-card:hover { border-color: var(--border-bright); box-shadow: var(--shadow); }
+    .rank-card.top-3 { border-color: rgba(99,102,241,0.4); }
+    .rank-card-header {
+      display: flex; align-items: center; gap: 16px;
+      padding: 16px 20px;
+    }
+    .rank-pos {
+      width: 36px; height: 36px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; font-weight: 800; flex-shrink: 0;
+    }
+    .rank-pos.gold { background: linear-gradient(135deg, #f59e0b, #fbbf24); color: #1a0a00; }
+    .rank-pos.silver { background: linear-gradient(135deg, #94a3b8, #cbd5e1); color: #0f1420; }
+    .rank-pos.bronze { background: linear-gradient(135deg, #b45309, #d97706); color: #fff; }
+    .rank-pos.default { background: var(--bg3); color: var(--text-dim); border: 1px solid var(--border); }
+
+    .rank-info { flex: 1; min-width: 0; }
+    .rank-name { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
+    .rank-email { font-size: 12px; color: var(--text-dim); }
+    .rank-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 10px; border-radius: 99px; font-size: 11px; font-weight: 600;
+    }
+    .badge-exp {
+      background: var(--cyan-dim); color: var(--cyan);
+      border: 1px solid rgba(34,211,238,0.2);
+    }
+    .badge-tier {
+      background: rgba(99,102,241,0.1); color: var(--accent2);
+      border: 1px solid rgba(99,102,241,0.2);
+    }
+    .badge-warn {
+      background: var(--yellow-dim); color: var(--yellow);
+      border: 1px solid rgba(245,158,11,0.2);
+    }
+
+    .score-display {
+      text-align: right; flex-shrink: 0;
+    }
+    .score-value {
+      font-size: 32px; font-weight: 800; line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .score-value.high { color: var(--green); }
+    .score-value.mid  { color: var(--yellow); }
+    .score-value.low  { color: var(--red); }
+    .score-label { font-size: 11px; color: var(--text-dimmer); margin-top: 2px; }
+
+    /* Score ring mini-chart using SVG */
+    .score-ring { flex-shrink: 0; }
+
+    /* Dimension bars (expandable) */
+    .rank-card-detail {
+      display: none;
+      border-top: 1px solid var(--border);
+      padding: 16px 20px;
+      background: var(--bg2);
+    }
+    .rank-card.expanded .rank-card-detail { display: block; }
+    .expand-icon { color: var(--text-dimmer); font-size: 16px; transition: transform 0.2s; }
+    .rank-card.expanded .expand-icon { transform: rotate(180deg); }
+
+    .dim-row { margin-bottom: 14px; }
+    .dim-header {
+      display: flex; justify-content: space-between; align-items: baseline;
+      margin-bottom: 6px;
+    }
+    .dim-name { font-size: 12px; font-weight: 600; color: var(--text); }
+    .dim-scores { font-size: 11px; color: var(--text-dimmer); }
+    .dim-bar-track {
+      height: 6px; background: var(--border); border-radius: 99px; overflow: hidden;
+    }
+    .dim-bar-fill {
+      height: 100%; border-radius: 99px;
+      background: linear-gradient(90deg, var(--accent), var(--cyan));
+      transition: width 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    }
+    .dim-bar-fill.mid  { background: linear-gradient(90deg, var(--yellow), #fbbf24); }
+    .dim-bar-fill.bad  { background: linear-gradient(90deg, var(--red), #f87171); }
+
+    .dim-low-score {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px; border-radius: 99px; font-size: 10px; font-weight: 700;
+      background: var(--red-dim); color: var(--red);
+      border: 1px solid rgba(239,68,68,0.25); margin-left: 8px;
+    }
+
+    .dim-evidence {
+      margin-top: 8px; padding: 10px 12px;
+      background: var(--bg3); border-radius: var(--radius-sm);
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .dim-ev-item { font-size: 11px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; }
+    .dim-ev-item.good { color: var(--green); }
+    .dim-ev-item.warn { color: var(--yellow); }
+    .dim-ev-item.bad  { color: var(--red); }
+
+    .signals-wrap { margin-top: 14px; }
+    .signal-title { font-size: 11px; font-weight: 700; color: var(--text-dimmer); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+    .signals-list { display: flex; flex-wrap: wrap; gap: 6px; }
+    .signal-chip {
+      padding: 4px 10px; background: var(--green-dim); color: var(--green);
+      border: 1px solid rgba(16,185,129,0.2); border-radius: 99px; font-size: 11px;
+    }
+
+    /* Error list */
+    .error-list { margin-top: 16px; }
+    .error-item {
+      display: flex; gap: 10px; padding: 10px 14px;
+      background: var(--red-dim); border: 1px solid rgba(239,68,68,0.2);
+      border-radius: var(--radius-sm); margin-bottom: 8px; font-size: 13px; color: var(--red);
+    }
+
+    /* Toast */
+    #toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+      padding: 14px 20px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500;
+      box-shadow: var(--shadow-lg); max-width: 360px;
+      transform: translateY(20px); opacity: 0;
+      transition: all 0.3s ease;
+      pointer-events: none;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+    #toast.error { background: var(--card); border: 1px solid var(--red); color: var(--red); }
+    #toast.success { background: var(--card); border: 1px solid var(--green); color: var(--green); }
+    #toast.info { background: var(--card); border: 1px solid var(--accent); color: var(--accent2); }
+
+    /* Loader spinner */
+    .spinner {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid currentColor; border-top-color: transparent;
+      animation: spin 0.7s linear infinite; display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Section */
+    .section-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+      color: var(--text-dimmer); margin-bottom: 12px;
+    }
+
+    /* ── Empty state ───────────────────────────── */
+    .empty-state {
+      text-align: center; padding: 80px 20px; color: var(--text-dimmer);
+    }
+    .empty-icon { font-size: 48px; margin-bottom: 16px; }
+    .empty-title { font-size: 18px; font-weight: 600; color: var(--text-dim); margin-bottom: 8px; }
+    .empty-sub { font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="orbs"><div class="orb orb1"></div><div class="orb orb2"></div><div class="orb orb3"></div></div>
+
+  <div class="wrapper">
+    <!-- ── Header ──────────────────────────────────────────────── -->
+    <header>
+      <div class="header-inner">
+        <div class="logo-badge">TABuddy</div>
+        <div>
+          <h1>Resume <span>Ranking</span> Engine</h1>
+          <p style="font-size:13px;color:var(--text-dim);margin-top:4px;">Deterministic 6-dimension scoring · SetFit 3-tier classification · Zero hallucinations</p>
+        </div>
+        <div class="status-pill {{ 'ok' if setfit_loaded else 'warn' }}">
+          <div class="dot"></div>
+          {% if setfit_loaded %}
+            SetFit Ready · {{ loaded_tiers | join(', ') }}
+          {% else %}
+            SetFit Offline · Classification Degraded
+          {% endif %}
+        </div>
+      </div>
+    </header>
+
+    <!-- ── Inputs ──────────────────────────────────────────────── -->
+    <div class="input-grid">
+      <!-- JD Panel -->
+      <div class="panel">
+        <div class="panel-title"><span class="icon">📋</span> Job Description</div>
+        <label for="jd-input">Paste the full job description</label>
+        <textarea id="jd-input" placeholder="We are looking for a Senior Backend Engineer with 5+ years of experience in Python, FastAPI, and PostgreSQL. You will own the design of our microservices architecture..."></textarea>
+        <div style="margin-top:12px;display:flex;gap:8px;">
+          <button class="btn btn-secondary" id="parse-jd-btn" style="font-size:13px;padding:8px 16px;">
+            <span>🔍</span> Analyze JD
+          </button>
+          <button class="btn btn-secondary" id="clear-jd-btn" style="font-size:13px;padding:8px 16px;">
+            <span>🗑</span> Clear
+          </button>
+        </div>
+      </div>
+
+      <!-- Resume Upload Panel -->
+      <div class="panel">
+        <div class="panel-title"><span class="icon">📄</span> Resumes <span style="color:var(--text-dimmer);font-weight:400;text-transform:none;letter-spacing:0;">(up to 30)</span></div>
+        <label>Upload resume files (PDF, DOCX)</label>
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="file-input" multiple accept=".pdf,.docx,.doc,.txt" />
+          <div class="drop-icon">📂</div>
+          <div class="drop-title">Drop resumes here</div>
+          <div class="drop-sub">PDF, DOCX, DOC · Max 30 files</div>
+        </div>
+        <div class="file-list" id="file-list"></div>
+      </div>
+    </div>
+
+    <!-- ── JD Atom Preview ────────────────────────────────────── -->
+    <div id="jd-preview" class="panel" style="margin-bottom:20px;">
+      <div class="panel-title"><span class="icon">🧬</span> JD Analysis Results</div>
+      <div id="jd-tier-row" class="tier-badge-row"></div>
+      <div id="jd-atoms" class="atoms-grid" style="margin-top:16px;"></div>
+    </div>
+
+    <!-- ── Action bar ────────────────────────────────────────── -->
+    <div class="action-bar">
+      <button class="btn btn-primary" id="rank-btn" disabled>
+        <span class="spinner" id="rank-spinner" style="display:none;border-color:#fff;border-top-color:transparent;"></span>
+        <span id="rank-btn-label">🚀 Rank All Candidates</span>
+      </button>
+      <button class="btn btn-secondary" id="reset-btn">↺ Reset</button>
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <div class="progress-label" id="progress-label">Processing...</div>
+      </div>
+    </div>
+
+    <!-- ── Results ───────────────────────────────────────────── -->
+    <div id="results-section">
+      <div class="results-header">
+        <h2>🏆 Ranked Candidates</h2>
+        <div class="results-meta" id="results-meta"></div>
+      </div>
+
+      <!-- Histogram -->
+      <div class="panel" style="margin-bottom:20px;">
+        <div class="section-label">Score Distribution</div>
+        <div class="histogram" id="histogram"></div>
+        <div style="height:20px;"></div>
+      </div>
+
+      <!-- Errors -->
+      <div class="error-list" id="error-list"></div>
+
+      <!-- Results list -->
+      <div class="rank-list" id="rank-list"></div>
+    </div>
+
+    <!-- Empty state (before ranking) -->
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon">🎯</div>
+      <div class="empty-title">Ready to rank</div>
+      <div class="empty-sub">Paste a job description, upload resumes, then hit <strong>Rank All Candidates</strong></div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    // ══════════════════════════════════════════════════════════════════════
+    // State
+    // ══════════════════════════════════════════════════════════════════════
+    let uploadedFiles = [];
+    let jdProfile = null;
+    let rankingResults = null;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DOM refs
+    // ══════════════════════════════════════════════════════════════════════
+    const jdInput      = document.getElementById('jd-input');
+    const parseJdBtn   = document.getElementById('parse-jd-btn');
+    const clearJdBtn   = document.getElementById('clear-jd-btn');
+    const dropzone     = document.getElementById('dropzone');
+    const fileInput    = document.getElementById('file-input');
+    const fileList     = document.getElementById('file-list');
+    const jdPreview    = document.getElementById('jd-preview');
+    const jdTierRow    = document.getElementById('jd-tier-row');
+    const jdAtoms      = document.getElementById('jd-atoms');
+    const rankBtn      = document.getElementById('rank-btn');
+    const rankSpinner  = document.getElementById('rank-spinner');
+    const rankBtnLabel = document.getElementById('rank-btn-label');
+    const resetBtn     = document.getElementById('reset-btn');
+    const progressWrap = document.getElementById('progress-wrap');
+    const progressFill = document.getElementById('progress-fill');
+    const progressLabel= document.getElementById('progress-label');
+    const resultsSection= document.getElementById('results-section');
+    const emptyState   = document.getElementById('empty-state');
+    const resultsMeta  = document.getElementById('results-meta');
+    const histogram    = document.getElementById('histogram');
+    const rankList     = document.getElementById('rank-list');
+    const errorList    = document.getElementById('error-list');
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Toast
+    // ══════════════════════════════════════════════════════════════════════
+    function showToast(msg, type = 'info', duration = 3500) {
+      const t = document.getElementById('toast');
+      t.textContent = msg; t.className = `show ${type}`;
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => { t.className = type; }, duration);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // File management
+    // ══════════════════════════════════════════════════════════════════════
+    function formatBytes(n) {
+      if (n < 1024) return `${n}B`;
+      if (n < 1048576) return `${(n/1024).toFixed(1)}KB`;
+      return `${(n/1048576).toFixed(1)}MB`;
+    }
+
+    function renderFileList() {
+      fileList.innerHTML = '';
+      uploadedFiles.forEach((f, i) => {
+        const chip = document.createElement('div');
+        chip.className = 'file-chip';
+        const ext = f.name.split('.').pop().toLowerCase();
+        const icons = { pdf: '📕', docx: '📘', doc: '📘', txt: '📄' };
+        chip.innerHTML = `
+          <span class="file-icon">${icons[ext] || '📄'}</span>
+          <span class="file-name" title="${f.name}">${f.name}</span>
+          <span class="file-size">${formatBytes(f.size)}</span>
+          <button class="remove-btn" data-i="${i}" title="Remove">✕</button>
+        `;
+        fileList.appendChild(chip);
+      });
+      updateRankButton();
+    }
+
+    fileList.addEventListener('click', e => {
+      const btn = e.target.closest('.remove-btn');
+      if (!btn) return;
+      uploadedFiles.splice(+btn.dataset.i, 1);
+      renderFileList();
+    });
+
+    function addFiles(newFiles) {
+      for (const f of newFiles) {
+        if (uploadedFiles.length >= 30) { showToast('Maximum 30 files reached', 'error'); break; }
+        if (!uploadedFiles.find(x => x.name === f.name && x.size === f.size)) {
+          uploadedFiles.push(f);
+        }
+      }
+      renderFileList();
+    }
+
+    fileInput.addEventListener('change', e => { addFiles(e.target.files); fileInput.value = ''; });
+    dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+    dropzone.addEventListener('drop', e => {
+      e.preventDefault(); dropzone.classList.remove('drag-over');
+      addFiles(e.dataTransfer.files);
+    });
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Rank button state
+    // ══════════════════════════════════════════════════════════════════════
+    function updateRankButton() {
+      rankBtn.disabled = !(jdInput.value.trim() && uploadedFiles.length > 0);
+    }
+    jdInput.addEventListener('input', updateRankButton);
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Analyze JD (parse only, no scoring)
+    // ══════════════════════════════════════════════════════════════════════
+    parseJdBtn.addEventListener('click', async () => {
+      const jdText = jdInput.value.trim();
+      if (!jdText) { showToast('Please enter a job description first', 'error'); return; }
+      parseJdBtn.disabled = true;
+      parseJdBtn.innerHTML = '<span class="spinner" style="border-color:currentColor;border-top-color:transparent;width:14px;height:14px;"></span> Analyzing…';
+      try {
+        const res = await fetch('/ranking/parse-jd', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jd_text: jdText }),
+        });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || res.statusText); }
+        jdProfile = await res.json();
+        renderJdPreview(jdProfile);
+        showToast('JD analyzed successfully', 'success');
+      } catch (e) {
+        showToast(`JD analysis failed: ${e.message}`, 'error');
+      } finally {
+        parseJdBtn.disabled = false;
+        parseJdBtn.innerHTML = '<span>🔍</span> Analyze JD';
+      }
+    });
+
+    clearJdBtn.addEventListener('click', () => {
+      jdInput.value = ''; jdProfile = null;
+      jdPreview.style.display = 'none';
+      updateRankButton();
+    });
+
+    function renderJdPreview(profile) {
+      // Tier path
+      const tc = profile.tier_classification;
+      const parts = tc.hierarchy_path.split(' > ');
+      jdTierRow.innerHTML = `<span style="font-size:12px;color:var(--text-dimmer)">Classification:</span>` +
+        parts.map((p, i) => `<span class="tier-badge">${p}</span>${i < parts.length-1 ? '<span class="tier-arrow">›</span>' : ''}`).join('') +
+        `<span style="font-size:11px;color:var(--text-dimmer);margin-left:4px">· confidence ${(tc.tier1.score*100).toFixed(0)}%</span>`;
+
+      // Atoms
+      const atoms = [];
+      if (profile.role_family) atoms.push({ type: 'Role Family', val: profile.role_family });
+      if (profile.role_objective) atoms.push({ type: 'Objective', val: profile.role_objective });
+      if (profile.industry_vertical) atoms.push({ type: 'Industry', val: profile.industry_vertical });
+      if (profile.business_model) atoms.push({ type: 'Business Model', val: profile.business_model });
+      profile.compliance_context?.forEach(c => atoms.push({ type: 'Compliance', val: c }));
+      profile.core_capabilities?.slice(0, 4).forEach(c => atoms.push({ type: 'Core Capability', val: c.normalized_entity }));
+      profile.secondary_capabilities?.slice(0, 3).forEach(c => atoms.push({ type: 'Skill Required', val: c.normalized_entity }));
+      profile.scale_atoms?.slice(0, 2).forEach(s => atoms.push({ type: 'Scale', val: s.value ? `${s.normalized_entity} (${s.value})` : s.normalized_entity }));
+
+      jdAtoms.innerHTML = atoms.map(a => `
+        <div class="atom-chip">
+          <div class="atom-type">${a.type}</div>
+          <div class="atom-value">${a.val}</div>
+        </div>`).join('');
+
+      if (!atoms.length) {
+        jdAtoms.innerHTML = `<div style="color:var(--text-dimmer);font-size:13px;grid-column:1/-1;">No structured atoms extracted — check Azure OpenAI connection</div>`;
+      }
+
+      jdPreview.style.display = 'block';
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Batch Rank
+    // ══════════════════════════════════════════════════════════════════════
+    rankBtn.addEventListener('click', async () => {
+      const jdText = jdInput.value.trim();
+      if (!jdText) { showToast('Job description is required', 'error'); return; }
+      if (!uploadedFiles.length) { showToast('Upload at least one resume', 'error'); return; }
+
+      setLoading(true);
+      progressWrap.style.display = 'block';
+      progressFill.style.width = '15%';
+      progressLabel.textContent = 'Parsing job description…';
+
+      try {
+        const fd = new FormData();
+        fd.append('jd_text', jdText);
+        uploadedFiles.forEach(f => fd.append('files', f));
+
+        progressFill.style.width = '30%';
+        progressLabel.textContent = `Processing ${uploadedFiles.length} resume${uploadedFiles.length>1?'s':''}…`;
+
+        const res = await fetch('/ranking/batch-rank', {
+          method: 'POST',
+          body: fd,
+        });
+
+        progressFill.style.width = '90%';
+        progressLabel.textContent = 'Assembling results…';
+
+        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || res.statusText); }
+        const session = await res.json();
+
+        progressFill.style.width = '100%';
+        jdProfile = session.jd_profile;
+        renderJdPreview(jdProfile);
+        renderResults(session);
+        showToast(`Ranked ${session.results.length} candidates!`, 'success');
+      } catch (e) {
+        showToast(`Ranking failed: ${e.message}`, 'error');
+      } finally {
+        setLoading(false);
+        setTimeout(() => { progressWrap.style.display = 'none'; }, 600);
+      }
+    });
+
+    function setLoading(on) {
+      rankBtn.disabled = on;
+      rankSpinner.style.display = on ? 'inline-block' : 'none';
+      rankBtnLabel.textContent = on ? 'Ranking…' : '🚀 Rank All Candidates';
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Render results
+    // ══════════════════════════════════════════════════════════════════════
+    function scoreColor(s) {
+      if (s >= 75) return 'high';
+      if (s >= 50) return 'mid';
+      return 'low';
+    }
+
+    function renderHistogram(results) {
+      // Bucket into 10-point ranges
+      const buckets = Array(10).fill(0);
+      results.forEach(r => {
+        const b = Math.min(Math.floor(r.final_score / 10), 9);
+        buckets[b]++;
+      });
+      const maxB = Math.max(...buckets, 1);
+      histogram.innerHTML = buckets.map((cnt, i) => {
+        const h = Math.max(4, (cnt / maxB) * 52);
+        const label = `${i*10}-${i*10+9}`;
+        return `<div class="hist-bar" style="height:${h}px" data-label="${label}" title="${cnt} candidate(s) ${label}pts"></div>`;
+      }).join('');
+    }
+
+    function escEv(text) {
+      return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function evClass(e) {
+      if (e.startsWith('✓') || e.startsWith('✅')) return 'good';
+      if (e.startsWith('△') || e.startsWith('⚠') || e.startsWith('~')) return 'warn';
+      if (e.startsWith('✗') || e.startsWith('❌') || e.startsWith('✕')) return 'bad';
+      return '';
+    }
+
+    function dimBarClass(raw) {
+      if (raw >= 50) return '';
+      if (raw >= 30) return 'mid';
+      return 'bad';
+    }
+
+    function renderDimBars(dims) {
+      return dims.map(d => {
+        const rc = dimBarClass(d.raw_score);
+        const lowWarn = d.raw_score < 50;
+        return `
+        <div class="dim-row">
+          <div class="dim-header">
+            <div style="display:flex;align-items:baseline;gap:4px;flex-wrap:wrap;">
+              <span class="dim-name">${d.dimension}</span>
+              ${lowWarn ? `<span class="dim-low-score">Low score — see failures below</span>` : ''}
+            </div>
+            <span class="dim-scores">${d.raw_score.toFixed(0)}/100 · weight ${(d.weight*100).toFixed(0)}% · weighted ${d.weighted_score.toFixed(1)}</span>
+          </div>
+          <div class="dim-bar-track">
+            <div class="dim-bar-fill ${rc}" style="width:${d.raw_score}%"></div>
+          </div>
+          ${d.evidence.length ? `
+            <div class="dim-evidence">
+              ${d.evidence.slice(0,10).map(e => `<div class="dim-ev-item ${evClass(e)}">${escEv(e)}</div>`).join('')}
+            </div>` : ''}
+        </div>`;
+      }).join('');
+    }
+
+    function rankPosClass(r) {
+      if (r === 1) return 'gold';
+      if (r === 2) return 'silver';
+      if (r === 3) return 'bronze';
+      return 'default';
+    }
+
+    function renderResults(session) {
+      const results = session.results;
+      emptyState.style.display = 'none';
+      resultsSection.style.display = 'block';
+
+      resultsMeta.textContent = `${results.length} candidates ranked · ${session.total_resumes} submitted${session.processing_errors.length ? ` · ${session.processing_errors.length} error(s)` : ''}`;
+
+      renderHistogram(results);
+
+      errorList.innerHTML = session.processing_errors.map(e =>
+        `<div class="error-item"><span>⚠️</span> ${e}</div>`
+      ).join('');
+
+      rankList.innerHTML = results.map((r, idx) => {
+        const sc = r.final_score;
+        const color = scoreColor(sc);
+        const top3 = idx < 3 ? 'top-3' : '';
+        const expLabel = r.experience_level === 'SENIOR' ? '🔶 Senior' : r.experience_level === 'MID' ? '🔷 Mid-Level' : '🔹 Fresher';
+        const tierPath = r.tier_classification.hierarchy_path;
+        return `
+          <div class="rank-card ${top3}" data-idx="${idx}" role="button" tabindex="0" aria-expanded="false">
+            <div class="rank-card-header">
+              <div class="rank-pos ${rankPosClass(r.rank)}">${r.rank}</div>
+              <div class="rank-info">
+                <div class="rank-name">${r.candidate_name || 'Unknown Candidate'}</div>
+                <div class="rank-email">${r.candidate_email || '—'}</div>
+                <div class="rank-badges">
+                  <span class="badge badge-exp">${expLabel}</span>
+                  <span class="badge badge-tier">⚡ ${tierPath}</span>
+                  ${r.tier_mismatch ? `<span class="badge badge-warn">⚠ Tier Mismatch</span>` : ''}
+                  ${r.low_confidence_classification ? `<span class="badge badge-warn">~ Low Confidence</span>` : ''}
+                </div>
+              </div>
+              <div class="score-display">
+                <div class="score-value ${color}">${sc.toFixed(0)}</div>
+                <div class="score-label">/ 100</div>
+              </div>
+              <span class="expand-icon">▾</span>
+            </div>
+            <div class="rank-card-detail">
+              <div class="section-label">Score Breakdown</div>
+              ${renderDimBars(r.dimension_scores)}
+              ${r.resume_strength_signals.length ? `
+                <div class="signals-wrap">
+                  <div class="signal-title">Resume Strength Signals</div>
+                  <div class="signals-list">
+                    ${r.resume_strength_signals.map(s => `<span class="signal-chip">✦ ${s}</span>`).join('')}
+                  </div>
+                </div>` : ''}
+            </div>
+          </div>`;
+      }).join('');
+
+      // Expand/collapse
+      rankList.querySelectorAll('.rank-card').forEach(card => {
+        card.addEventListener('click', () => {
+          card.classList.toggle('expanded');
+          card.setAttribute('aria-expanded', card.classList.contains('expanded'));
+        });
+        card.addEventListener('keydown', e => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); card.click(); }
+        });
+      });
+
+      // Animate bars after mount
+      requestAnimationFrame(() => {
+        rankList.querySelectorAll('.dim-bar-fill').forEach(b => {
+          const w = b.style.width; b.style.width = '0';
+          requestAnimationFrame(() => { b.style.width = w; });
+        });
+      });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Reset
+    // ══════════════════════════════════════════════════════════════════════
+    resetBtn.addEventListener('click', () => {
+      uploadedFiles = []; jdProfile = null; rankingResults = null;
+      jdInput.value = ''; fileList.innerHTML = '';
+      jdPreview.style.display = 'none';
+      resultsSection.style.display = 'none';
+      emptyState.style.display = 'block';
+      updateRankButton();
+      showToast('Reset complete', 'info');
+    });
+  </script>
+</body>
+</html>

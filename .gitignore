@@ -9,3 +9,14 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.local
+
+
+# set fit models
+setfit_models
+
+.claude
+CLAUDE.md
+
+
+important_notes.md

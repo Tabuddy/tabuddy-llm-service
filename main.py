@@ -1,5 +1,8 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -9,7 +12,22 @@ import time
 import tempfile
 from pathlib import Path
 
-from normalizer import normalize_skills
+# ── Ranking system imports ────────────────────────────────────────────────────
+import setfit_classifier as clf
+from jd_parser import parse_jd
+from resume_scorer import score_resume, detect_experience_level
+from ranking_models import (
+    JDProfile,
+    RankingSession,
+    ResumeRankResult,
+    ParseJDRequest,
+    ScoreResumeRequest,
+    ClassifyTextRequest,
+    TierClassification,
+    TierPrediction,
+)
+
+from remote_meta_tagger import parse_resume_via_api
 from resume_parser import extract_text, extract_pdf_links
 from resume_zoner import zone_resume
 from candidate_extractor import extract_candidate_details
@@ -32,12 +50,42 @@ logger = logging.getLogger(__name__)
 
 
 load_dotenv()
+
+# Reduce log spam: disable TQDM globally and quiet HTTPx
+import os
+os.environ["TQDM_DISABLE"] = "1"
+
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+from download_models_from_azure import download_models_from_azure
+import os
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load SetFit models on startup; unload on shutdown."""
+    if os.getenv("ENV") == "PROD":
+        logger.info("☁️ Production environment detected. Syncing models from Azure before loading...")
+        await asyncio.to_thread(download_models_from_azure)
+
+    logger.info("🚀 Loading SetFit classification models...")
+    loaded = clf.load_setfit_models()
+    if loaded:
+        logger.info("✅ SetFit models ready: %s", clf.get_loaded_tiers())
+    else:
+        logger.warning("⚠️  SetFit models not loaded — tier classification degraded")
+    yield
+    logger.info("Shutting down TABuddy service")
+
 
 app = FastAPI(
-    title="TABuddy – Resume Meta-Tagging Service",
-    description="Contextual resume parsing, skill extraction, and global parameter tagging for HR tech.",
-    version="0.3.0",
+    title="TABuddy – Resume Intelligence & Ranking Service",
+    description=(
+        "Contextual resume parsing, skill extraction, global parameter tagging, "
+        "and deterministic resume ranking for HR tech."
+    ),
+    version="0.4.0",
+    lifespan=lifespan,
 )
 
 app.include_router(docling_router)
@@ -413,3 +461,211 @@ async def parse_resume_hybrid_stage2_endpoint(
 
     logger.info("Hybrid stage2 total took %.2fs", time.perf_counter() - t0)
     return response
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESUME RANKING ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Helper: full resume pipeline reused internally ────────────────────────────
+async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
+    """Parse resume via external meta-tagging API, falling back to local pipeline
+    if the external service is unavailable.
+    """
+    raw_bytes = await file.read()
+    filename = file.filename or "resume.pdf"
+
+    try:
+        return await parse_resume_via_api(raw_bytes, filename)
+    except Exception as e:
+        logger.warning(
+            "External meta-tag API failed (%s), falling back to local pipeline", e,
+        )
+
+    # Local fallback (original hybrid pipeline)
+    from resume_parser import _parse_docx, _parse_pdf
+
+    fname_lower = filename.lower()
+
+    def _normal_parse() -> str:
+        if fname_lower.endswith(".pdf"):
+            return _parse_pdf(raw_bytes)
+        if fname_lower.endswith(".docx") or fname_lower.endswith(".doc"):
+            return _parse_docx(raw_bytes)
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    def _docling_parse() -> str:
+        try:
+            from docling_client import convert_path_to_markdown
+            suffix = Path(filename).suffix or ".pdf"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                return convert_path_to_markdown(tmp_path)
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("Docling failed in ranking fallback pipeline: %s", e)
+            return ""
+
+    raw_text, docling_md = await asyncio.gather(
+        asyncio.to_thread(_normal_parse),
+        asyncio.to_thread(_docling_parse),
+    )
+
+    candidate = extract_candidate_details(raw_text)
+    blocks = await build_hybrid_blocks(raw_text, docling_md)
+    blocks = filter_blocks(blocks)
+
+    async def _tag_and_meta(blks):
+        br = await tag_all_blocks(blks)
+        cmt = await extract_context_meta_tags(br)
+        return br, cmt
+
+    (block_results, context_meta_tags), (global_params, reasoning_log) = (
+        await asyncio.gather(
+            _tag_and_meta(blocks),
+            extract_global_parameters(blocks),
+        )
+    )
+
+    return aggregate(
+        candidate, block_results, global_params,
+        context_meta_tags, reasoning_log,
+        parsed_text=raw_text, zoned_blocks=blocks,
+    )
+
+
+# ── 1. Parse & classify a Job Description ────────────────────────────────────
+@app.post("/ranking/parse-jd", response_model=JDProfile)
+async def ranking_parse_jd(req: ParseJDRequest):
+    """Parse a raw JD text into structured capability atoms + SetFit tier classification.
+
+    Returns a JDProfile that can be stored client-side and passed to
+    /ranking/score-resume or /ranking/batch-rank.
+    """
+    if not req.jd_text.strip():
+        raise HTTPException(status_code=400, detail="jd_text cannot be empty")
+    t0 = time.perf_counter()
+    profile = await parse_jd(req.jd_text)
+    logger.info("JD parsing took %.2fs", time.perf_counter() - t0)
+    return profile
+
+
+# ── 2. Score a single resume against a pre-parsed JD ─────────────────────────
+@app.post("/ranking/score-resume", response_model=ResumeRankResult)
+async def ranking_score_resume(
+    jd_profile: ScoreResumeRequest,
+    file: UploadFile = File(...),
+):
+    """Score a single uploaded resume against a pre-parsed JDProfile.
+
+    Returns a ResumeRankResult with full 6-dimension score breakdown.
+    """
+    t0 = time.perf_counter()
+    resume = await _run_full_resume_pipeline(file)
+
+    # Classify resume with SetFit
+    resume_text = resume.parsed_text[:2000] if resume.parsed_text else ""
+    resume_tier = clf.classify_text(resume_text) if clf.models_available() else TierClassification(
+        tier1=TierPrediction(label="Unknown", score=0.0),
+        hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
+    )
+
+    result = score_resume(jd_profile.jd_profile, resume, resume_tier)
+    logger.info("Single resume scoring took %.2fs", time.perf_counter() - t0)
+    return result
+
+
+# ── 3. Batch rank multiple resumes against a JD ───────────────────────────────
+@app.post("/ranking/batch-rank", response_model=RankingSession)
+async def ranking_batch_rank(
+    jd_text: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    """Parse JD once, then score all uploaded resumes in parallel and rank them.
+
+    Returns a RankingSession with all results sorted by final_score descending.
+    """
+    if not jd_text.strip():
+        raise HTTPException(status_code=400, detail="jd_text cannot be empty")
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one resume file required")
+    if len(files) > 30:
+        raise HTTPException(status_code=400, detail="Maximum 30 resumes per batch")
+
+    t0 = time.perf_counter()
+
+    # Step 1: Parse JD (single LLM call)
+    jd_profile = await parse_jd(jd_text)
+    logger.info("JD parsed in %.2fs", time.perf_counter() - t0)
+
+    # Step 2: Process all resumes in parallel
+    async def _score_one(f: UploadFile) -> ResumeRankResult | str:
+        try:
+            resume = await _run_full_resume_pipeline(f)
+            resume_text = resume.parsed_text[:2000] if resume.parsed_text else ""
+            resume_tier = clf.classify_text(resume_text) if clf.models_available() else TierClassification(
+                tier1=TierPrediction(label="Unknown", score=0.0),
+                hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
+            )
+            return score_resume(jd_profile, resume, resume_tier)
+        except Exception as e:
+            fname = getattr(f, "filename", "unknown")
+            logger.exception("Error scoring resume %s: %s", fname, e)
+            return f"Error processing {fname}: {e}"
+
+    outcomes = await asyncio.gather(*[_score_one(f) for f in files])
+
+    results: list[ResumeRankResult] = []
+    errors: list[str] = []
+    for o in outcomes:
+        if isinstance(o, ResumeRankResult):
+            results.append(o)
+        else:
+            errors.append(str(o))
+
+    # Sort by final_score descending, assign ranks
+    results.sort(key=lambda r: r.final_score, reverse=True)
+    for i, r in enumerate(results):
+        r.rank = i + 1
+
+    logger.info(
+        "Batch rank: %d resumes, %.2fs total. Errors: %d",
+        len(results), time.perf_counter() - t0, len(errors),
+    )
+
+    return RankingSession(
+        jd_profile=jd_profile,
+        results=results,
+        total_resumes=len(files),
+        processing_errors=errors,
+    )
+
+
+# ── 4. Expose SetFit classification directly ──────────────────────────────────
+@app.post("/classify-text", response_model=TierClassification)
+async def classify_text_endpoint(req: ClassifyTextRequest):
+    """Run the 3-tier SetFit cascade on arbitrary text.
+
+    Useful for debugging classification of JDs and resumes.
+    """
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text cannot be empty")
+    return clf.classify_text(req.text[:3000])
+
+
+# ── 5. Resume Ranking Test UI ─────────────────────────────────────────────────
+@app.get("/resume-ranking", response_class=HTMLResponse)
+async def resume_ranking_ui(request: Request):
+    """Jinja2 test page for the resume ranking system."""
+    return templates.TemplateResponse(
+        "resume_ranking.html",
+        {
+            "request": request,
+            "setfit_loaded": clf.models_available(),
+            "loaded_tiers": clf.get_loaded_tiers(),
+        },
+    )
