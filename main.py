@@ -27,7 +27,6 @@ from ranking_models import (
     TierPrediction,
 )
 
-from remote_meta_tagger import parse_resume_via_api
 from resume_parser import extract_text, extract_pdf_links
 from resume_zoner import zone_resume
 from candidate_extractor import extract_candidate_details
@@ -58,7 +57,8 @@ os.environ["TQDM_DISABLE"] = "1"
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from download_models_from_azure import download_models_from_azure
+from model_azure import download_models_from_azure, upload_models_to_azure
+from model_pipeline import router as model_pipeline_router
 import os
 
 # Download models synchronously before Uvicorn starts the ASGI lifespan.
@@ -91,6 +91,7 @@ app = FastAPI(
 )
 
 app.include_router(docling_router)
+app.include_router(model_pipeline_router)
 
 templates = Jinja2Templates(directory="templates")
 
@@ -472,20 +473,10 @@ async def parse_resume_hybrid_stage2_endpoint(
 
 # ── Helper: full resume pipeline reused internally ────────────────────────────
 async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
-    """Parse resume via external meta-tagging API, falling back to local pipeline
-    if the external service is unavailable.
-    """
+    """Parse resume via local hybrid pipeline (normal text + Docling in parallel)."""
     raw_bytes = await file.read()
     filename = file.filename or "resume.pdf"
 
-    try:
-        return await parse_resume_via_api(raw_bytes, filename)
-    except Exception as e:
-        logger.warning(
-            "External meta-tag API failed (%s), falling back to local pipeline", e,
-        )
-
-    # Local fallback (original hybrid pipeline)
     from resume_parser import _parse_docx, _parse_pdf
 
     fname_lower = filename.lower()

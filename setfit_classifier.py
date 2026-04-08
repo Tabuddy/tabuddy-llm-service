@@ -16,7 +16,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ranking_models import TierClassification, TierPrediction
@@ -72,6 +73,43 @@ def load_setfit_models() -> bool:
     return MODELS_LOADED
 
 
+_models_lock = threading.Lock()
+_MODEL_LABEL_COUNTS = {
+    "tier1": ["Digital", "Physical", "Service"],
+    "tier2": ["App_Engineering", "Data_Intelligence", "Infra_Cloud", "Product_Design", "Cyber_Security"],
+    "tier3": ["Stack_Java", "Stack_Python", "Stack_Node", "Stack_React",
+              "Stack_ReactNative", "Stack_Angular", "Stack_iOS", "Stack_Android"],
+}
+
+
+def reload_models() -> dict[str, bool]:
+    """Unload and re-load SetFit models from disk (hot-reload in production).
+
+    Thread-safe. Returns {tier_name: True/False}.
+    """
+    global _models, MODELS_LOADED
+    from setfit import SetFitModel  # type: ignore
+
+    with _models_lock:
+        _models.clear()
+        results: dict[str, bool] = {}
+        for tier, path in _MODEL_PATHS.items():
+            if not path.exists():
+                logger.warning("reload: model path missing %s", path)
+                results[tier] = False
+                continue
+            try:
+                model = SetFitModel.from_pretrained(str(path))
+                _models[tier] = model
+                results[tier] = True
+                logger.info("✅ Hot-reloaded SetFit %s", tier)
+            except Exception as e:
+                logger.error("❌ Hot-reload failed for %s: %s", tier, e)
+                results[tier] = False
+        MODELS_LOADED = any(results.values())
+        return results
+
+
 def _predict_single(model, text: str) -> dict:
     """Run prediction on a single model, return {role, score}."""
     probs = model.predict_proba([text])[0]
@@ -85,7 +123,7 @@ def _predict_single(model, text: str) -> dict:
 def _log_low_confidence(tier: str, text: str, predicted: str, confidence: float) -> None:
     """Append a low-confidence prediction to the JSONL log."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "layer": tier,
         "text": text[:200],
         "predicted_label": predicted,

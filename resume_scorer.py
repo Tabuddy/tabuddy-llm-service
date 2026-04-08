@@ -41,10 +41,10 @@ logger = logging.getLogger(__name__)
 _WEIGHTS: dict[ExperienceLevel, dict[str, float]] = {
     ExperienceLevel.SENIOR: {
         "tier_alignment": 0.15,
-        "capability_match": 0.25,
-        "skill_match": 0.10,
-        "experience_quality": 0.30,
-        "scale_impact": 0.10,
+        "capability_match": 0.20,
+        "skill_match": 0.20,
+        "experience_quality": 0.20,
+        "scale_impact": 0.15,
         "domain_context": 0.10,
     },
     ExperienceLevel.MID: {
@@ -71,6 +71,34 @@ _TIER2_LABELS = {
     "App_Engineering", "Data_Intelligence", "Infra_Cloud",
     "Product_Design", "Cyber_Security",
 }
+
+# Stack-family groups: stacks that commonly overlap in real-world roles.
+# Used to give partial Tier 3 credit when JD and resume differ at Tier 3
+# but both belong to the same broad stack family.
+_STACK_COMPATIBILITY_GROUPS: dict[str, set[str]] = {
+    "frontend_web":  {"Stack_React", "Stack_Angular", "Stack_Python"},
+    "backend":       {"Stack_Java", "Stack_Python", "Stack_Node"},
+    "fullstack_web": {
+        "Stack_React", "Stack_Node", "Stack_Angular",
+        "Stack_Python", "Stack_Java",
+    },
+    "mobile":        {"Stack_ReactNative", "Stack_iOS", "Stack_Android"},
+}
+
+
+def _tier3_partial_credit(jd_t3: str | None, res_t3: str | None) -> float:
+    """Return a partial Tier 3 score (0-20) when labels differ but share
+    a stack family. Returns 20.0 for exact match, 12.0 if both in the same
+    compatibility group, 5.0 if unrelated.
+    """
+    if not jd_t3 or not res_t3:
+        return 20.0
+    if jd_t3 == res_t3:
+        return 20.0
+    for group_stacks in _STACK_COMPATIBILITY_GROUPS.values():
+        if jd_t3 in group_stacks and res_t3 in group_stacks:
+            return 12.0
+    return 5.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -287,15 +315,20 @@ def _semantic_similarity_score(query: str, candidates: list[str]) -> float:
     return semantic_best_match(query, candidates)
 
 
-def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4) -> float:
+def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4, strict: bool = False) -> float:
     """Find highest match score between query and a list of candidates.
 
-    Three-tier matching:
-      1. Exact / substring match → returns 1.0 immediately
-      2. Dictionary-normalized exact/substring match → returns 1.0
+    Matching tiers:
+      1. Exact / substring match → returns 1.0
+      2. Dictionary-normalized exact/substring → returns 0.9
       3. Jaccard token overlap → returns score if >= threshold
-      4. Semantic embedding similarity (fallback) → returns score
-         if semantic >= 0.75 (full) or >= 0.6 (partial)
+      4. Semantic embedding similarity (fallback) → returns score if >=0.55, capped at 0.7
+      5. LLM fallback → returns 0.35 if contextually related
+
+    strict mode (for technology keywords):
+      - Skips semantic and LLM fallback
+      - Requires Jaccard >= 0.6 to return a positive score
+      - Returns 0.0 if only weak fuzzy matches
     """
     if not candidates:
         return 0.0
@@ -327,6 +360,15 @@ def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4)
                         or norm_q_canonical in norm_c_canonical
                         or norm_c_canonical in norm_q_canonical):
                     return 0.9  # Very high but not 1.0 to distinguish from exact
+
+    # Strict mode: only Jaccard with higher threshold, no semantic/LLM
+    if strict:
+        best = 0.0
+        for norm_c in norm_candidates:
+            score = _fuzzy_match_score(norm_q, norm_c)
+            if score > best:
+                best = score
+        return best if best >= 0.6 else 0.0
 
     # Tier 3: Jaccard token overlap
     best = 0.0
@@ -458,6 +500,18 @@ def _collect_resume_skills(resume: ResumeTaggingResponse) -> dict[str, str]:
             if norm and len(norm) > 1 and norm not in skills:
                 skills[norm] = "listed"
 
+    # Domain skills — extracted by LLM, useful for industry/domain alignment
+    for s in sc.domain_skills:
+        norm = _normalize_term(s)
+        if norm and len(norm) > 1 and norm not in skills:
+            skills[norm] = "domain"
+
+    # Soft skills — extracted by LLM, useful for culture/team alignment
+    for s in sc.soft_skills:
+        norm = _normalize_term(s)
+        if norm and len(norm) > 1 and norm not in skills:
+            skills[norm] = "soft"
+
     return skills
 
 
@@ -480,16 +534,100 @@ _GENERIC_SKILL_WORDS = {
     "best", "practices", "and", "the", "for", "with", "using",
 }
 
+# Stack-indicator words that MUST be kept during decomposition because they
+# carry meaningful signal about the candidate's or JD's stack scope.
+_STACK_INDICATORS = {
+    "full", "stack", "frontend", "backend", "web", "mobile",
+    "cross", "platform", "end",
+}
+
 
 def _decompose_compound_skill(compound: str) -> list[str]:
     """Break compound capability terms into individual tech words for matching.
 
-    E.g., 'docker implementation' → ['docker']
-          'restful api development' → ['restful', 'api']
-          'full-stack development' → ['fullstack', 'full', 'stack']
+    Retains stack-indicator words that _GENERIC_SKILL_WORDS would normally
+    filter out, because in compound contexts they signal stack scope.
+
+    E.g., 'full-stack development' → ['full', 'stack']
+          'frontend engineering'   → ['frontend']
+          'docker implementation'  → ['docker']
     """
     words = _normalize_term(compound).split()
-    return [w for w in words if w not in _GENERIC_SKILL_WORDS and len(w) > 1]
+    return [
+        w for w in words
+        if (w not in _GENERIC_SKILL_WORDS or w in _STACK_INDICATORS) and len(w) > 1
+    ]
+
+
+_FRONTEND_SIGNALS = {
+    "react", "angular", "vue", "svelte", "next", "html", "css",
+    "frontend", "front-end", "ui", "web component",
+}
+_BACKEND_SIGNALS = {
+    "node", "python", "java", "go", "rust", "ruby", "php",
+    "backend", "back-end", "api", "server", "microservice",
+    "postgresql", "postgres", "mysql", "mongo", "redis",
+}
+_MOBILE_SIGNALS = {
+    "ios", "android", "react native", "flutter", "swift", "kotlin",
+    "mobile", "xcode", "cocoa", "jetpack",
+}
+
+
+def _has_stack_breadth(signals: list[str], min_categories: int = 2) -> bool:
+    """Check if a list of skill/capability signals spans multiple stack
+    categories (frontend + backend + mobile).
+    """
+    s = {s.lower() for s in signals}
+    categories = 0
+    if s & _FRONTEND_SIGNALS:
+        categories += 1
+    if s & _BACKEND_SIGNALS:
+        categories += 1
+    if s & _MOBILE_SIGNALS:
+        categories += 1
+    return categories >= min_categories
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADDITIONAL VALIDATION HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compute_tech_coherence(jd_tech: list[str], resume_tech: list[str]) -> float:
+    """Compute Jaccard similarity between JD tech requirements and resume's primary tech stack."""
+    jd_norm = {_normalize_term(t) for t in jd_tech if _normalize_term(t)}
+    res_norm = {_normalize_term(t) for t in resume_tech if _normalize_term(t)}
+    if not jd_norm or not res_norm:
+        return 0.0
+    intersection = jd_norm & res_norm
+    union = jd_norm | res_norm
+    return len(intersection) / len(union)
+
+
+def _count_primary_caps_high_match(jd: JDProfile, resume: ResumeTaggingResponse, threshold: float = 0.7) -> int:
+    """Count how many PRIMARY core capabilities from the JD are matched by the resume with score >= threshold."""
+    core = jd.core_capabilities
+    # Build resume signals as in score_capability_match
+    resume_skill_set = _collect_resume_skills(resume)
+    resume_tech = [_normalize_term(t) for t in _collect_all_resume_tech(resume)]
+    resume_signals: list[str] = list(resume_skill_set.keys()) + resume_tech
+    for sig in resume.context_meta_tags.resume_strength_signals:
+        norm_sig = _normalize_term(sig)
+        if norm_sig:
+            resume_signals.append(norm_sig)
+    for focus in resume.context_meta_tags.summary_tags.domain_focus:
+        norm_focus = _normalize_term(focus)
+        if norm_focus:
+            resume_signals.append(norm_focus)
+
+    count = 0
+    for cap in core:
+        if cap.classification != "PRIMARY":
+            continue
+        match = _best_match_score(cap.normalized_entity, resume_signals)
+        if match >= threshold:
+            count += 1
+    return count
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -542,12 +680,19 @@ def score_tier_alignment(
     res_t3 = resume_tier.tier3.label if resume_tier.tier3 else None
 
     if jd_t3 and res_t3:
+        t3_credit = _tier3_partial_credit(jd_t3, res_t3)
         if jd_t3 == res_t3:
             score += 20.0
             evidence.append(f"✓ Tier 3 match: {jd_t3}")
+        elif t3_credit >= 10.0:
+            score += t3_credit
+            evidence.append(
+                f"△ Tier 3 compatible: JD={jd_t3}, Resume={res_t3} "
+                f"(overlapping stack family, +{t3_credit:.0f})"
+            )
         else:
-            score += 5.0
-            evidence.append(f"△ Tier 3 partial: JD={jd_t3}, Resume={res_t3}")
+            score += t3_credit
+            evidence.append(f"△ Tier 3 different: JD={jd_t3}, Resume={res_t3}")
     elif not jd_t3:
         score += 20.0  # JD doesn't specify tier 3
 
@@ -602,6 +747,19 @@ def score_capability_match(
         elif match >= 0.4:
             evidence.append(f"△ ~{cap.normalized_entity} (partial)")
 
+    # Stack breadth bonus: multi-stack candidates matching narrow JD capabilities
+    if total_weight and _has_stack_breadth(resume_signals, min_categories=2):
+        jd_role = (jd.role_family or "").lower()
+        if any(term in jd_role for term in [
+            "frontend", "front-end", "backend", "back-end", "mobile",
+        ]):
+            breadth_bonus = min(matched_weight * 0.08, total_weight * 0.1)
+            matched_weight += breadth_bonus
+            evidence.append(
+                "Multi-stack candidate with relevant narrow coverage "
+                "for single-stack JD"
+            )
+
     score = (matched_weight / total_weight) * 100 if total_weight else 0.0
     no_match_count = sum(
         1 for cap in all_caps
@@ -648,7 +806,7 @@ def score_skill_match(
         if best_score < 0.6:
             parts = _decompose_compound_skill(req_skill)
             for part in parts:
-                part_score = _best_match_score(part, all_resume_skills_norm)
+                part_score = _best_match_score(part, all_resume_skills_norm, strict=True)
                 if part_score > best_score:
                     best_score = part_score
 
@@ -681,7 +839,7 @@ def score_skill_match(
         if any(_normalize_term(tech) in _normalize_term(r) for r in required):
             continue
         tech_total += 1
-        match = _best_match_score(tech, all_resume_skills_norm)
+        match = _best_match_score(tech, all_resume_skills_norm, strict=True)
         if match >= 0.8:
             prov = resume_skills.get(tech, "listed")
             if prov == "contextual":
@@ -690,7 +848,7 @@ def score_skill_match(
             else:
                 tech_matched += 1.0
                 evidence.append(f"✓ {tech} (listed)")
-        elif match >= 0.4:
+        elif match >= 0.6:
             tech_matched += 0.5
 
     # ── Combined score ──────────────────────────────────────────────────────
@@ -823,6 +981,24 @@ def score_experience_quality(
     ) else 0
     if leadership_bonus:
         evidence.append(f"  Leadership bonus: +{leadership_bonus}pts")
+
+    # Soft-skill alignment bonus — resume's soft skills matching JD keywords
+    sc = resume.context_meta_tags.skill_categories
+    if sc.soft_skills:
+        soft_keywords = {
+            "agile", "scrum", "collaboration", "communication",
+            "team", "leadership", "mentor", "presentation",
+        }
+        resume_softs = [_normalize_term(s) for s in sc.soft_skills if _normalize_term(s)]
+        soft_match = sum(
+            1 for s in resume_softs
+            if any(kw in s for kw in soft_keywords)
+        )
+        if soft_match >= 2:
+            base_score = min(base_score + soft_match * 2, 100.0)
+            evidence.append(
+                f"Soft skill alignment: {soft_match} relevant soft skills"
+            )
 
     return min(base_score + leadership_bonus, 100.0), evidence
 
@@ -1187,6 +1363,35 @@ def score_resume(
             ds.weighted_score = round(ds.raw_score * ds.weight, 1)
 
     final_score = sum(d.weighted_score for d in dimension_scores)
+
+    # ——— Penalty 1: Tech Stack Coherence ———
+    # If JD specifies a clear tech stack (>=3 tech keywords) and candidate's primary tech
+    # has very low overlap (<0.3 Jaccard), apply a 30% penalty.
+    if jd.required_tech_normalized and len(jd.required_tech_normalized) >= 3:
+        # Gather resume's primary tech: contextual skills + tech from experience/projects
+        resume_contextual_skills = [
+            skill for skill, prov in _collect_resume_skills(resume).items()
+            if prov == "contextual"
+        ]
+        resume_primary_tech = resume_contextual_skills + _collect_all_resume_tech(resume)
+        coherence = _compute_tech_coherence(jd.required_tech_normalized, resume_primary_tech)
+        if coherence < 0.3:
+            final_score *= 0.7
+            logger.debug(
+                "Tech stack coherence penalty: coherence=%.2f, score adjusted to %.1f",
+                coherence, final_score
+            )
+
+    # ——— Penalty 2: Must-Have Primary Capability Gate ———
+    # Ensure at least one PRIMARY core capability is strongly matched (≥0.7)
+    primary_high_count = _count_primary_caps_high_match(jd, resume, threshold=0.7)
+    if primary_high_count == 0:
+        # Cap the final score at 60 if no core capability strongly matches
+        final_score = min(final_score, 60.0)
+        logger.debug(
+            "No PRIMARY capability matched ≥0.7; capping final_score at 60 (was %.1f)",
+            final_score
+        )
 
     # Tier mismatch hard penalty (only if tier1 completely wrong)
     tier_mismatch = (

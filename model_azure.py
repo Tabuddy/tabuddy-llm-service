@@ -66,7 +66,39 @@ def download_models_from_azure(local_model_dir: str = "setfit_models", container
     except Exception as e:
         logger.error("❌ Failed to download models from Azure: %s", e)
 
-if __name__ == "__main__":
-    # Configure basic logging if executed directly
-    logging.basicConfig(level=logging.INFO)
-    download_models_from_azure()
+
+def upload_models_to_azure(local_model_dir: str = "setfit_models", container_name: str = "setfit-models") -> dict:
+    """Upload all files in local_model_dir/ to Azure blob.
+
+    Returns: {"success": True/False, "uploaded": int, "error": str|None}
+    """
+    url = os.getenv("AZURE_MODELS_CONTAINER_URL")
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+
+    if url:
+        container_client = ContainerClient.from_container_url(url)
+    elif connection_string:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
+    else:
+        return {"success": False, "uploaded": 0, "error": "No Azure credentials"}
+
+    model_dir = Path(local_model_dir)
+    if not model_dir.exists():
+        return {"success": False, "uploaded": 0, "error": "Local models directory not found"}
+
+    uploaded = 0
+    try:
+        for filepath in model_dir.rglob("*"):
+            if filepath.is_file():
+                blob_name = str(filepath.relative_to(model_dir)).replace("\\", "/")
+                blob_client = container_client.get_blob_client(blob_name)
+                blob_client.upload_blob(filepath.read_bytes(), overwrite=True)
+                uploaded += 1
+                logger.info("  Uploaded %s", blob_name)
+
+        logger.info("✅ Uploaded %d model files to Azure.", uploaded)
+        return {"success": True, "uploaded": uploaded}
+    except Exception as e:
+        logger.error("❌ Failed to upload models to Azure: %s", e)
+        return {"success": False, "uploaded": uploaded, "error": str(e)}

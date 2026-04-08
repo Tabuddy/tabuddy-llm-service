@@ -150,7 +150,8 @@ async def _crosscheck_tier_classification(
         "microservices), even if they use Docker/AWS/CI-CD as tools\n"
         "- Infra_Cloud: roles whose PRIMARY job is MANAGING infrastructure, "
         "platforms, or CI/CD systems at organizational scale\n"
-        "- Data_Intelligence: roles focused on ML, data science, analytics\n\n"
+        "- Data_Intelligence: roles focused on data engineering, data pipelines, "
+        "ETL, data warehousing, knowledge graphs, ML, data science, analytics\n\n"
         f"SetFit predicted: {setfit_result.hierarchy_path}\n\n"
         f"JD (truncated):\n{jd_text[:1000]}\n\n"
         "Respond with ONLY the path, e.g.: Digital > App_Engineering\n"
@@ -204,21 +205,59 @@ async def _crosscheck_tier_classification(
 
 # ── Tech Keyword Extraction ────────────────────────────────────────────────────
 _COMMON_TECH_TERMS = {
-    "react", "reactjs", "react.js", "node", "nodejs", "node.js",
-    "javascript", "typescript", "python", "java", "golang", "rust",
-    "ruby", "php", "swift", "kotlin", "angular", "vue", "vue.js",
-    "next.js", "nextjs", "svelte", "express", "fastapi", "django",
-    "flask", "spring boot", "spring", "docker", "kubernetes", "k8s",
-    "terraform", "ansible", "jenkins", "github actions",
-    "aws", "azure", "gcp", "google cloud",
-    "postgresql", "postgres", "mysql", "mongodb", "redis",
-    "elasticsearch", "graphql", "restful", "rest", "grpc",
-    "websocket", "socket.io", "ci/cd", "git", "github", "gitlab",
-    "html", "css", "tailwind", "sass", "redux", "mobx",
-    "jest", "cypress", "selenium", "playwright",
-    "kafka", "rabbitmq", "microservices", "serverless",
-    "observability", "monitoring", "grafana", "prometheus",
-    "agile", "scrum",
+    # Frontend
+    "react", "reactjs", "react.js", "vue", "vue.js", "angular", "svelte",
+    "next.js", "nextjs", "html", "css", "tailwind", "sass", "bootstrap",
+    "jquery", "webpack", "vite", "babel",
+    # Backend & Fullstack
+    "node", "nodejs", "node.js", "express", "fastapi", "django", "flask",
+    "spring boot", "spring", "java", "python", "golang", "rust", "ruby",
+    "php", "swift", "kotlin", "csharp", "c#", ".net", "asp.net",
+    "microservices", "restful", "rest", "grpc", "graphql", "websocket",
+    "serverless", "lambd", "api", "backend", "frontend", "fullstack",
+    "typescript", "javascript", "es6", "babel",
+    # Mobile
+    "ios", "android", "react native", "flutter", "swift", "kotlin",
+    "xcode", "android studio", "mobile", "app",
+    # DevOps & Cloud
+    "docker", "kubernetes", "k8s", "docker-compose", "helm",
+    "terraform", "ansible", "jenkins", "github actions", "gitlab ci",
+    "aws", "azure", "gcp", "google cloud", "cloud", "iaas", "paas", "saas",
+    "ci/cd", "pipelines", "infrastructure", "orchestration", "monitoring",
+    "observability", "logging", "tracing", "prometheus", "grafana",
+    "elk", "elastic", "stack", "kibana", "datadog", "new relic",
+    # Databases
+    "postgresql", "postgres", "mysql", "mariadb", "mongodb", "redis",
+    "cassandra", "mssql", "sql server", "oracle", "elasticsearch",
+    "dynamodb", "cosmosdb", "firestore", "neo4j", "graph database",
+    "rdbms", "nosql", "sql", "database", "db", "data storage",
+    # Data Engineering & Analytics
+    "big data", "hadoop", "spark", "databricks", "airflow", "luigi", "prefect",
+    "dbt", "data pipeline", "etl", "elt", "data warehouse", "data lake",
+    "data mesh", "data fabric", "kafka", "confluent", "pulsar", "rabbitmq",
+    "sqoop", "flink", "kinesis", "stream processing", "batch processing",
+    "pandas", "numpy", "scipy", "scikit-learn", "sklearn", "tensorflow",
+    "pytorch", "keras", "mlflow", "kubeflow", "feast", "hopsworks",
+    "feature store", "model deployment", "model serving",
+    "knowledge graph", "rdf", "owl", "sparql", "graphql", "triple store",
+    "vector", "embeddings", "vector database", "pinecone", "weaviate", "milvus",
+    "qdrant", "pgvector", "ann", "approximate nearest neighbor",
+    "hdfs", "s3", "azure blob", "cloud storage", "object storage",
+    "data ingestion", "data extraction", "data transformation", "data loading",
+    "data quality", "data governance", "data catalog", "metadata",
+    # Testing & QA
+    "selenium", "cypress", "playwright", "jest", "mocha", "junit",
+    "pytest", "testng", "cucumber", "bdd", "tdd", "integration test",
+    "unit test", "e2e", "end-to-end", "mocking", "stubbing",
+    # Version Control & Collaboration
+    "git", "github", "gitlab", "bitbucket", "azure devops", "jira",
+    "confluence", "slack", "microsoft teams", "agile", "scrum", "kanban",
+    "waterfall", "devops", "sre", "site reliability", "incident response",
+    # Security & Compliance
+    "oauth", "jwt", "saml", "ldap", "kerberos", "encryption", "TLS",
+    "SSL", "HTTPS", "firewall", "vpc", "subnet", "vpn", "rbac", "abac",
+    "pci", "hipaa", "gdpr", "compliance", "audit", "penetration test",
+    "vulnerability", "scanning", " secrets management", "key vault",
 }
 
 
@@ -236,14 +275,14 @@ def _extract_experience_requirements(jd_text: str) -> tuple[float | None, float 
 
     # Seniority keywords (order matters — check most specific first)
     seniority_map = [
-        (("principal engineer", "principle"), "principal"),
+        (("principal engineer", "principle", "staff engineer", "staff "), "principal"),
+        (("engineering manager", "tech lead", "team lead"), "senior"),
         (("senior",), "senior"),
         (("lead",), "senior"),
-        (("mid.level",), "mid"),
-        (("junior",), "junior"),
-        (("entry.level",), "fresher"),
-        (("fresher",), "fresher"),
-        (("graduate",), "fresher"),
+        (("sde-3", "sde 3", "sde3"), "senior"),
+        (("sde-2", "sde 2", "sde2", "mid.level", "mid level", "intermediate"), "mid"),
+        (("sde-1", "sde 1", "sde1", "junior", "software engineer i"), "junior"),
+        (("entry.level", "fresher", "graduate"), "fresher"),
         (("intern",), "fresher"),
     ]
     for patterns, label in seniority_map:
