@@ -253,7 +253,7 @@ async def training_logs(
     layer: str | None = Query(None, description="Filter by tier name"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(25, ge=1, le=100, description="Entries per page"),
-    sort: str = Query('desc', regex='^(asc|desc)$', description="Sort order: 'asc' for oldest first, 'desc' for newest first")
+    sort: str = Query('desc', pattern='^(asc|desc)$', description="Sort order: 'asc' for oldest first, 'desc' for newest first")
 ):
     """Read low_confidence_log.jsonl and return paginated, sorted entries."""
     if not _LOW_CONF_LOG.exists():
@@ -267,7 +267,7 @@ async def training_logs(
                 if line:
                     try:
                         entry = json.loads(line)
-                        if layer is None or entry.get("layer") == layer:
+                        if not layer or entry.get("layer") == layer:
                             entries.append(entry)
                     except json.JSONDecodeError:
                         continue
