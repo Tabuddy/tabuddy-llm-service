@@ -390,6 +390,25 @@
     .trace-item .verb { color: var(--accent2); }
     .trace-item .ctx { color: var(--text-dim); font-style: italic; }
     .trace-item .met { color: var(--success); }
+    .trace-item .trace-temporal {
+      display: block;
+      margin-top: 0.3rem;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      font-family: ui-monospace, monospace, system-ui;
+    }
+    .gsi-total-yrs {
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      color: var(--accent2);
+    }
+    .gsi-footnote {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      margin-top: 0.55rem;
+      max-width: 52rem;
+      line-height: 1.35;
+    }
 
     /* Global Parameters */
     .param-group {
@@ -827,6 +846,43 @@
       return d.innerHTML;
     }
 
+    /**
+     * Turn API fractional years into readable text: "9 months", "1 year 4 months", "2 years".
+     */
+    function fmtYearsLabel(val) {
+      if (val == null || val === '') return null;
+      const n = Number(val);
+      if (Number.isNaN(n) || n <= 0) return null;
+
+      let wholeYears = Math.floor(n + 1e-9);
+      let fractional = n - wholeYears;
+      let months = Math.round(fractional * 12);
+      if (months === 12) {
+        wholeYears += 1;
+        months = 0;
+      }
+
+      const parts = [];
+      if (wholeYears > 0) {
+        parts.push(wholeYears + (wholeYears === 1 ? ' year' : ' years'));
+      }
+      if (months > 0) {
+        parts.push(months + (months === 1 ? ' month' : ' months'));
+      }
+      if (parts.length > 0) {
+        return parts.join(' ');
+      }
+
+      const m = Math.max(1, Math.round(n * 12));
+      if (m >= 12) {
+        const y = Math.floor(m / 12);
+        const rm = m % 12;
+        if (rm === 0) return y + (y === 1 ? ' year' : ' years');
+        return y + (y === 1 ? ' year ' : ' years ') + rm + (rm === 1 ? ' month' : ' months');
+      }
+      return m + (m === 1 ? ' month' : ' months');
+    }
+
     function renderResults(data, elapsed) {
       document.getElementById('pipelineTime').innerHTML =
         'Pipeline completed in <strong>' + elapsed + 's</strong>';
@@ -1004,10 +1060,12 @@
       });
       document.getElementById('gsiCount').textContent = gsi.length + ' skills';
       let gsiHtml = '<div style="overflow-x:auto"><table class="gsi-table"><thead><tr>';
-      gsiHtml += '<th>Skill</th><th>Occurrences</th><th>Traces</th></tr></thead><tbody>';
+      gsiHtml += '<th>Skill</th><th>Total time</th><th>Occurrences</th><th>Traces</th></tr></thead><tbody>';
       gsi.forEach(entry => {
+        const totalYrs = fmtYearsLabel(entry.computed_years_with_skill);
         gsiHtml += '<tr>';
         gsiHtml += '<td class="gsi-skill">' + esc(entry.skill) + '</td>';
+        gsiHtml += '<td class="gsi-total-yrs">' + (totalYrs ? esc(totalYrs) : '—') + '</td>';
         gsiHtml += '<td>' + (entry.traces ? entry.traces.length : 0) + '</td>';
         gsiHtml += '<td>';
         (entry.traces || []).forEach(tr => {
@@ -1016,11 +1074,22 @@
           gsiHtml += '<span class="verb">' + esc(tr.action_verb) + '</span> ';
           gsiHtml += '<span class="ctx">"' + esc(tr.context) + '"</span>';
           if (tr.metric) gsiHtml += ' <span class="met">📊 ' + esc(tr.metric) + '</span>';
+          const roleYrs = fmtYearsLabel(tr.computed_years_with_skill);
+          const lastUsed = tr.last_used_date ? String(tr.last_used_date).trim() : '';
+          if (lastUsed || roleYrs) {
+            gsiHtml += '<span class="trace-temporal">';
+            const bits = [];
+            if (lastUsed) bits.push('last used ' + esc(lastUsed));
+            if (roleYrs) bits.push(esc(roleYrs) + ' in block');
+            gsiHtml += bits.join(' · ');
+            gsiHtml += '</span>';
+          }
           gsiHtml += '</div>';
         });
         gsiHtml += '</td></tr>';
       });
       gsiHtml += '</tbody></table></div>';
+      gsiHtml += '<p class="gsi-footnote">Temporal fields come from experience blocks (hybrid pipeline). <strong>Total time</strong> sums per-trace tenure (shown as years/months); overlapping jobs may double-count. Project/summary-only traces often show no dates.</p>';
       document.getElementById('gsiBody').innerHTML = gsiHtml;
 
       // Global Parameters

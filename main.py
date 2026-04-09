@@ -285,7 +285,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
                 tmp.write(raw_bytes)
                 tmp_path = tmp.name
             try:
-                return convert_path_to_markdown(tmp_path)
+                return convert_path_to_markdown(tmp_path, device="cpu")
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
         except Exception as e:
@@ -338,6 +338,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
         parsed_text=raw_text,
         zoned_blocks=blocks,
         extracted_links=extracted_links,
+        enrich_skill_temporal=True,
     )
 
     logger.info("Hybrid pipeline total took %.2fs", time.perf_counter() - t0)
@@ -373,7 +374,7 @@ async def parse_resume_hybrid_stage1_endpoint(file: UploadFile = File(...)):
                 tmp.write(raw_bytes)
                 tmp_path = tmp.name
             try:
-                return convert_path_to_markdown(tmp_path)
+                return convert_path_to_markdown(tmp_path, device="cpu")
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
         except Exception as e:
@@ -460,6 +461,7 @@ async def parse_resume_hybrid_stage2_endpoint(
         parsed_text=payload.parsed_text,
         zoned_blocks=stage1_blocks,  # keep stage1 preview in UI/debug
         extracted_links=payload.extracted_links,
+        enrich_skill_temporal=True,
     )
 
     logger.info("Hybrid stage2 total took %.2fs", time.perf_counter() - t0)
