@@ -1,21 +1,23 @@
 from __future__ import annotations
-
-from contextlib import asynccontextmanager
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
-import asyncio
-import logging
-import time
-import tempfile
-from pathlib import Path
-
-# ── Ranking system imports ────────────────────────────────────────────────────
-import setfit_classifier as clf
-from jd_parser import parse_jd
-from resume_scorer import score_resume, detect_experience_level
+from hybrid_block_builder import build_hybrid_blocks
+from docling_api import docling_router
+from models import (
+    ResumeTaggingResponse,
+    HybridParseStage1Response,
+    ZonedBlockPreview,
+    ExtractedLink,
+    ResumeBlock,
+)
+from aggregator import aggregate
+from meta_tag_extractor import extract_context_meta_tags
+from global_parameter_extractor import extract_global_parameters
+from block_tagger import tag_all_blocks
+from nlp_filter import filter_blocks
+from candidate_extractor import extract_candidate_details
+from resume_zoner import zone_resume
+from resume_parser import extract_text, extract_pdf_links
+import skill_library
+import db
 from ranking_models import (
     JDProfile,
     RankingSession,
@@ -26,56 +28,70 @@ from ranking_models import (
     TierClassification,
     TierPrediction,
 )
+from resume_scorer import score_resume, detect_experience_level
+from jd_parser import parse_jd
+import setfit_classifier as clf
+from pathlib import Path
+import tempfile
+import time
+import logging
+import asyncio
+from pydantic import BaseModel, Field
+from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+from model_azure import download_models_from_azure, upload_models_to_azure
+from model_pipeline import router as model_pipeline_router
 
-from resume_parser import extract_text, extract_pdf_links
-from resume_zoner import zone_resume
-from candidate_extractor import extract_candidate_details
-from nlp_filter import filter_blocks
-from block_tagger import tag_all_blocks
-from global_parameter_extractor import extract_global_parameters
-from meta_tag_extractor import extract_context_meta_tags
-from aggregator import aggregate
-from models import (
-    ResumeTaggingResponse,
-    HybridParseStage1Response,
-    ZonedBlockPreview,
-    ExtractedLink,
-    ResumeBlock,
-)
-from docling_api import docling_router
-from hybrid_block_builder import build_hybrid_blocks
+# Suppress noisy third-party progress bars BEFORE any imports that pull in tqdm
+import os
+os.environ["TQDM_DISABLE"] = "1"
+
+
+# ── Ranking system imports ────────────────────────────────────────────────────
+
 
 logger = logging.getLogger(__name__)
 
 
 load_dotenv()
 
-# Reduce log spam: disable TQDM globally and quiet HTTPx
-import os
-os.environ["TQDM_DISABLE"] = "1"
-
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from model_azure import download_models_from_azure, upload_models_to_azure
-from model_pipeline import router as model_pipeline_router
-import os
+# Silence noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("docling").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
+logging.getLogger("RapidOCR").setLevel(logging.WARNING)
+logging.getLogger("rapidocr").setLevel(logging.WARNING)
+
 
 # Download models synchronously before Uvicorn starts the ASGI lifespan.
 # This strictly evades the Uvicorn 60-second lifespan timeout logic.
 if os.getenv("ENV") == "PROD":
-    logger.info("☁️ Production environment detected. Syncing models from Azure before starting server...")
+    logger.info(
+        "☁️ Production environment detected. Syncing models from Azure before starting server...")
     download_models_from_azure()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load SetFit models on startup; unload on shutdown."""
+    """Load SetFit models, MongoDB skill library on startup; unload on shutdown."""
     logger.info("🚀 Loading SetFit classification models...")
     loaded = clf.load_setfit_models()
     if loaded:
         logger.info("✅ SetFit models ready: %s", clf.get_loaded_tiers())
     else:
-        logger.warning("⚠️  SetFit models not loaded — tier classification degraded")
+        logger.warning(
+            "⚠️  SetFit models not loaded — tier classification degraded")
+
+    # Initialize MongoDB connection and merged skill library
+    await db.init_db()
+    await skill_library.init()
+
     yield
     logger.info("Shutting down TABuddy service")
 
@@ -500,7 +516,8 @@ async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
         except Exception as e:
-            logger.warning("Docling failed in ranking fallback pipeline: %s", e)
+            logger.warning(
+                "Docling failed in ranking fallback pipeline: %s", e)
             return ""
 
     raw_text, docling_md = await asyncio.gather(
@@ -541,6 +558,28 @@ async def ranking_parse_jd(req: ParseJDRequest):
     """
     if not req.jd_text.strip():
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
+
+    # Input validation: detect if resume text was accidentally sent as JD
+    import re as _re
+    _resume_signals = [
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",  # email
+        # 10-digit phone
+        r"\b\d{10}\b",
+        r"linkedin\.com/in/",                                   # linkedin
+        r"github\.com/",                                        # github
+    ]
+    signal_count = sum(
+        1 for pat in _resume_signals
+        if _re.search(pat, req.jd_text[:500], _re.IGNORECASE)
+    )
+    if signal_count >= 2:
+        logger.warning(
+            "⚠️  /ranking/parse-jd received text that looks like a resume "
+            "(contains %d personal-info signals in first 500 chars). "
+            "Proceeding, but accuracy may be degraded.",
+            signal_count,
+        )
+
     t0 = time.perf_counter()
     profile = await parse_jd(req.jd_text)
     logger.info("JD parsing took %.2fs", time.perf_counter() - t0)
@@ -560,14 +599,20 @@ async def ranking_score_resume(
     t0 = time.perf_counter()
     resume = await _run_full_resume_pipeline(file)
 
-    # Classify resume with SetFit
+    # Classify resume with SetFit (use layered for multi-expertise support)
     resume_text = resume.parsed_text[:2000] if resume.parsed_text else ""
-    resume_tier = clf.classify_text(resume_text) if clf.models_available() else TierClassification(
-        tier1=TierPrediction(label="Unknown", score=0.0),
-        hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
-    )
+    if clf.models_available():
+        resume_lc = clf.classify_as_layered(resume_text)
+        resume_tier = resume_lc.to_legacy_tier()
+    else:
+        resume_lc = None
+        resume_tier = TierClassification(
+            tier1=TierPrediction(label="Unknown", score=0.0),
+            hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
+        )
 
-    result = score_resume(jd_profile.jd_profile, resume, resume_tier)
+    result = score_resume(jd_profile.jd_profile, resume,
+                          resume_tier, resume_lc=resume_lc)
     logger.info("Single resume scoring took %.2fs", time.perf_counter() - t0)
     return result
 
@@ -585,9 +630,11 @@ async def ranking_batch_rank(
     if not jd_text.strip():
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
     if not files:
-        raise HTTPException(status_code=400, detail="At least one resume file required")
+        raise HTTPException(
+            status_code=400, detail="At least one resume file required")
     if len(files) > 30:
-        raise HTTPException(status_code=400, detail="Maximum 30 resumes per batch")
+        raise HTTPException(
+            status_code=400, detail="Maximum 30 resumes per batch")
 
     t0 = time.perf_counter()
 
@@ -599,12 +646,18 @@ async def ranking_batch_rank(
     async def _score_one(f: UploadFile) -> ResumeRankResult | str:
         try:
             resume = await _run_full_resume_pipeline(f)
-            resume_text = resume.parsed_text[:2000] if resume.parsed_text else ""
-            resume_tier = clf.classify_text(resume_text) if clf.models_available() else TierClassification(
-                tier1=TierPrediction(label="Unknown", score=0.0),
-                hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
-            )
-            return score_resume(jd_profile, resume, resume_tier)
+            resume_text = resume.parsed_text[:
+                                             2000] if resume.parsed_text else ""
+            if clf.models_available():
+                resume_lc = clf.classify_as_layered(resume_text)
+                resume_tier = resume_lc.to_legacy_tier()
+            else:
+                resume_lc = None
+                resume_tier = TierClassification(
+                    tier1=TierPrediction(label="Unknown", score=0.0),
+                    hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
+                )
+            return score_resume(jd_profile, resume, resume_tier, resume_lc=resume_lc)
         except Exception as e:
             fname = getattr(f, "filename", "unknown")
             logger.exception("Error scoring resume %s: %s", fname, e)

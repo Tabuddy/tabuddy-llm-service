@@ -1,0 +1,19 @@
+{
+  "strong_primary": [
+    "job title contains platform name",
+    "mentioned first in required skills section",
+    "has explicit years of experience quantified (e.g. '5+ years in Java')",
+    "described with 'expert', 'deep', 'strong background', 'proficiency'",
+    "mentioned more than twice with elaboration or context",
+    "appears under 'must have', 'required', 'mandatory'",
+    "listed in job title or department name"
+  ],
+  "secondary_indicator": [
+    "appears under 'preferred', 'nice to have', 'bonus', 'plus'",
+    "phrased as 'familiarity with', 'exposure to', 'knowledge of'",
+    "described as 'a plus', 'advantage', 'bonus points'",
+    "appears once without elaboration",
+    "not in job title",
+    "listed after secondary bullet points"
+  ]
+}

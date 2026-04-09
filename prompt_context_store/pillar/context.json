@@ -1,0 +1,25 @@
+{
+  "options": [
+    "Application Engineering",
+    "Cyber Security",
+    "Data & Intelligence",
+    "Infrastructure & Cloud",
+    "Platform & Tooling",
+    "Product & Design"
+  ],
+  "definitions": {
+    "Application Engineering": "Roles that BUILD software products — web apps, mobile apps, APIs, microservices, embedded systems. Primary output is running software used by end users or other systems.",
+    "Cyber Security": "Roles whose primary job is securing systems, networks, and applications. Pen testing, threat detection, GRC compliance, SOC operations, IAM, application security.",
+    "Data & Intelligence": "Roles focused on data — building pipelines, warehouses, ML models, analytics platforms, BI reports, knowledge graphs, feature stores. Primary output is data products.",
+    "Infrastructure & Cloud": "Roles that MANAGE infrastructure, platforms, and CI/CD systems at organizational scale. Multi-team or org-wide responsibility. Primary output is stable, scalable platforms.",
+    "Platform & Tooling": "Roles that build INTERNAL developer platforms, observability tools, API gateways, auth systems, internal SDKs. Output is tooling consumed by other engineers.",
+    "Product & Design": "Roles focused on product strategy, UX design, user research, or product management. Primary output is product roadmaps, design artifacts, or user research insights."
+  },
+  "disambiguation_rules": [
+    "App Engineering vs Infrastructure: If the role's PRIMARY output is running software used by end users → App Engineering. If managing shared platforms for other teams → Infrastructure.",
+    "App Engineering vs Data: If building ML-powered features that run in an app → App Engineering. If building the data platform that trains models → Data & Intelligence.",
+    "Platform & Tooling vs Infrastructure: Platform engineering builds tools for developers (SDKs, APIs). Infrastructure manages compute/network/storage at org scale.",
+    "Cyber Security vs App Engineering: Application Security Engineers who write security features belong in App Engineering. Dedicated security teams (SOC, pen test) belong in Cyber Security.",
+    "Product & Design vs App Engineering: A TPM or Product Manager is Product & Design. An engineer who also does product planning is still App Engineering."
+  ]
+}

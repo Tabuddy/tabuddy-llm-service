@@ -8,10 +8,14 @@ Provides API endpoints to:
 """
 
 from __future__ import annotations
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
 
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +47,8 @@ _training_state: dict[str, Any] = {
     "finished_at": None,
     "message": None,
     "layers_trained": [],
+    "device": None,             # "GPU: RTX 3060" or "CPU"
+    "layer_times": {},          # {"tier1": {"duration_s": 32.1}, ...}
 }
 _lock = threading.Lock()
 
@@ -77,6 +83,8 @@ class TrainingStatusResponse(BaseModel):
     finished_at: str | None
     message: str | None
     layers_trained: list[str]
+    device: str | None = None
+    layer_times: dict = {}
 
 
 class ModelStateItem(BaseModel):
@@ -104,16 +112,14 @@ class AzureActionResult(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _run_training_background():
-    """Background worker that runs all three tiers then hot-reloads."""
+    """Background worker that runs all three tiers then hot-reloads.
+
+    Auto-detects GPU and uses GPU-accelerated training when available.
+    Records per-layer timing for the frontend.
+    """
     global _training_state
-    from setfit_trainer import TIER1_DATA, TIER2_DIGITAL_DATA, TIER3_APP_ENG_DATA, train_layer
 
-    _datasets = {
-        "tier1": TIER1_DATA,
-        "tier2": TIER2_DIGITAL_DATA,
-        "tier3": TIER3_APP_ENG_DATA,
-    }
-
+    # Set status to training IMMEDIATELY so the frontend can show it
     with _lock:
         _training_state = {
             "status": "training",
@@ -121,22 +127,99 @@ def _run_training_background():
             "finished_at": None,
             "message": None,
             "layers_trained": [],
+            "device": None,
+            "layer_times": {},
         }
 
+    try:
+        _run_training_inner()
+    except Exception as exc:
+        logger.exception("Training thread crashed: %s", exc)
+        with _lock:
+            _training_state["status"] = "failed"
+            _training_state["finished_at"] = datetime.now(
+                timezone.utc).isoformat()
+            _training_state["message"] = str(exc)
+
+
+def _run_training_inner():
+    """Actual training logic, called from _run_training_background."""
+    global _training_state
+    from setfit_trainer import (
+        TIER1_DATA, TIER2_DIGITAL_DATA, TIER3_APP_ENG_DATA,
+        train_layer, load_corrections_from_log,
+    )
+
+    # ── Detect GPU ────────────────────────────────────────────────────────────
+    has_gpu = False
+    device_label = "CPU"
+    train_fn = train_layer
+    gpu_batch_size = 8
+    try:
+        import torch
+        if torch.cuda.is_available():
+            has_gpu = True
+            device_label = f"GPU: {torch.cuda.get_device_name(0)}"
+            from setfit_trainer_gpu import train_layer_gpu, auto_configure_batch_size
+            train_fn = None  # will call train_layer_gpu with batch_size
+            gpu_batch_size = auto_configure_batch_size()
+            logger.info("✨ GPU detected: %s (batch_size=%d)",
+                        device_label, gpu_batch_size)
+    except Exception:
+        pass
+    logger.info("Training device: %s", device_label)
+
+    _datasets = {
+        "tier1": list(TIER1_DATA),
+        "tier2": list(TIER2_DIGITAL_DATA),
+        "tier3": list(TIER3_APP_ENG_DATA),
+    }
+
+    # Merge LLM-corrected entries from low_confidence_log.jsonl
+    try:
+        log_data = load_corrections_from_log()
+        for tier_key in _datasets:
+            extras = log_data.get(tier_key, [])
+            if extras:
+                logger.info("📊 %s: merging %d log corrections with %d hardcoded examples",
+                            tier_key, len(extras), len(_datasets[tier_key]))
+                _datasets[tier_key].extend(extras)
+    except Exception as e:
+        logger.warning("⚠️ Could not load log corrections (non-fatal): %s", e)
+
+    with _lock:
+        _training_state["device"] = device_label
+
     layers_trained: list[str] = []
+    layer_times: dict[str, dict] = {}
     error_msg: str | None = None
 
-    # Train each layer sequentially (CPU-bound, SetFit trainer is synchronous)
     for tier_key in ["tier1", "tier2", "tier3"]:
         data = _datasets[tier_key]
         output_path = _MODEL_PATHS[tier_key]
         try:
-            logger.info("🚀 Training %s (%d examples)", tier_key, len(data))
-            train_layer(tier_key.upper(), data, output_path)
+            logger.info("🚀 Training %s (%d examples) on %s",
+                        tier_key, len(data), device_label)
+            t_start = time.perf_counter()
+
+            if has_gpu:
+                from setfit_trainer_gpu import train_layer_gpu
+                train_layer_gpu(
+                    layer_name=tier_key.upper(),
+                    data=data,
+                    output_path=output_path,
+                    batch_size=gpu_batch_size,
+                )
+            else:
+                train_layer(tier_key.upper(), data, output_path)
+
+            duration = round(time.perf_counter() - t_start, 1)
             layers_trained.append(tier_key)
+            layer_times[tier_key] = {"duration_s": duration}
             with _lock:
                 _training_state["layers_trained"] = list(layers_trained)
-            logger.info("✅ Completed %s", tier_key)
+                _training_state["layer_times"] = dict(layer_times)
+            logger.info("✅ Completed %s in %.1fs", tier_key, duration)
         except Exception as exc:
             error_msg = f"Failed to train {tier_key}: {exc}"
             logger.exception(error_msg)
@@ -150,9 +233,11 @@ def _run_training_background():
             if result.get("success"):
                 global _last_azure_upload
                 _last_azure_upload = datetime.now(timezone.utc).isoformat()
-                logger.info("✅ Models uploaded to Azure (%d files)", result.get("uploaded", 0))
+                logger.info("✅ Models uploaded to Azure (%d files)",
+                            result.get("uploaded", 0))
             else:
-                logger.warning("⚠️ Azure upload skipped: %s", result.get("error"))
+                logger.warning("⚠️ Azure upload skipped: %s",
+                               result.get("error"))
         except Exception as _e:
             logger.warning("⚠️ Azure upload error (non-fatal): %s", _e)
 
@@ -169,7 +254,8 @@ def _run_training_background():
             try:
                 with open(_LOW_CONF_LOG, 'w', encoding='utf-8') as f:
                     f.truncate(0)
-                logger.info("Cleared low-confidence logs after training completion")
+                logger.info(
+                    "Cleared low-confidence logs after training completion")
             except Exception as e:
                 logger.warning("Could not clear low-confidence logs: %s", e)
 
@@ -211,9 +297,6 @@ def _get_model_status() -> list[dict]:
 
 # ── HTML Page ─────────────────────────────────────────────────────────────────
 
-from fastapi import Request
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
 
 _templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
@@ -239,7 +322,8 @@ async def training_start():
     """Trigger background training. Returns immediately. Poll /status for progress."""
     with _lock:
         if _training_state["status"] == "training":
-            raise HTTPException(status_code=409, detail="Training already in progress")
+            raise HTTPException(
+                status_code=409, detail="Training already in progress")
 
     thread = threading.Thread(target=_run_training_background, daemon=True)
     thread.start()
@@ -253,7 +337,8 @@ async def training_logs(
     layer: str | None = Query(None, description="Filter by tier name"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(25, ge=1, le=100, description="Entries per page"),
-    sort: str = Query('desc', pattern='^(asc|desc)$', description="Sort order: 'asc' for oldest first, 'desc' for newest first")
+    sort: str = Query('desc', pattern='^(asc|desc)$',
+                      description="Sort order: 'asc' for oldest first, 'desc' for newest first")
 ):
     """Read low_confidence_log.jsonl and return paginated, sorted entries."""
     if not _LOW_CONF_LOG.exists():
@@ -362,7 +447,8 @@ async def azure_upload():
                 message=f"Uploaded {result.get('uploaded', 0)} files to Azure",
             )
         else:
-            raise HTTPException(status_code=500, detail=result.get("error", "Upload failed"))
+            raise HTTPException(
+                status_code=500, detail=result.get("error", "Upload failed"))
     except HTTPException:
         raise
     except Exception as e:

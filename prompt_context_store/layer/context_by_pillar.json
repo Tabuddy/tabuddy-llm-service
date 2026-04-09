@@ -1,0 +1,103 @@
+{
+  "Application Engineering": {
+    "layers": [
+      "App_Backend",
+      "App_Frontend",
+      "App_Fullstack",
+      "App_Mobile",
+      "App_API_Integration",
+      "App_Desktop",
+      "App_Embedded",
+      "App_Gaming"
+    ],
+    "definitions": {
+      "App_Backend": "Server-side logic, APIs, databases — role writes code that runs on backend servers. Primary stack is Python/Java/Node/Go/Ruby/Rust on the server.",
+      "App_Frontend": "Browser/web UI — role writes code users see and interact with. Primary stack is React/Angular/Vue/Svelte/HTML/CSS/TypeScript.",
+      "App_Fullstack": "Both frontend and backend. Role is expected to build features end-to-end, owning both the browser layer and the server layer.",
+      "App_Mobile": "Native or cross-platform mobile apps. Primary stack is Swift/Kotlin/React Native/Flutter/Android/iOS.",
+      "App_API_Integration": "Builds integrations between systems, third-party APIs, webhooks, ETL for application data, workflow automation.",
+      "App_Desktop": "Desktop applications for Windows/macOS/Linux. Electron, Qt, WPF, JavaFX, WinForms.",
+      "App_Embedded": "Firmware and embedded systems. C/C++, RTOS, microcontrollers, hardware-software interfaces.",
+      "App_Gaming": "Game development. Unity, Unreal Engine, rendering pipelines, game physics, multiplayer networking."
+    },
+    "disambiguation": "App_Backend vs App_Fullstack: If JD says 'you will own backend' with no frontend mention → Backend. If it says 'build features end-to-end' or requires both React and a server-side language → Fullstack."
+  },
+  "Data & Intelligence": {
+    "layers": [
+      "Data_Engineering",
+      "Data_Science",
+      "ML_Engineering",
+      "Analytics_BI",
+      "Data_Platform"
+    ],
+    "definitions": {
+      "Data_Engineering": "Builds data pipelines, ETL/ELT, data warehouses, data lakes. Tools: Spark, Kafka, Airflow, dbt, Flink.",
+      "Data_Science": "Statistical modeling, experimentation, hypothesis testing, Jupyter notebooks, R/Python data analysis.",
+      "ML_Engineering": "Productionizes ML models, builds MLOps pipelines, model serving, feature stores. Tools: MLflow, Kubeflow, SageMaker.",
+      "Analytics_BI": "Business intelligence, dashboards, reporting. Tools: Tableau, PowerBI, Looker, Redshift, Snowflake.",
+      "Data_Platform": "Builds the data infrastructure others use — metadata management, data catalog, data quality, governance frameworks."
+    },
+    "disambiguation": "Data_Engineering vs ML_Engineering: If the role is mostly about moving data → Engineering. If deploying ML models in production → ML Engineering."
+  },
+  "Infrastructure & Cloud": {
+    "layers": [
+      "Cloud_Infrastructure",
+      "DevOps",
+      "SRE",
+      "Network_Engineering",
+      "Database_Administration"
+    ],
+    "definitions": {
+      "Cloud_Infrastructure": "Manages cloud accounts, VPCs, IAM, security groups, provisioning. AWS/Azure/GCP administration at organization scale.",
+      "DevOps": "Builds and manages CI/CD pipelines, container orchestration, release management. Responsible for developer productivity at scale.",
+      "SRE": "Reliability engineering — SLOs/SLIs, incident response, on-call, chaos engineering, performance optimization.",
+      "Network_Engineering": "Network topology, routing, firewalls, VPNs, load balancers, DNS. Cisco/Juniper or cloud networking.",
+      "Database_Administration": "Manages database infrastructure — backups, replication, query performance, schema migrations, HA/DR setup."
+    },
+    "disambiguation": "DevOps vs SRE: DevOps owns CI/CD and deployment pipelines. SRE owns reliability metrics and incident response."
+  },
+  "Cyber Security": {
+    "layers": [
+      "Security_Engineering",
+      "Pen_Testing",
+      "SOC_Operations",
+      "GRC_Compliance",
+      "IAM"
+    ],
+    "definitions": {
+      "Security_Engineering": "Builds security tooling, secure code review, SAST/DAST integration, vulnerability management.",
+      "Pen_Testing": "Offensive security — penetration testing, red teaming, exploit development, bug bounty.",
+      "SOC_Operations": "Security operations center — threat detection, SIEM, incident response, log analysis.",
+      "GRC_Compliance": "Governance, risk, compliance — SOC2, ISO 27001, HIPAA, GDPR, audit management.",
+      "IAM": "Identity and access management — SSO, OAuth, SAML, LDAP, role-based access control, directory services."
+    }
+  },
+  "Platform & Tooling": {
+    "layers": [
+      "Developer_Platform",
+      "Observability_Tooling",
+      "API_Gateway",
+      "Auth_Platform"
+    ],
+    "definitions": {
+      "Developer_Platform": "Internal developer portals, self-service scaffolding, infrastructure-as-code templates, developer experience.",
+      "Observability_Tooling": "Builds monitoring, logging, tracing infrastructure. Prometheus, Grafana, ELK, Datadog.",
+      "API_Gateway": "Manages API gateways, rate limiting, API versioning, developer portals for external APIs.",
+      "Auth_Platform": "Manages authentication and authorization platform — identity providers, token management, MFA."
+    }
+  },
+  "Product & Design": {
+    "layers": [
+      "Product_Management",
+      "UX_Design",
+      "Product_Design",
+      "User_Research"
+    ],
+    "definitions": {
+      "Product_Management": "Defines product roadmap, writes PRDs, coordinates engineering, manages stakeholders, tracks OKRs.",
+      "UX_Design": "User experience design — wireframes, prototypes, design systems, Figma, accessibility.",
+      "Product_Design": "Visual and interaction design — branding, motion graphics, component libraries.",
+      "User_Research": "Qualitative and quantitative user research — interviews, usability testing, surveys, personas."
+    }
+  }
+}

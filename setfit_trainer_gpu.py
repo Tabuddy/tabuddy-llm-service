@@ -27,7 +27,8 @@ try:
     GPU_AVAILABLE = torch.cuda.is_available()
     if GPU_AVAILABLE:
         print(f"GPU detected: {torch.cuda.get_device_name(0)}")
-        print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(
+            f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     else:
         print("WARNING: No GPU detected, falling back to CPU training")
 except ImportError:
@@ -40,7 +41,7 @@ except ImportError:
 
 # Import training data from the original trainer
 try:
-    from setfit_trainer import TIER1_DATA, TIER2_DIGITAL_DATA, TIER3_APP_ENG_DATA
+    from setfit_trainer import TIER1_DATA, TIER2_DIGITAL_DATA, TIER3_APP_ENG_DATA, load_corrections_from_log
 except ImportError:
     print("ERROR: Could not import training data from setfit_trainer.py")
     print("   Make sure both files are in the same directory")
@@ -84,18 +85,16 @@ def train_layer_gpu(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
 
-    print(f"\nStarting GPU Training for Layer: {layer_name}")
-    print(f"Examples: {len(data)}")
-    print(f"Batch size: {batch_size}")
-    print(f"Batch size: {batch_size}")
-    print(f"Device: {device} ({num_gpus} GPU{'s' if num_gpus > 1 else ''})")
+    print(
+        f"\n─ GPU Training: {layer_name} | {len(data)} examples | batch={batch_size} | {device} ({num_gpus} GPU{'s' if num_gpus > 1 else ''})")
 
     # Prepare dataset
-    df = df = __import__('pandas').DataFrame(data)
+    df = __import__('pandas').DataFrame(data)
     dataset = HFDataset.from_pandas(df)
 
     # Load base model
-    model = SetFitModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    model = SetFitModel.from_pretrained(
+        "sentence-transformers/all-MiniLM-L6-v2")
     model.to(device)
 
     # Multi-GPU support via DataParallel
@@ -109,6 +108,7 @@ def train_layer_gpu(
         batch_size=batch_size,
         num_epochs=5,
         num_iterations=40,
+        show_progress_bar=False,
     )
 
     trainer = Trainer(
@@ -119,14 +119,13 @@ def train_layer_gpu(
     )
 
     # Train with optional mixed precision context
-    print(f"Training {layer_name}...")
     trainer.train()
 
     # Save model
     if output_path.exists():
         shutil.rmtree(output_path)
     model.save_pretrained(str(output_path))
-    print(f"Saved {layer_name} to: {output_path}")
+    print(f"  ✓ {layer_name} saved")
 
     return output_path
 
@@ -176,6 +175,11 @@ def main():
         default="./setfit_models",
         help="Base directory to save models",
     )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Skip log ingestion (use only hardcoded training data)",
+    )
     args = parser.parse_args()
 
     # Auto-configure batch size if not provided
@@ -192,14 +196,23 @@ def main():
         "tier3": (TIER3_APP_ENG_DATA, base / "tier3_app_eng"),
     }
 
+    # Merge log corrections into training data
+    log_data: dict[str, list[dict]] = {"tier1": [], "tier2": [], "tier3": []}
+    if not args.no_log:
+        log_data = load_corrections_from_log()
+
     to_train = list(layers.keys()) if args.layer == "all" else [args.layer]
 
     for layer_key in to_train:
-        data, out_path = layers[layer_key]
+        hardcoded, out_path = layers[layer_key]
+        merged = hardcoded + log_data.get(layer_key, [])
+        if len(merged) > len(hardcoded):
+            print(
+                f"📊 {layer_key}: {len(hardcoded)} hardcoded + {len(merged) - len(hardcoded)} from log = {len(merged)} total")
         try:
             train_layer_gpu(
                 layer_name=layer_key.upper(),
-                data=data,
+                data=merged,
                 output_path=out_path,
                 batch_size=args.batch_size,
             )

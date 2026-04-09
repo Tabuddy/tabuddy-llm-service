@@ -1,0 +1,188 @@
+{
+  "App_Backend": {
+    "platforms": [
+      "Java",
+      "Python",
+      "Node.js",
+      ".NET/C#",
+      "Go",
+      "Ruby",
+      "PHP",
+      "Rust",
+      "Scala",
+      "Kotlin",
+      "Generic"
+    ],
+    "signal_words": {
+      "Java": [
+        "java",
+        "spring boot",
+        "spring",
+        "hibernate",
+        "maven",
+        "gradle",
+        "jakarta",
+        "jvm",
+        "slf4j",
+        "junit"
+      ],
+      "Python": [
+        "python",
+        "django",
+        "fastapi",
+        "flask",
+        "sqlalchemy",
+        "celery",
+        "pytest",
+        "pydantic",
+        "uvicorn",
+        "asyncio"
+      ],
+      "Node.js": [
+        "node",
+        "nodejs",
+        "node.js",
+        "express",
+        "nestjs",
+        "fastify",
+        "typescript",
+        "npm",
+        "yarn",
+        "pm2"
+      ],
+      ".NET/C#": [
+        "c#",
+        ".net",
+        "asp.net",
+        "dotnet",
+        "blazor",
+        "entity framework",
+        "ef core",
+        "wpf",
+        "xamarin"
+      ],
+      "Go": [
+        "golang",
+        "go ",
+        "goroutine",
+        "gin",
+        "echo",
+        "fiber",
+        "go modules"
+      ],
+      "Ruby": ["ruby", "rails", "ruby on rails", "sinatra", "rspec", "bundler"],
+      "PHP": ["php", "laravel", "symfony", "wordpress", "drupal", "php-fpm"],
+      "Rust": ["rust", "cargo", "tokio", "actix", "wasm"],
+      "Scala": ["scala", "akka", "play framework", "sbt", "spark scala"],
+      "Kotlin": ["kotlin", "ktor", "coroutines", "kotlin/jvm", "kotlin backend"]
+    }
+  },
+  "App_Frontend": {
+    "platforms": [
+      "React",
+      "Angular",
+      "Vue",
+      "Svelte",
+      "Vanilla/HTML/CSS",
+      "Generic"
+    ],
+    "signal_words": {
+      "React": [
+        "react",
+        "reactjs",
+        "next.js",
+        "nextjs",
+        "redux",
+        "zustand",
+        "react hooks",
+        "react testing library",
+        "jsx",
+        "tsx"
+      ],
+      "Angular": [
+        "angular",
+        "angularjs",
+        "rxjs",
+        "ngrx",
+        "angular material",
+        "typescript",
+        "zone.js"
+      ],
+      "Vue": ["vue", "vuejs", "nuxt", "nuxt.js", "pinia", "vuex", "vite"],
+      "Svelte": ["svelte", "sveltekit", "svelte store"],
+      "Vanilla/HTML/CSS": [
+        "html",
+        "css",
+        "vanilla js",
+        "javascript",
+        "sass",
+        "tailwind",
+        "bootstrap",
+        "jquery"
+      ]
+    }
+  },
+  "App_Mobile": {
+    "platforms": [
+      "iOS/Swift",
+      "Android/Kotlin",
+      "React Native",
+      "Flutter",
+      "Generic"
+    ],
+    "signal_words": {
+      "iOS/Swift": [
+        "ios",
+        "swift",
+        "swiftui",
+        "xcode",
+        "objective-c",
+        "cocoa",
+        "uikit",
+        "combine"
+      ],
+      "Android/Kotlin": [
+        "android",
+        "kotlin",
+        "android studio",
+        "jetpack compose",
+        "coroutines",
+        "android sdk",
+        "gradle android"
+      ],
+      "React Native": [
+        "react native",
+        "expo",
+        "react navigation",
+        "metro bundler",
+        "rn"
+      ],
+      "Flutter": ["flutter", "dart", "flutter sdk", "pub.dev", "flutter bloc"]
+    }
+  },
+  "Data_Engineering": {
+    "platforms": ["Python/Spark", "Scala/Spark", "SQL/dbt", "Java", "Generic"],
+    "signal_words": {
+      "Python/Spark": [
+        "pyspark",
+        "apache spark",
+        "airflow",
+        "prefect",
+        "luigi",
+        "dask",
+        "pandas",
+        "ray"
+      ],
+      "Scala/Spark": ["scala spark", "akka streams", "sbt", "spark scala"],
+      "SQL/dbt": [
+        "dbt",
+        "sql",
+        "bigquery",
+        "snowflake",
+        "redshift",
+        "databricks sql"
+      ],
+      "Java": ["java spark", "flink java", "kafka streams java"]
+    }
+  }
+}

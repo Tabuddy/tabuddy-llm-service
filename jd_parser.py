@@ -17,12 +17,15 @@ from openai import AsyncAzureOpenAI
 from ranking_models import (
     JDAtom,
     JDCapabilityAtom,
-    JDScaleAtom,
     JDProfile,
+    JDScaleAtom,
+    LayerPrediction,
+    LayeredClassification,
     TierClassification,
     TierPrediction,
 )
 import setfit_classifier as clf
+import prompt_rescue
 
 logger = logging.getLogger(__name__)
 
@@ -120,87 +123,129 @@ def _build_default_tier_classification() -> TierClassification:
     )
 
 
-# ── LLM Cross-Check for SetFit Classification ─────────────────────────────────
+# ── LLM Cross-Check using Prompt Rescue ───────────────────────────────────────────────
 async def _crosscheck_tier_classification(
     jd_text: str,
     setfit_result: TierClassification,
 ) -> TierClassification:
-    """Small LLM prompt to cross-check SetFit tier classification.
+    """Cross-check SetFit tier classification using prompt rescue engine.
 
-    Fires when SetFit confidence is not very high, to catch misclassifications
-    like a Full-Stack JD being tagged as Infra_Cloud.
+    Fires when SetFit confidence is below the pillar rescue threshold.
+    Uses the structured context store for higher-quality corrections.
     """
-    client = _get_client()
-    if not client:
-        return setfit_result
-
-    # If very high confidence at both tiers, trust SetFit
+    # Trust very high confidence predictions
     if (setfit_result.tier1.score > 0.92
             and setfit_result.tier2
             and setfit_result.tier2.score > 0.92):
         return setfit_result
 
-    prompt = (
-        "Classify this job description into ONE path.\n\n"
-        "Tier 1: Digital | Physical | Service\n"
-        "Tier 2 (Digital only): App_Engineering | Data_Intelligence | "
-        "Infra_Cloud | Product_Design | Cyber_Security\n\n"
-        "CRITICAL RULES:\n"
-        "- App_Engineering: roles that BUILD applications (web/mobile/APIs/"
-        "microservices), even if they use Docker/AWS/CI-CD as tools\n"
-        "- Infra_Cloud: roles whose PRIMARY job is MANAGING infrastructure, "
-        "platforms, or CI/CD systems at organizational scale\n"
-        "- Data_Intelligence: roles focused on data engineering, data pipelines, "
-        "ETL, data warehousing, knowledge graphs, ML, data science, analytics\n\n"
-        f"SetFit predicted: {setfit_result.hierarchy_path}\n\n"
-        f"JD (truncated):\n{jd_text[:1000]}\n\n"
-        "Respond with ONLY the path, e.g.: Digital > App_Engineering\n"
-        "No explanation."
+    # Build SetFit scores dict for the rescue engine
+    # (We use tier2 score as the primary signal since that's where misclassifications occur)
+    t2_score = setfit_result.tier2.score if setfit_result.tier2 else setfit_result.tier1.score
+    if not prompt_rescue.needs_rescue("pillar", t2_score):
+        return setfit_result
+
+    # Map current tier labels to pillar names for the scores dict
+    _TIER2_TO_PILLAR = {
+        "App_Engineering": "Application Engineering",
+        "Data_Intelligence": "Data & Intelligence",
+        "Infra_Cloud": "Infrastructure & Cloud",
+        "Product_Design": "Product & Design",
+        "Cyber_Security": "Cyber Security",
+    }
+    setfit_scores: dict[str, float] = {}
+    if setfit_result.tier2:
+        setfit_scores[_TIER2_TO_PILLAR.get(
+            setfit_result.tier2.label, setfit_result.tier2.label)] = t2_score
+
+    rescue_result = await prompt_rescue.rescue_classification(
+        stage="pillar",
+        setfit_scores=setfit_scores,
+        text=jd_text,
     )
 
-    try:
-        response = await client.chat.completions.create(
-            model=_AZURE_DEPLOYMENT,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=30,
-            temperature=0.0,
-        )
-        content = (response.choices[0].message.content or "").strip()
-        parts = [p.strip() for p in content.replace("\u203a", ">").split(">")]
-        if not parts or parts[0] not in ("Digital", "Physical", "Service"):
-            return setfit_result
-
-        corrected_t1 = parts[0]
-        corrected_t2 = parts[1] if len(parts) > 1 else None
-
-        differs = False
-        if corrected_t1 != setfit_result.tier1.label:
-            differs = True
-        elif (corrected_t2 and setfit_result.tier2
-              and corrected_t2 != setfit_result.tier2.label):
-            differs = True
-
-        if not differs:
-            return setfit_result
-
-        logger.info(
-            "\u26a1 LLM cross-check overrides SetFit: %s \u2192 %s",
-            setfit_result.hierarchy_path, " > ".join(parts),
-        )
-        corrected = TierClassification(
-            tier1=TierPrediction(label=corrected_t1, score=0.85),
-            hierarchy_path=" > ".join(parts),
-            final_label=parts[-1],
-            low_confidence=False,
-        )
-        if corrected_t2:
-            corrected.tier2 = TierPrediction(label=corrected_t2, score=0.85)
-        if len(parts) > 2:
-            corrected.tier3 = TierPrediction(label=parts[2], score=0.85)
-        return corrected
-    except Exception as e:
-        logger.warning("LLM cross-check failed (%s), using SetFit result", e)
+    if rescue_result.get("confidence_source") != "llm_rescue":
         return setfit_result
+
+    # Map pillar name back to tier2 label
+    _PILLAR_TO_TIER2 = {v: k for k, v in _TIER2_TO_PILLAR.items()}
+    rescued_pillar = rescue_result["value"]
+    corrected_t2 = _PILLAR_TO_TIER2.get(rescued_pillar)
+
+    if not corrected_t2 or corrected_t2 == (setfit_result.tier2.label if setfit_result.tier2 else ""):
+        return setfit_result
+
+    logger.info(
+        "⚡ Prompt rescue overrides JD classification: %s → %s",
+        setfit_result.hierarchy_path, corrected_t2,
+    )
+    corrected = TierClassification(
+        tier1=TierPrediction(label="Digital", score=0.90),
+        tier2=TierPrediction(label=corrected_t2, score=0.85),
+        hierarchy_path=f"Digital > {corrected_t2}",
+        final_label=corrected_t2,
+        low_confidence=False,
+    )
+    return corrected
+
+
+async def _build_jd_layered_classification(
+    jd_text: str,
+    tier_class: TierClassification,
+) -> LayeredClassification:
+    """Build a LayeredClassification for a JD using the SetFit result + prompt rescue.
+
+    JDs typically describe a single target role, so compatible_layers is limited
+    to cases where the JD explicitly describes multi-stack requirements.
+    """
+    # Use the setfit_classifier's classify_as_layered for the base mapping
+    lc = clf.classify_as_layered(jd_text[:2000])
+
+    # Override the pillar/layer if the cross-checked tier_class differs
+    _TIER2_TO_PILLAR = {
+        "App_Engineering": "Application Engineering",
+        "Data_Intelligence": "Data & Intelligence",
+        "Infra_Cloud": "Infrastructure & Cloud",
+        "Product_Design": "Product & Design",
+        "Cyber_Security": "Cyber Security",
+    }
+    if tier_class.tier2 and tier_class.tier2.label in _TIER2_TO_PILLAR:
+        corrected_pillar = _TIER2_TO_PILLAR[tier_class.tier2.label]
+        if corrected_pillar != lc.pillar.label:
+            lc.pillar = LayerPrediction(
+                label=corrected_pillar,
+                score=tier_class.tier2.score,
+                confidence_source="llm_rescue",
+            )
+            # Rebuild hierarchy_path
+            parts = [corrected_pillar]
+            if lc.layer:
+                parts.append(lc.layer.label)
+            if lc.activity:
+                parts.append(lc.activity.label)
+            lc.hierarchy_path = " > ".join(parts)
+
+    # Trigger layer-level rescue if the layer confidence is low
+    if lc.layer and prompt_rescue.needs_rescue("layer", lc.layer.score):
+        layer_scores: dict[str, float] = {lc.layer.label: lc.layer.score}
+        rescue = await prompt_rescue.rescue_classification(
+            stage="layer",
+            setfit_scores=layer_scores,
+            text=jd_text,
+            resolved_context={"pillar": lc.pillar.label},
+        )
+        if rescue.get("confidence_source") == "llm_rescue":
+            rescued_layer = rescue["value"]
+            lc.layer = LayerPrediction(
+                label=rescued_layer, score=rescue["score"], confidence_source="llm_rescue"
+            )
+            # Update hierarchy_path
+            parts = [lc.pillar.label, rescued_layer]
+            if lc.activity:
+                parts.append(lc.activity.label)
+            lc.hierarchy_path = " > ".join(parts)
+
+    return lc
 
 
 # ── Tech Keyword Extraction ────────────────────────────────────────────────────
@@ -385,8 +430,6 @@ def _extract_tech_from_jd(jd_text: str) -> list[str]:
     return sorted(found)
 
 
-
-
 def _extract_atoms_from_response(raw_json: list) -> tuple[
     list[JDCapabilityAtom],  # core
     list[JDCapabilityAtom],  # secondary
@@ -417,7 +460,8 @@ def _extract_atoms_from_response(raw_json: list) -> tuple[
         "role_family", "role_objective", "role_scope", "delivery_mode",
         "industry_vertical", "industry_sub_vertical", "business_model",
     }
-    _CAP_TYPES = {"core_capability", "secondary_capability", "adjacent_capability"}
+    _CAP_TYPES = {"core_capability",
+                  "secondary_capability", "adjacent_capability"}
     _SCALE_TYPES = {
         "scale_geographic", "scale_volume", "scale_revenue",
         "scale_infrastructure", "scale_team",
@@ -543,11 +587,15 @@ async def parse_jd(jd_text: str) -> JDProfile:
     if clf.models_available():
         tier_class = clf.classify_text(jd_text[:2000])
     else:
-        logger.warning("SetFit models not loaded — using fallback classification")
+        logger.warning(
+            "SetFit models not loaded — using fallback classification")
         tier_class = _build_default_tier_classification()
 
-    # Step 1b: LLM cross-check of SetFit output
+    # Step 1b: Prompt rescue cross-check (replaces the old LLM cross-check)
     tier_class = await _crosscheck_tier_classification(jd_text, tier_class)
+
+    # Step 1c: Build layered classification for new 4-layer taxonomy
+    layered_class = await _build_jd_layered_classification(jd_text, tier_class)
 
     # Step 2: LLM atom extraction
     client = _get_client()
@@ -604,6 +652,7 @@ async def parse_jd(jd_text: str) -> JDProfile:
     return JDProfile(
         raw_jd=jd_text,
         tier_classification=tier_class,
+        layered_classification=layered_class,
         role_family=globals_.get("role_family"),
         role_objective=globals_.get("role_objective"),
         role_scope=globals_.get("role_scope"),

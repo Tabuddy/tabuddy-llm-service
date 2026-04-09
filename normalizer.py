@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from rapidfuzz import fuzz, process
 from openai import AsyncAzureOpenAI
 
-from skills_dictionary import SKILL_ALIASES, CANONICAL_SKILLS
+import skill_library
+from skills_dictionary import SKILL_ALIASES  # kept for static fuzzy key list
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +28,11 @@ class NormalizedSkill:
 # ────────────────────────────────────────────
 def _dict_lookup(skill: str) -> NormalizedSkill | None:
     key = skill.strip().lower()
-    if key in SKILL_ALIASES:
+    aliases = skill_library.get_aliases()
+    if key in aliases:
         return NormalizedSkill(
             original=skill,
-            normalized=SKILL_ALIASES[key],
+            normalized=aliases[key],
             method="dictionary",
             confidence=1.0,
         )
@@ -40,13 +42,18 @@ def _dict_lookup(skill: str) -> NormalizedSkill | None:
 # ────────────────────────────────────────────
 # Tier 2 – Fuzzy match against alias keys
 # ────────────────────────────────────────────
-_ALIAS_KEYS = list(SKILL_ALIASES.keys())
+
+def _get_alias_keys() -> list[str]:
+    """Return current alias keys from merged skill library."""
+    return list(skill_library.get_aliases().keys())
 
 
 def _fuzzy_match(skill: str) -> NormalizedSkill | None:
     key = skill.strip().lower()
+    aliases = skill_library.get_aliases()
+    alias_keys = _get_alias_keys()
     result = process.extractOne(
-        key, _ALIAS_KEYS, scorer=fuzz.WRatio, score_cutoff=FUZZY_THRESHOLD
+        key, alias_keys, scorer=fuzz.WRatio, score_cutoff=FUZZY_THRESHOLD
     )
     if result:
         matched_alias, score, _ = result
@@ -58,7 +65,7 @@ def _fuzzy_match(skill: str) -> NormalizedSkill | None:
             return None
         return NormalizedSkill(
             original=skill,
-            normalized=SKILL_ALIASES[matched_alias],
+            normalized=aliases[matched_alias],
             method="fuzzy",
             confidence=round(score / 100, 2),
         )
@@ -135,7 +142,7 @@ async def _llm_normalize(skills: list[str]) -> list[NormalizedSkill]:
         if len(normalized) != len(skills):
             raise ValueError("LLM returned mismatched array length")
 
-        return [
+        results = [
             NormalizedSkill(
                 original=orig,
                 normalized=norm,
@@ -144,6 +151,17 @@ async def _llm_normalize(skills: list[str]) -> list[NormalizedSkill]:
             )
             for orig, norm in zip(skills, normalized)
         ]
+
+        # Persist newly learned skills to MongoDB (fire-and-forget)
+        import asyncio
+        for r in results:
+            if r.normalized.lower() != r.original.lower():
+                asyncio.create_task(
+                    skill_library.learn(
+                        r.original, r.normalized, confidence=r.confidence)
+                )
+
+        return results
     except Exception as e:
         logger.warning("LLM normalization failed: %s", e)
         return [

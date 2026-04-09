@@ -247,8 +247,7 @@
     async function startTraining() {
       const btn = document.getElementById('train-btn');
       btn.disabled = true;
-      document.getElementById('train-icon').textContent = '⏳';
-      document.getElementById('train-label').textContent = 'Starting…';
+      btn.innerHTML = '<span id="train-icon">⏳</span><span id="train-label">Starting…</span>';
       document.getElementById('train-progress').className = 'progress-fill indeterminate';
       try {
         const res = await fetch('/api/training/start', { method: 'POST' });
@@ -256,7 +255,13 @@
         showToast('Training started in background', 'success');
         pollInterval = setInterval(checkTraining, 3000);
         checkTraining();
-      } catch(e) { showToast('Failed to start training: ' + e.message, 'error'); btn.disabled = false; document.getElementById('train-icon').textContent = '🚀'; document.getElementById('train-label').textContent = 'Train All Layers'; document.getElementById('train-progress').style.width = '0%'; }
+      } catch(e) {
+        showToast('Failed to start training: ' + e.message, 'error');
+        btn.disabled = false;
+        btn.innerHTML = '<span id="train-icon">🚀</span><span id="train-label">Train All Layers</span>';
+        document.getElementById('train-progress').style.width = '0%';
+        document.getElementById('train-progress').className = 'progress-fill';
+      }
     }
 
     async function checkTraining() {
@@ -269,34 +274,43 @@
 
         if (s.status === 'idle') {
           el.className = 'train-status'; prog.style.width = '0%';
-          btn.innerHTML = '<span>🚀</span><span>Train All Layers</span>'; btn.disabled = false;
+          btn.innerHTML = '<span id="train-icon">🚀</span><span id="train-label">Train All Layers</span>'; btn.disabled = false;
           if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
           loadModels();
           return;
         }
 
         if (s.status === 'training') {
+          const deviceStr = s.device ? ` on <strong>${s.device}</strong>` : '';
           el.className = 'train-status training';
-          el.innerHTML = `<div class="msg">⏳ Training models in progress…</div>
-            ${s.layers_trained.length ? `<div class="layers">${['tier1','tier2','tier3'].map(t =>
-              `<span class="layer-chip ${s.layers_trained.includes(t)?'done':''}">${s.layers_trained.includes(t)?'✓':'○'} ${t}</span>`
-            ).join('')}</div>` : ''}`;
+          el.innerHTML = `<div class="msg">⏳ Training models${deviceStr}…</div>
+            ${s.layers_trained.length ? `<div class="layers">${['tier1','tier2','tier3'].map(t => {
+              const done = s.layers_trained.includes(t);
+              const dur = s.layer_times && s.layer_times[t] ? ` (${s.layer_times[t].duration_s}s)` : '';
+              return `<span class="layer-chip ${done?'done':''}">${done?'✓':'○'} ${t}${dur}</span>`;
+            }).join('')}</div>` : ''}`;
           prog.className = 'progress-fill indeterminate';
           btn.disabled = true;
         } else if (s.status === 'completed') {
+          const deviceStr = s.device ? ` on ${s.device}` : '';
+          const totalTime = s.started_at && s.finished_at ? ((new Date(s.finished_at) - new Date(s.started_at)) / 1000).toFixed(1) : null;
+          const totalStr = totalTime ? ` in ${totalTime}s` : '';
           el.className = 'train-status completed';
-          el.innerHTML = `<div class="msg">✅ Training complete! Models uploaded to Azure & hot-reloaded.</div>
-            <div class="layers">${s.layers_trained.map(t => `<span class="layer-chip done">✓ ${t}</span>`).join('')}</div>`;
-          prog.style.width = '100%'; prog.style.animation = 'none';
-          btn.innerHTML = '<span>🚀</span><span>Train All Layers</span>'; btn.disabled = false;
+          el.innerHTML = `<div class="msg">✅ Training complete${deviceStr}${totalStr}. Models uploaded & hot-reloaded.</div>
+            <div class="layers">${s.layers_trained.map(t => {
+              const dur = s.layer_times && s.layer_times[t] ? ` (${s.layer_times[t].duration_s}s)` : '';
+              return `<span class="layer-chip done">✓ ${t}${dur}</span>`;
+            }).join('')}</div>`;
+          prog.style.width = '100%'; prog.style.animation = 'none'; prog.className = 'progress-fill';
+          btn.innerHTML = '<span id="train-icon">🚀</span><span id="train-label">Train All Layers</span>'; btn.disabled = false;
           if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
           showToast('Training completed successfully', 'success');
           loadModels(); loadLogs();
         } else if (s.status === 'failed') {
           el.className = 'train-status failed';
           el.innerHTML = `<div class="msg">❌ Training failed: ${s.message || 'Unknown error'}</div>`;
-          prog.style.width = '0%';
-          btn.innerHTML = '<span>🚀</span><span>Train All Layers</span>'; btn.disabled = false;
+          prog.style.width = '0%'; prog.className = 'progress-fill';
+          btn.innerHTML = '<span id="train-icon">🚀</span><span id="train-label">Train All Layers</span>'; btn.disabled = false;
           if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
           showToast('Training failed', 'error');
           loadModels();
@@ -362,7 +376,8 @@
           <tbody>${data.entries.map(e => {
             const conf = (e.confidence * 100).toFixed(1);
             const cClass = e.confidence < 0.4 ? 'low' : 'mid';
-            return `<tr><td>${e.timestamp || '—'}</td><td>${e.layer || '—'}</td><td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(e.text||'').replace(/"/g,'&quot;')}">${(e.text||'').substring(0,120)}</td><td>${e.predicted_label || '—'}</td><td><span class="conf-badge ${cClass}">${conf}%</span></td></tr>`;
+            const displayText = e.compact_summary || e.text || '';
+            return `<tr><td>${e.timestamp || '—'}</td><td>${e.layer || '—'}</td><td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${displayText.replace(/"/g,'&quot;')}">${displayText.substring(0,120)}</td><td>${e.predicted_label || '—'}</td><td><span class="conf-badge ${cClass}">${conf}%</span></td></tr>`;
           }).join('')}</tbody></table></div>`;
 
         // Pagination controls and info

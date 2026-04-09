@@ -1,0 +1,85 @@
+{
+  "options": [
+    "Architect",
+    "Develop",
+    "Test",
+    "Manage",
+    "Support",
+    "Solutions_Architect"
+  ],
+  "definitions": {
+    "Architect": "Primary responsibility is technical design — system design, architecture decisions, technical vision. Sets the direction but may also code.",
+    "Develop": "Primary responsibility is implementing features — writing code, building products. The default for most software engineer roles.",
+    "Test": "Primary responsibility is quality engineering — test automation, SDET, QA, performance testing, integration test frameworks.",
+    "Manage": "Primary responsibility is people/delivery management — engineering manager, team lead with direct reports, delivery management.",
+    "Support": "Primary responsibility is production support — L2/L3, on-call, incident response, debugging live systems, SRE support tier.",
+    "Solutions_Architect": "Pre-sales or customer-facing technical advisory — RFPs, proposals, cross-domain solutions, client-facing demos, not writing production code."
+  },
+  "signal_vocabulary": {
+    "Architect": [
+      "system design",
+      "design decisions",
+      "architecture",
+      "technical vision",
+      "technical strategy",
+      "defines architecture",
+      "principal engineer",
+      "staff engineer",
+      "tech lead with no direct reports"
+    ],
+    "Develop": [
+      "build",
+      "develop",
+      "implement",
+      "engineer",
+      "write code",
+      "ship features",
+      "create",
+      "maintain",
+      "contribute"
+    ],
+    "Test": [
+      "qa",
+      "quality assurance",
+      "test automation",
+      "sdet",
+      "performance testing",
+      "integration tests",
+      "test engineer",
+      "testing framework",
+      "quality engineer"
+    ],
+    "Manage": [
+      "team lead",
+      "engineering manager",
+      "direct reports",
+      "1-on-1",
+      "performance reviews",
+      "delivery management",
+      "resource planning",
+      "head of engineering"
+    ],
+    "Support": [
+      "l2 support",
+      "l3 support",
+      "on-call",
+      "incident response",
+      "troubleshoot production",
+      "escalation",
+      "production issues",
+      "pagerduty"
+    ],
+    "Solutions_Architect": [
+      "pre-sales",
+      "client-facing",
+      "rfp",
+      "proposals",
+      "demos",
+      "workshops",
+      "partner enablement",
+      "cross-domain",
+      "advisory",
+      "consulting"
+    ]
+  }
+}

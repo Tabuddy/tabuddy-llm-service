@@ -18,13 +18,16 @@ Dimensions & Adaptive Weights:
 
 from __future__ import annotations
 
+import os
 import re
 import logging
+from datetime import datetime as _dt
 from typing import TYPE_CHECKING
 
 from ranking_models import (
     ExperienceLevel,
     DimensionScore,
+    LayeredClassification,
     ResumeRankResult,
     JDProfile,
     TierClassification,
@@ -112,7 +115,13 @@ MONTH_NAMES = {
     "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
 
-_NOW = 2026  # April 2026; kept static to avoid test-time drift
+
+def _now_year() -> int:
+    return _dt.now().year
+
+
+def _now_month() -> int:
+    return _dt.now().month
 
 
 def _month_index(name: str) -> int | None:
@@ -137,7 +146,8 @@ def _parse_months_from_duration(duration: str) -> float:
         return float(explicit_months.group(1)) / 12.0
 
     # "1 year 3 months", "2 years 6 months"
-    year_month_match = re.search(r"(\d+(?:\.\d+)?)\s*years?\s*(\d+)\s*months?", d)
+    year_month_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*years?\s*(\d+)\s*months?", d)
     if year_month_match:
         return float(year_month_match.group(1)) + float(year_month_match.group(2)) / 12.0
 
@@ -158,11 +168,11 @@ def _parse_months_from_duration(duration: str) -> float:
             return 0.0
 
         if m.group(3) and m.group(3).lower() in ("present", "current"):
-            end_mon = 4  # April
-            end_year = _NOW
+            end_mon = _now_month()
+            end_year = _now_year()
         else:
             end_mon = _month_index(m.group(4))
-            end_year = int(m.group(5)) if m.group(5) else _NOW
+            end_year = int(m.group(5)) if m.group(5) else _now_year()
             if end_mon is None:
                 return 0.0
 
@@ -241,7 +251,8 @@ def estimate_candidate_years(resume: ResumeTaggingResponse) -> float:
     total_companies = resume.context_meta_tags.experience_tags.total_companies
     if total_companies > 0:
         timeline = resume.context_meta_tags.experience_tags.experience_timeline
-        intern_count = sum(1 for e in timeline if _is_internship_role(e.role or ""))
+        intern_count = sum(
+            1 for e in timeline if _is_internship_role(e.role or ""))
         if intern_count == total_companies:
             # All roles are internships — ~6 months each
             return max(total_companies * 0.5, 0.25)
@@ -288,19 +299,24 @@ def _fuzzy_match_score(a: str, b: str) -> float:
 
 
 def _normalize_to_canonical(skill: str) -> str | None:
-    """If skill (lowercased) is in SKILL_ALIASES, return canonical name.
+    """If skill (lowercased) is in the merged skill library, return canonical name.
 
-    Also checks if the normalized form matches any alias key. Returns None
-    if no alias is found so the caller falls back to the original string.
+    Checks skill_library (static + MongoDB learned) first, falls back to
+    direct SKILL_ALIASES. Returns None if no alias found.
     """
     norm = _normalize_term(skill)
     if not norm:
         return None
-    # Direct alias lookup
-    if norm in SKILL_ALIASES:
-        return SKILL_ALIASES[norm]
-    # Check if any alias (normalized) matches our input
-    for alias_key, canonical in SKILL_ALIASES.items():
+    # Use merged skill library (static + MongoDB)
+    try:
+        import skill_library
+        aliases = skill_library.get_aliases()
+    except Exception:
+        aliases = SKILL_ALIASES
+
+    if norm in aliases:
+        return aliases[norm]
+    for alias_key, canonical in aliases.items():
         if _normalize_term(alias_key) == norm:
             return canonical
     return None
@@ -338,7 +354,8 @@ def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4,
         return 0.0
 
     # Normalize candidates too
-    norm_candidates = [_normalize_term(c) for c in candidates if _normalize_term(c)]
+    norm_candidates = [_normalize_term(c)
+                       for c in candidates if _normalize_term(c)]
     if not norm_candidates:
         return 0.0
 
@@ -398,6 +415,7 @@ def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4,
 
 # ── LLM-based skill context fallback ──────────────────────────────────────────
 _LLM_SKILL_CACHE: dict[str, bool] = {}
+_LLM_SKILL_CACHE_MAX: int = int(os.getenv("LLM_SKILL_CACHE_MAX", "10000"))
 
 
 def _match_skill_llm(skill_a: str, skill_b: str) -> bool:
@@ -412,6 +430,13 @@ def _match_skill_llm(skill_a: str, skill_b: str) -> bool:
     key = "|".join(sorted([skill_a, skill_b]))
     if key in _LLM_SKILL_CACHE:
         return _LLM_SKILL_CACHE[key]
+
+    # Evict oldest quarter when at capacity
+    if len(_LLM_SKILL_CACHE) >= _LLM_SKILL_CACHE_MAX:
+        keys_to_remove = list(_LLM_SKILL_CACHE.keys())[
+            :_LLM_SKILL_CACHE_MAX // 4]
+        for k in keys_to_remove:
+            del _LLM_SKILL_CACHE[k]
 
     result = _skill_llm_call(skill_a, skill_b)
     _LLM_SKILL_CACHE[key] = result
@@ -451,7 +476,8 @@ def _skill_llm_call(skill_a: str, skill_b: str) -> bool:
         content = (response.choices[0].message.content or "").strip().upper()
         return content.startswith("YES")
     except Exception as e:
-        logger.debug("LLM skill match failed for %r vs %r: %s", skill_a, skill_b, e)
+        logger.debug("LLM skill match failed for %r vs %r: %s",
+                     skill_a, skill_b, e)
         return False
 
 
@@ -609,7 +635,8 @@ def _count_primary_caps_high_match(jd: JDProfile, resume: ResumeTaggingResponse,
     core = jd.core_capabilities
     # Build resume signals as in score_capability_match
     resume_skill_set = _collect_resume_skills(resume)
-    resume_tech = [_normalize_term(t) for t in _collect_all_resume_tech(resume)]
+    resume_tech = [_normalize_term(t)
+                   for t in _collect_all_resume_tech(resume)]
     resume_signals: list[str] = list(resume_skill_set.keys()) + resume_tech
     for sig in resume.context_meta_tags.resume_strength_signals:
         norm_sig = _normalize_term(sig)
@@ -631,6 +658,114 @@ def _count_primary_caps_high_match(jd: JDProfile, resume: ResumeTaggingResponse,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MULTI-EXPERTISE TIER ALIGNMENT (LayeredClassification)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def score_layered_tier_alignment(
+    jd_lc: LayeredClassification,
+    resume_lc: LayeredClassification,
+) -> tuple[float, list[str]]:
+    """Score tier alignment using the 4-layer taxonomy with multi-expertise support.
+
+    Key improvement over `score_tier_alignment`: uses `compatible_layers` from
+    the resume to handle multi-expertise candidates (full-stack, polyglot engineers).
+
+    A full-stack resume with compatible_layers = [App_Frontend, App_Backend, App_Fullstack]
+    will score highly against both frontend-only and backend-only JDs.
+
+    Returns (score_0_100, evidence_list)
+    """
+    evidence: list[str] = []
+
+    jd_pillar = jd_lc.pillar.label
+    res_pillar = resume_lc.pillar.label
+
+    if jd_pillar == "Unknown" or res_pillar == "Unknown":
+        evidence.append("Pillar unavailable — tier alignment not assessed")
+        return 50.0, evidence
+
+    # Pillar mismatch → hard penalty
+    if jd_pillar != res_pillar:
+        evidence.append(
+            f"Pillar mismatch: JD={jd_pillar}, Resume={res_pillar}")
+        return 10.0, evidence
+
+    evidence.append(f"✓ Pillar match: {jd_pillar}")
+    score = 40.0
+
+    # Confidence penalty: if either side has low pillar confidence, reduce
+    # the pillar-match bonus proportionally.  A 0.60-confidence match should
+    # not earn the same 40 pts as a 0.95-confidence match.
+    min_conf = min(jd_lc.pillar.score, resume_lc.pillar.score)
+    if min_conf < 0.75:
+        penalty = 1.0 - (0.75 - min_conf)  # e.g. 0.60 → 0.85 multiplier
+        score *= max(penalty, 0.60)         # floor at 60% of base
+        evidence.append(
+            f"△ Low confidence penalty (min_conf={min_conf:.2f})"
+        )
+
+    # Layer alignment — check compatible_layers for multi-expertise
+    jd_layer = jd_lc.layer.label if jd_lc.layer else None
+    res_layer = resume_lc.layer.label if resume_lc.layer else None
+    res_compatible = resume_lc.compatible_layers  # may include additional layers
+
+    if jd_layer and (res_layer or res_compatible):
+        if res_layer == jd_layer:
+            score += 40.0
+            evidence.append(f"✓ Layer match: {jd_layer}")
+        elif jd_layer in res_compatible:
+            # Multi-expertise match: resume is compatible with JD's layer
+            score += 35.0
+            evidence.append(
+                f"✓ Multi-expertise match: JD needs {jd_layer}, "
+                f"resume compatible via {res_compatible}"
+            )
+        elif res_layer and jd_layer:
+            # Check if both layers are in the same broad family
+            same_family_pairs = {
+                frozenset({"App_Frontend", "App_Fullstack"}),
+                frozenset({"App_Backend", "App_Fullstack"}),
+                # full-stack vs single-stack
+                frozenset({"App_Frontend", "App_Backend"}),
+            }
+            if frozenset({jd_layer, res_layer}) in same_family_pairs:
+                score += 25.0
+                evidence.append(
+                    f"△ Related layer pair: JD={jd_layer}, Resume={res_layer}")
+            else:
+                score += 10.0
+                evidence.append(
+                    f"△ Layer mismatch: JD={jd_layer}, Resume={res_layer}")
+        else:
+            score += 5.0
+            evidence.append(
+                f"△ JD layer={jd_layer}, resume unclassified at layer")
+    elif not jd_layer:
+        score += 20.0  # JD doesn't specify layer — pillar match is sufficient
+
+    # Platform/tool alignment
+    jd_platform = jd_lc.platform_tool.label if jd_lc.platform_tool else None
+    res_platform = resume_lc.platform_tool.label if resume_lc.platform_tool else None
+
+    if jd_platform and res_platform:
+        if jd_platform == res_platform:
+            score += 20.0
+            evidence.append(f"✓ Platform match: {jd_platform}")
+        else:
+            # Check stack compatibility groups (from old Tier 3 logic)
+            jd_stack = f"Stack_{jd_platform.split('/')[0]}"
+            res_stack = f"Stack_{res_platform.split('/')[0]}"
+            partial = _tier3_partial_credit(jd_stack, res_stack)
+            score += partial
+            evidence.append(
+                f"△ Platform partial: JD={jd_platform}, Resume={res_platform} (+{partial:.0f})")
+    elif not jd_platform:
+        score += 20.0
+
+    return min(score, 100.0), evidence
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DIMENSION SCORERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -647,7 +782,8 @@ def score_tier_alignment(
     res_t1 = resume_tier.tier1.label
 
     if jd_t1 == "Unknown" or res_t1 == "Unknown":
-        evidence.append("Classification unavailable — tier alignment not assessed")
+        evidence.append(
+            "Classification unavailable — tier alignment not assessed")
         return 50.0, evidence
 
     # Tier 1 match
@@ -710,7 +846,8 @@ def score_capability_match(
     For freshers, also checks project descriptions.
     """
     evidence: list[str] = []
-    all_caps = jd.core_capabilities + jd.secondary_capabilities + jd.adjacent_capabilities
+    all_caps = jd.core_capabilities + \
+        jd.secondary_capabilities + jd.adjacent_capabilities
 
     if not all_caps:
         evidence.append("No capability atoms extracted from JD")
@@ -718,7 +855,8 @@ def score_capability_match(
 
     # Collect resume capability signals
     resume_skill_set = _collect_resume_skills(resume)
-    resume_tech = [_normalize_term(t) for t in _collect_all_resume_tech(resume)]
+    resume_tech = [_normalize_term(t)
+                   for t in _collect_all_resume_tech(resume)]
     resume_signals: list[str] = list(resume_skill_set.keys()) + resume_tech
 
     # Also include strength signals and domain focus
@@ -743,7 +881,8 @@ def score_capability_match(
         matched_weight += base_w * match
 
         if match >= 0.8:
-            evidence.append(f"✓ {cap.normalized_entity} ({cap.classification})")
+            evidence.append(
+                f"✓ {cap.normalized_entity} ({cap.classification})")
         elif match >= 0.4:
             evidence.append(f"△ ~{cap.normalized_entity} (partial)")
 
@@ -766,7 +905,8 @@ def score_capability_match(
         if _best_match_score(cap.normalized_entity, resume_signals) < 0.3
     )
     if no_match_count:
-        evidence.append(f"✗ {no_match_count} capability/ies not found in resume")
+        evidence.append(
+            f"✗ {no_match_count} capability/ies not found in resume")
 
     return min(score, 100.0), evidence
 
@@ -806,7 +946,8 @@ def score_skill_match(
         if best_score < 0.6:
             parts = _decompose_compound_skill(req_skill)
             for part in parts:
-                part_score = _best_match_score(part, all_resume_skills_norm, strict=True)
+                part_score = _best_match_score(
+                    part, all_resume_skills_norm, strict=True)
                 if part_score > best_score:
                     best_score = part_score
 
@@ -857,9 +998,11 @@ def score_skill_match(
     base_score = (matched / total) * 100 if total else 0.0
 
     # Co-dependency bonus
-    bundle_bonus = _score_bundle_codependency(jd, resume_skills, all_resume_skills_norm)
+    bundle_bonus = _score_bundle_codependency(
+        jd, resume_skills, all_resume_skills_norm)
     if bundle_bonus > 0:
-        evidence.append(f"✓ Co-dependent skill bundle bonus: +{bundle_bonus:.0f}pts")
+        evidence.append(
+            f"✓ Co-dependent skill bundle bonus: +{bundle_bonus:.0f}pts")
 
     final_score = min(base_score + bundle_bonus, 100.0)
 
@@ -938,7 +1081,8 @@ def score_experience_quality(
         role_str = f"{exp.role or ''} {exp.company or ''}"
         # Also match tech_stack against JD signals for relevance
         tech_signals = [_normalize_term(t) for t in exp.tech_stack]
-        role_relevance = _best_match_score(role_str, jd_signals_norm) if jd_signals_norm else 0.5
+        role_relevance = _best_match_score(
+            role_str, jd_signals_norm) if jd_signals_norm else 0.5
         tech_relevance = max(
             (_best_match_score(t, jd_signals_norm) for t in tech_signals),
             default=0.0,
@@ -959,14 +1103,17 @@ def score_experience_quality(
         # Recency: current role or most recent (first in timeline = most recent)
         recency_factor = 1.3 if (exp.is_current or i == 0) else 1.0
 
-        role_score = min((relevance * 60 + quality_boost) * recency_factor, 100)
+        role_score = min((relevance * 60 + quality_boost)
+                         * recency_factor, 100)
         scores.append(role_score)
 
         total_metrics = quant_count + achievement_count
         if relevance >= 0.5:
-            evidence.append(f"✓ {exp.role or 'Role'} at {exp.company or 'Co'}: relevant ({total_metrics} metrics)")
+            evidence.append(
+                f"✓ {exp.role or 'Role'} at {exp.company or 'Co'}: relevant ({total_metrics} metrics)")
         elif relevance >= 0.2:
-            evidence.append(f"△ {exp.role or 'Role'} at {exp.company or 'Co'}: adjacent role ({total_metrics} metrics)")
+            evidence.append(
+                f"△ {exp.role or 'Role'} at {exp.company or 'Co'}: adjacent role ({total_metrics} metrics)")
 
     # Leadership trajectory bonus
     leadership = resume.global_parameters.leadership_footprint
@@ -989,7 +1136,8 @@ def score_experience_quality(
             "agile", "scrum", "collaboration", "communication",
             "team", "leadership", "mentor", "presentation",
         }
-        resume_softs = [_normalize_term(s) for s in sc.soft_skills if _normalize_term(s)]
+        resume_softs = [_normalize_term(
+            s) for s in sc.soft_skills if _normalize_term(s)]
         soft_match = sum(
             1 for s in resume_softs
             if any(kw in s for kw in soft_keywords)
@@ -1018,7 +1166,8 @@ def score_scale_and_impact(
     resume_scale: list[str] = []
     for anchor in resume.global_parameters.scale_anchors:
         resume_scale.append(
-            _normalize_term(f"{anchor.extracted_metric} {anchor.extracted_unit}")
+            _normalize_term(
+                f"{anchor.extracted_metric} {anchor.extracted_unit}")
         )
     for q in resume.context_meta_tags.experience_tags.top_quantifiers[:20]:
         resume_scale.append(_normalize_term(q))
@@ -1040,8 +1189,10 @@ def score_scale_and_impact(
     # Count all quantified items (achievements + quantifiers)
     quant_count = (
         len(resume.context_meta_tags.experience_tags.top_quantifiers)
-        + sum(len(e.quantifiers) for e in resume.context_meta_tags.experience_tags.experience_timeline)
-        + sum(len(p.quantifiers) for p in resume.context_meta_tags.project_tags.projects)
+        + sum(len(e.quantifiers)
+              for e in resume.context_meta_tags.experience_tags.experience_timeline)
+        + sum(len(p.quantifiers)
+              for p in resume.context_meta_tags.project_tags.projects)
     )
 
     if not resume_scale:
@@ -1053,8 +1204,10 @@ def score_scale_and_impact(
 
     if total_atoms == 0:
         # No specific scale requirements in JD — resume having metrics is a bonus
-        bonus = min(len(resume.global_parameters.scale_anchors) * 10 + quant_count * 3, 40)
-        evidence.append(f"No specific scale requirements in JD. Resume has {quant_count} quantified items")
+        bonus = min(len(resume.global_parameters.scale_anchors)
+                    * 10 + quant_count * 3, 40)
+        evidence.append(
+            f"No specific scale requirements in JD. Resume has {quant_count} quantified items")
         return 50.0 + bonus, evidence
 
     matched = 0.0
@@ -1119,8 +1272,10 @@ def score_domain_context(
         evidence.append("No specific domain requirement in JD")
 
     # 2. Architectural paradigm match
-    jd_arch: list[str] = [a.normalized_entity for a in jd.process_methodology_atoms if a.normalized_entity]
-    resume_arch: list[str] = [a.normalized_value for a in resume.global_parameters.architectural_paradigm]
+    jd_arch: list[str] = [
+        a.normalized_entity for a in jd.process_methodology_atoms if a.normalized_entity]
+    resume_arch: list[str] = [
+        a.normalized_value for a in resume.global_parameters.architectural_paradigm]
     resume_arch += [a.normalized_value for a in resume.global_parameters.codebase_lifecycle]
 
     if jd_arch and resume_arch:
@@ -1136,7 +1291,8 @@ def score_domain_context(
 
     # 3. Compliance match
     jd_compliance = jd.compliance_context
-    resume_compliance = [c.normalized_value for c in resume.global_parameters.compliance_exposure]
+    resume_compliance = [
+        c.normalized_value for c in resume.global_parameters.compliance_exposure]
 
     if jd_compliance and resume_compliance:
         compliance_hits = sum(
@@ -1146,21 +1302,26 @@ def score_domain_context(
         comp_score = (compliance_hits / len(jd_compliance)) * 100
         sub_scores.append(comp_score)
         if compliance_hits:
-            evidence.append(f"✓ Compliance overlap: {compliance_hits}/{len(jd_compliance)} requirements")
+            evidence.append(
+                f"✓ Compliance overlap: {compliance_hits}/{len(jd_compliance)} requirements")
         else:
-            evidence.append(f"✗ No compliance overlap (JD requires: {', '.join(jd_compliance[:2])})")
+            evidence.append(
+                f"✗ No compliance overlap (JD requires: {', '.join(jd_compliance[:2])})")
     elif jd_compliance and not resume_compliance:
         sub_scores.append(10.0)  # Penalty for missing required compliance
-        evidence.append(f"✗ Missing compliance: {', '.join(jd_compliance[:2])}")
+        evidence.append(
+            f"✗ Missing compliance: {', '.join(jd_compliance[:2])}")
     else:
         sub_scores.append(70.0)  # No compliance requirement
 
     # 4. Cross-functional area match
     jd_cf: list[str] = [a.normalized_entity for a in jd.stakeholder_atoms]
-    resume_cf: list[str] = [a.normalized_value for a in resume.global_parameters.cross_functional_area]
+    resume_cf: list[str] = [
+        a.normalized_value for a in resume.global_parameters.cross_functional_area]
 
     if jd_cf and resume_cf:
-        cf_match = max((_best_match_score(j, resume_cf) for j in jd_cf), default=0.0)
+        cf_match = max((_best_match_score(j, resume_cf)
+                       for j in jd_cf), default=0.0)
         sub_scores.append(cf_match * 100)
         if cf_match >= 0.5:
             evidence.append(f"✓ Cross-functional match")
@@ -1257,14 +1418,18 @@ def score_resume(
     resume: ResumeTaggingResponse,
     resume_tier: TierClassification,
     rank: int = 0,
+    resume_lc: LayeredClassification | None = None,
 ) -> ResumeRankResult:
     """Score a parsed resume against a parsed JD.
 
     Args:
         jd: Parsed job description profile
         resume: Full resume tagging response from the hybrid pipeline
-        resume_tier: SetFit classification of the resume
+        resume_tier: SetFit classification of the resume (legacy)
         rank: Position in final ranking (set by caller after sorting)
+        resume_lc: LayeredClassification for the resume (new 4-layer taxonomy).
+                   When provided alongside jd.layered_classification, enables
+                   multi-expertise tier matching via compatible_layers.
 
     Returns:
         ResumeRankResult with full dimension breakdown
@@ -1275,9 +1440,15 @@ def score_resume(
     weights = _WEIGHTS[exp_level]
 
     # ── Dimension 1: Tier Alignment ──────────────────────────────────────────
-    tier_raw, tier_ev = score_tier_alignment(
-        jd.tier_classification, resume_tier
-    )
+    # Use layered classification (multi-expertise) when available
+    if resume_lc and jd.layered_classification:
+        tier_raw, tier_ev = score_layered_tier_alignment(
+            jd.layered_classification, resume_lc
+        )
+    else:
+        tier_raw, tier_ev = score_tier_alignment(
+            jd.tier_classification, resume_tier
+        )
     # ── Dimension 2: Core Capability Match ───────────────────────────────────
     cap_raw, cap_ev = score_capability_match(jd, resume, exp_level)
 
@@ -1294,7 +1465,8 @@ def score_resume(
     domain_raw, domain_ev = score_domain_context(jd, resume)
 
     # ── Dimension 7 (conditional): Experience Adequacy ───────────────────────
-    exp_adequacy_raw, exp_adequacy_ev = score_experience_adequacy(jd, candidate_years)
+    exp_adequacy_raw, exp_adequacy_ev = score_experience_adequacy(
+        jd, candidate_years)
     has_exp_adequacy = exp_adequacy_raw is not None
 
     # ── Assemble Dimension Scores ─────────────────────────────────────────────
@@ -1373,8 +1545,10 @@ def score_resume(
             skill for skill, prov in _collect_resume_skills(resume).items()
             if prov == "contextual"
         ]
-        resume_primary_tech = resume_contextual_skills + _collect_all_resume_tech(resume)
-        coherence = _compute_tech_coherence(jd.required_tech_normalized, resume_primary_tech)
+        resume_primary_tech = resume_contextual_skills + \
+            _collect_all_resume_tech(resume)
+        coherence = _compute_tech_coherence(
+            jd.required_tech_normalized, resume_primary_tech)
         if coherence < 0.3:
             final_score *= 0.7
             logger.debug(
@@ -1384,7 +1558,8 @@ def score_resume(
 
     # ——— Penalty 2: Must-Have Primary Capability Gate ———
     # Ensure at least one PRIMARY core capability is strongly matched (≥0.7)
-    primary_high_count = _count_primary_caps_high_match(jd, resume, threshold=0.7)
+    primary_high_count = _count_primary_caps_high_match(
+        jd, resume, threshold=0.7)
     if primary_high_count == 0:
         # Cap the final score at 60 if no core capability strongly matches
         final_score = min(final_score, 60.0)
@@ -1410,6 +1585,7 @@ def score_resume(
         final_score=round(min(final_score, 100.0), 1),
         experience_level=exp_level,
         tier_classification=resume_tier,
+        layered_classification=resume_lc,
         dimension_scores=dimension_scores,
         resume_strength_signals=resume.context_meta_tags.resume_strength_signals,
         tier_mismatch=tier_mismatch,

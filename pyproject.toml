@@ -27,6 +27,8 @@ dependencies = [
     "datasets>=2.16.1",
     "scikit-learn>=1.4.0",
     "azure-storage-blob>=12.28.0",
+    # ── MongoDB async driver for auto-growing skill library ───────────────────
+    "motor>=3.0.0",
 ]
 
 [[tool.uv.index]]
