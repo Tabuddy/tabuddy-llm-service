@@ -24,7 +24,9 @@ def _pdf_pipeline_options(
     images_scale: float | None = None,
     force_backend_text: bool = False,
     do_table_structure: bool | None = None,
+    device: str = "auto",
 ):
+    from docling.datamodel.accelerator_options import AcceleratorOptions
     from docling.datamodel.pipeline_options import PdfPipelineOptions
 
     scale = images_scale if images_scale is not None else float(
@@ -38,6 +40,7 @@ def _pdf_pipeline_options(
         table_batch_size=int(os.environ.get("DOCLING_TABLE_BATCH_SIZE", "1")),
         queue_max_size=int(os.environ.get("DOCLING_QUEUE_MAX_SIZE", "8")),
         force_backend_text=force_backend_text,
+        accelerator_options=AcceleratorOptions(device=device),
     )
     if do_table_structure is not None:
         opts.do_table_structure = do_table_structure
@@ -50,6 +53,7 @@ def create_document_converter(
     images_scale: float | None = None,
     force_backend_text: bool = False,
     do_table_structure: bool | None = None,
+    device: str = "auto",
 ) -> DocumentConverter:
     from docling.datamodel.base_models import InputFormat
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -59,6 +63,7 @@ def create_document_converter(
         images_scale=images_scale,
         force_backend_text=force_backend_text,
         do_table_structure=do_table_structure,
+        device=device,
     )
     return DocumentConverter(
         format_options={
@@ -67,7 +72,7 @@ def create_document_converter(
     )
 
 
-def convert_path_to_markdown(path: str | Path) -> str:
+def convert_path_to_markdown(path: str | Path, *, device: str = "auto") -> str:
     """Run Docling on a file path; return markdown or empty string.
 
     Tries progressively cheaper modes if conversion fails (OOM / preprocess errors).
@@ -121,7 +126,7 @@ def convert_path_to_markdown(path: str | Path) -> str:
 
     for label, kwargs in attempts:
         try:
-            conv = create_document_converter(**kwargs)
+            conv = create_document_converter(**kwargs, device=device)
             result = conv.convert(str(path), raises_on_error=False)
             st = result.status
             if result.document is None:
@@ -146,7 +151,7 @@ def convert_path_to_markdown(path: str | Path) -> str:
     return ""
 
 
-def convert_path_best_effort(path: str | Path):
+def convert_path_best_effort(path: str | Path, *, device: str = "auto"):
     """Like convert_path_to_markdown but returns the last successful ConversionResult (or None).
 
     Used by /docling/convert when post-processing needs `result.document` (chunker, etc.).
@@ -191,7 +196,7 @@ def convert_path_best_effort(path: str | Path):
 
     for label, kwargs in attempts:
         try:
-            conv = create_document_converter(**kwargs)
+            conv = create_document_converter(**kwargs, device=device)
             result = conv.convert(str(path), raises_on_error=False)
             st = result.status
             if result.document is None:
