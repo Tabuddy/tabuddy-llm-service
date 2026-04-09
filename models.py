@@ -34,6 +34,9 @@ class SkillTrace(BaseModel):
     context: str  # 5-15 word exact quote from block
     co_dependent_skills: list[str] = []
     metric: str | None = None  # non-financial scale metric, null if none
+    # Filled when aggregate(..., enrich_skill_temporal=True); from experience_detail
+    last_used_date: str | None = None  # ISO date YYYY-MM-DD, end of role or "as of" if current
+    computed_years_with_skill: float | None = None  # tenure in that block / role (approx.)
 
 
 # ── Per-block skill entry (used inside BlockTagResult) ──
@@ -143,6 +146,8 @@ class GlobalParameters(BaseModel):
 # ── Trajectory-based global skill index ──
 class GlobalSkillEntry(BaseModel):
     skill: str
+    # Sum of per-trace computed_years_with_skill when temporal enrich is on (naive sum across roles).
+    computed_years_with_skill: float | None = None
     traces: list[SkillTrace]
 
 
