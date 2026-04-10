@@ -1,7 +1,7 @@
 """JD Parser — converts raw Job Description text into structured meta-tag atoms.
 
 Pipeline:
-  1. SetFit 3-tier classification of the JD
+  1. LLM-based classification (pillar/layer/activity)
   2. Single LLM call to extract structured atoms using the JD atom prompt
   3. Deterministic normalization into JDProfile
 """
@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import re
+from typing import Any
 from openai import AsyncAzureOpenAI
 
+from llm_client import get_reasoning_client, get_fast_client, REASONING_MODEL, FAST_MODEL
 from ranking_models import (
     JDAtom,
     JDCapabilityAtom,
@@ -24,8 +26,6 @@ from ranking_models import (
     TierClassification,
     TierPrediction,
 )
-import setfit_classifier as clf
-import prompt_rescue
 
 logger = logging.getLogger(__name__)
 
@@ -123,129 +123,151 @@ def _build_default_tier_classification() -> TierClassification:
     )
 
 
-# ── LLM Cross-Check using Prompt Rescue ───────────────────────────────────────────────
-async def _crosscheck_tier_classification(
-    jd_text: str,
-    setfit_result: TierClassification,
-) -> TierClassification:
-    """Cross-check SetFit tier classification using prompt rescue engine.
+def _normalize_llm_content(content: Any) -> str:
+    """Normalize LLM message content into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        # Defensive support for segmented content payloads.
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+        text = "\n".join(parts).strip()
+    else:
+        text = str(content).strip()
 
-    Fires when SetFit confidence is below the pillar rescue threshold.
-    Uses the structured context store for higher-quality corrections.
-    """
-    # Trust very high confidence predictions
-    if (setfit_result.tier1.score > 0.92
-            and setfit_result.tier2
-            and setfit_result.tier2.score > 0.92):
-        return setfit_result
-
-    # Build SetFit scores dict for the rescue engine
-    # (We use tier2 score as the primary signal since that's where misclassifications occur)
-    t2_score = setfit_result.tier2.score if setfit_result.tier2 else setfit_result.tier1.score
-    if not prompt_rescue.needs_rescue("pillar", t2_score):
-        return setfit_result
-
-    # Map current tier labels to pillar names for the scores dict
-    _TIER2_TO_PILLAR = {
-        "App_Engineering": "Application Engineering",
-        "Data_Intelligence": "Data & Intelligence",
-        "Infra_Cloud": "Infrastructure & Cloud",
-        "Product_Design": "Product & Design",
-        "Cyber_Security": "Cyber Security",
-    }
-    setfit_scores: dict[str, float] = {}
-    if setfit_result.tier2:
-        setfit_scores[_TIER2_TO_PILLAR.get(
-            setfit_result.tier2.label, setfit_result.tier2.label)] = t2_score
-
-    rescue_result = await prompt_rescue.rescue_classification(
-        stage="pillar",
-        setfit_scores=setfit_scores,
-        text=jd_text,
-    )
-
-    if rescue_result.get("confidence_source") != "llm_rescue":
-        return setfit_result
-
-    # Map pillar name back to tier2 label
-    _PILLAR_TO_TIER2 = {v: k for k, v in _TIER2_TO_PILLAR.items()}
-    rescued_pillar = rescue_result["value"]
-    corrected_t2 = _PILLAR_TO_TIER2.get(rescued_pillar)
-
-    if not corrected_t2 or corrected_t2 == (setfit_result.tier2.label if setfit_result.tier2 else ""):
-        return setfit_result
-
-    logger.info(
-        "⚡ Prompt rescue overrides JD classification: %s → %s",
-        setfit_result.hierarchy_path, corrected_t2,
-    )
-    corrected = TierClassification(
-        tier1=TierPrediction(label="Digital", score=0.90),
-        tier2=TierPrediction(label=corrected_t2, score=0.85),
-        hierarchy_path=f"Digital > {corrected_t2}",
-        final_label=corrected_t2,
-        low_confidence=False,
-    )
-    return corrected
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    return text
 
 
-async def _build_jd_layered_classification(
-    jd_text: str,
-    tier_class: TierClassification,
-) -> LayeredClassification:
-    """Build a LayeredClassification for a JD using the SetFit result + prompt rescue.
+def _safe_json_parse(text: str) -> Any | None:
+    """Parse JSON from LLM output with tolerant extraction."""
+    if not text:
+        return None
 
-    JDs typically describe a single target role, so compatible_layers is limited
-    to cases where the JD explicitly describes multi-stack requirements.
-    """
-    # Use the setfit_classifier's classify_as_layered for the base mapping
-    lc = clf.classify_as_layered(jd_text[:2000])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
 
-    # Override the pillar/layer if the cross-checked tier_class differs
-    _TIER2_TO_PILLAR = {
-        "App_Engineering": "Application Engineering",
-        "Data_Intelligence": "Data & Intelligence",
-        "Infra_Cloud": "Infrastructure & Cloud",
-        "Product_Design": "Product & Design",
-        "Cyber_Security": "Cyber Security",
-    }
-    if tier_class.tier2 and tier_class.tier2.label in _TIER2_TO_PILLAR:
-        corrected_pillar = _TIER2_TO_PILLAR[tier_class.tier2.label]
-        if corrected_pillar != lc.pillar.label:
-            lc.pillar = LayerPrediction(
-                label=corrected_pillar,
-                score=tier_class.tier2.score,
-                confidence_source="llm_rescue",
-            )
-            # Rebuild hierarchy_path
-            parts = [corrected_pillar]
-            if lc.layer:
-                parts.append(lc.layer.label)
-            if lc.activity:
-                parts.append(lc.activity.label)
-            lc.hierarchy_path = " > ".join(parts)
+    # Try extracting a JSON array/object embedded in extra prose.
+    for open_char, close_char in [("[", "]"), ("{", "}")]:
+        start = text.find(open_char)
+        end = text.rfind(close_char)
+        if start >= 0 and end > start:
+            snippet = text[start:end + 1]
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                continue
+    return None
 
-    # Trigger layer-level rescue if the layer confidence is low
-    if lc.layer and prompt_rescue.needs_rescue("layer", lc.layer.score):
-        layer_scores: dict[str, float] = {lc.layer.label: lc.layer.score}
-        rescue = await prompt_rescue.rescue_classification(
-            stage="layer",
-            setfit_scores=layer_scores,
-            text=jd_text,
-            resolved_context={"pillar": lc.pillar.label},
+
+# ── LLM-Based Classification ─────────────────────────────────────────────────
+_CLASSIFY_PROMPT = """\
+You are an expert role classifier. Classify the following text into our taxonomy.
+
+Taxonomy pillars:
+- Application Engineering: Software development roles (web, mobile, backend, fullstack)
+- Data & Intelligence: Data engineering, data science, analytics, ML/AI, BI roles
+- Infrastructure & Cloud: DevOps, SRE, cloud architecture, networking, sysadmin roles
+- Product & Design: Product management, UX/UI design, technical writing roles
+- Cyber Security: Security engineering, compliance, penetration testing roles
+
+Activity types:
+- Architect: System/solution design, technical leadership
+- Develop: Hands-on building/coding
+- Test: QA, testing, quality assurance
+- Manage: Project/people/delivery management
+- Support: Operations, maintenance, support
+- Solutions_Architect: Pre-sales, solution consulting
+
+Return ONLY a JSON object with these fields:
+{
+  "pillar": "<exact pillar name from list above>",
+  "layer": "<specific sub-area, e.g. Data_Engineering, App_Backend, App_Frontend, Infra_DevOps, etc.>",
+  "activity": "<activity type from list above>",
+  "confidence": <0.0-1.0>
+}
+
+Do NOT add explanation. Return ONLY the JSON object.
+"""
+
+
+async def _llm_classify_text(text: str) -> LayeredClassification:
+    """Classify text using LLM instead of SetFit."""
+    client = get_fast_client()
+    if not client:
+        logger.warning("No Azure OpenAI key — using default classification")
+        return _build_default_layered()
+
+    try:
+        response = await client.chat.completions.create(
+            model=FAST_MODEL,
+            messages=[
+                {"role": "system", "content": _CLASSIFY_PROMPT},
+                {"role": "user", "content": text[:3000]},
+            ],
+            temperature=0.0,
+            max_completion_tokens=500,
         )
-        if rescue.get("confidence_source") == "llm_rescue":
-            rescued_layer = rescue["value"]
-            lc.layer = LayerPrediction(
-                label=rescued_layer, score=rescue["score"], confidence_source="llm_rescue"
+        content = _normalize_llm_content(response.choices[0].message.content)
+        data = _safe_json_parse(content)
+        if not isinstance(data, dict):
+            logger.warning(
+                "LLM classification returned non-JSON object (finish_reason=%s).",
+                response.choices[0].finish_reason,
             )
-            # Update hierarchy_path
-            parts = [lc.pillar.label, rescued_layer]
-            if lc.activity:
-                parts.append(lc.activity.label)
-            lc.hierarchy_path = " > ".join(parts)
+            return _build_default_layered()
 
-    return lc
+        pillar = data.get("pillar", "Unknown")
+        layer = data.get("layer")
+        activity = data.get("activity", "Develop")
+        confidence = float(data.get("confidence", 0.85))
+
+        parts = [pillar]
+        if layer:
+            parts.append(layer)
+        if activity:
+            parts.append(activity)
+
+        return LayeredClassification(
+            pillar=LayerPrediction(
+                label=pillar, score=confidence, confidence_source="llm"),
+            layer=LayerPrediction(
+                label=layer, score=confidence, confidence_source="llm") if layer else None,
+            activity=LayerPrediction(
+                label=activity, score=confidence, confidence_source="llm") if activity else None,
+            platform_tool=None,
+            hierarchy_path=" > ".join(parts),
+            final_label=parts[-1],
+            low_confidence=confidence < 0.6,
+            compatible_layers=[],
+        )
+    except Exception as e:
+        logger.warning("LLM classification failed: %s", e)
+        return _build_default_layered()
+
+
+def _build_default_layered() -> LayeredClassification:
+    return LayeredClassification(
+        pillar=LayerPrediction(label="Unknown", score=0.0,
+                               confidence_source="fallback"),
+        hierarchy_path="Unknown",
+        final_label="Unknown",
+        low_confidence=True,
+        compatible_layers=[],
+    )
 
 
 # ── Tech Keyword Extraction ────────────────────────────────────────────────────
@@ -253,56 +275,52 @@ _COMMON_TECH_TERMS = {
     # Frontend
     "react", "reactjs", "react.js", "vue", "vue.js", "angular", "svelte",
     "next.js", "nextjs", "html", "css", "tailwind", "sass", "bootstrap",
-    "jquery", "webpack", "vite", "babel",
+    "jquery", "webpack", "vite",
     # Backend & Fullstack
-    "node", "nodejs", "node.js", "express", "fastapi", "django", "flask",
+    "node.js", "nodejs", "express", "fastapi", "django", "flask",
     "spring boot", "spring", "java", "python", "golang", "rust", "ruby",
     "php", "swift", "kotlin", "csharp", "c#", ".net", "asp.net",
-    "microservices", "restful", "rest", "grpc", "graphql", "websocket",
-    "serverless", "lambd", "api", "backend", "frontend", "fullstack",
-    "typescript", "javascript", "es6", "babel",
+    "microservices", "graphql",
+    "serverless", "typescript", "javascript",
     # Mobile
-    "ios", "android", "react native", "flutter", "swift", "kotlin",
-    "xcode", "android studio", "mobile", "app",
+    "ios", "android", "react native", "flutter",
+    "xcode", "android studio",
     # DevOps & Cloud
     "docker", "kubernetes", "k8s", "docker-compose", "helm",
     "terraform", "ansible", "jenkins", "github actions", "gitlab ci",
-    "aws", "azure", "gcp", "google cloud", "cloud", "iaas", "paas", "saas",
-    "ci/cd", "pipelines", "infrastructure", "orchestration", "monitoring",
-    "observability", "logging", "tracing", "prometheus", "grafana",
-    "elk", "elastic", "stack", "kibana", "datadog", "new relic",
+    "aws", "azure", "gcp", "google cloud",
+    "ci/cd", "prometheus", "grafana",
+    "elasticsearch", "datadog", "new relic",
     # Databases
     "postgresql", "postgres", "mysql", "mariadb", "mongodb", "redis",
-    "cassandra", "mssql", "sql server", "oracle", "elasticsearch",
-    "dynamodb", "cosmosdb", "firestore", "neo4j", "graph database",
-    "rdbms", "nosql", "sql", "database", "db", "data storage",
+    "cassandra", "mssql", "sql server", "oracle",
+    "dynamodb", "cosmosdb", "firestore", "neo4j",
+    "nosql", "sql",
     # Data Engineering & Analytics
     "big data", "hadoop", "spark", "databricks", "airflow", "luigi", "prefect",
     "dbt", "data pipeline", "etl", "elt", "data warehouse", "data lake",
     "data mesh", "data fabric", "kafka", "confluent", "pulsar", "rabbitmq",
-    "sqoop", "flink", "kinesis", "stream processing", "batch processing",
+    "sqoop", "flink", "kinesis",
     "pandas", "numpy", "scipy", "scikit-learn", "sklearn", "tensorflow",
-    "pytorch", "keras", "mlflow", "kubeflow", "feast", "hopsworks",
-    "feature store", "model deployment", "model serving",
-    "knowledge graph", "rdf", "owl", "sparql", "graphql", "triple store",
-    "vector", "embeddings", "vector database", "pinecone", "weaviate", "milvus",
-    "qdrant", "pgvector", "ann", "approximate nearest neighbor",
-    "hdfs", "s3", "azure blob", "cloud storage", "object storage",
-    "data ingestion", "data extraction", "data transformation", "data loading",
-    "data quality", "data governance", "data catalog", "metadata",
+    "pytorch", "keras", "mlflow", "kubeflow",
+    "hdfs", "s3", "azure blob",
+    "data quality", "data governance", "data catalog",
+    # Data platforms & tools
+    "snowflake", "informatica", "informatica iics", "power bi", "tableau",
+    "looker", "qlik", "ssis", "ssrs", "ssas", "talend", "matillion",
+    "fivetran", "stitch", "bigquery", "redshift", "synapse",
+    "hive", "impala", "presto", "trino", "delta lake", "iceberg",
+    "apache hudi", "nifi", "dataproc", "emr",
+    # Vector & AI
+    "pinecone", "weaviate", "milvus", "qdrant", "pgvector",
     # Testing & QA
     "selenium", "cypress", "playwright", "jest", "mocha", "junit",
-    "pytest", "testng", "cucumber", "bdd", "tdd", "integration test",
-    "unit test", "e2e", "end-to-end", "mocking", "stubbing",
+    "pytest", "testng", "cucumber",
     # Version Control & Collaboration
     "git", "github", "gitlab", "bitbucket", "azure devops", "jira",
-    "confluence", "slack", "microsoft teams", "agile", "scrum", "kanban",
-    "waterfall", "devops", "sre", "site reliability", "incident response",
+    "confluence", "agile", "scrum",
     # Security & Compliance
-    "oauth", "jwt", "saml", "ldap", "kerberos", "encryption", "TLS",
-    "SSL", "HTTPS", "firewall", "vpc", "subnet", "vpn", "rbac", "abac",
-    "pci", "hipaa", "gdpr", "compliance", "audit", "penetration test",
-    "vulnerability", "scanning", " secrets management", "key vault",
+    "oauth", "jwt", "saml", "ldap", "kerberos",
 }
 
 
@@ -419,13 +437,19 @@ def _extract_experience_requirements(jd_text: str) -> tuple[float | None, float 
 
 
 def _extract_tech_from_jd(jd_text: str) -> list[str]:
-    """Extract individual technology keywords from raw JD text."""
+    """Extract individual technology keywords from raw JD text.
+
+    Uses word-boundary matching to avoid false positives
+    (e.g. 'app' matching inside 'application').
+    """
     text_lower = jd_text.lower()
     found: set[str] = set()
     for term in sorted(_COMMON_TECH_TERMS, key=len, reverse=True):
-        if term in text_lower:
+        # Use word boundaries to avoid substring false positives
+        pattern = r'\b' + re.escape(term) + r'\b'
+        if re.search(pattern, text_lower):
             normed = re.sub(r"[^a-z0-9\s]", "", term).strip()
-            if normed and len(normed) > 1:
+            if normed and len(normed) > 2:  # Skip 2-char noise
                 found.add(normed)
     return sorted(found)
 
@@ -579,48 +603,72 @@ async def parse_jd(jd_text: str) -> JDProfile:
     """Parse a raw Job Description into structured JDProfile.
 
     Steps:
-      1. SetFit 3-tier classify the JD text
+      1. LLM classification of the JD text
       2. LLM call to extract atoms
       3. Normalize and assemble JDProfile
     """
-    # Step 1: SetFit classification
-    if clf.models_available():
-        tier_class = clf.classify_text(jd_text[:2000])
-    else:
-        logger.warning(
-            "SetFit models not loaded — using fallback classification")
-        tier_class = _build_default_tier_classification()
+    # Step 1: LLM-based classification (replaces SetFit + prompt_rescue)
+    layered_class = await _llm_classify_text(jd_text)
+    tier_class = layered_class.to_legacy_tier()
 
-    # Step 1b: Prompt rescue cross-check (replaces the old LLM cross-check)
-    tier_class = await _crosscheck_tier_classification(jd_text, tier_class)
-
-    # Step 1c: Build layered classification for new 4-layer taxonomy
-    layered_class = await _build_jd_layered_classification(jd_text, tier_class)
-
-    # Step 2: LLM atom extraction
-    client = _get_client()
+    # Step 2: LLM atom extraction (using o4-mini reasoning model)
+    # Retry up to 2 times if extraction returns empty — the reasoning model
+    # occasionally returns malformed JSON or truncated output.
+    client = get_reasoning_client() or _get_client()
+    atom_model = REASONING_MODEL if get_reasoning_client() else _AZURE_DEPLOYMENT
     raw_atoms: list = []
+    _MAX_ATOM_RETRIES = 2
 
     if client:
-        try:
-            response = await client.chat.completions.create(
-                model=_AZURE_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": _JD_ATOM_PROMPT},
-                    {"role": "user", "content": jd_text},
-                ],
-                max_completion_tokens=6000,
-            )
-            content = (response.choices[0].message.content or "").strip()
-            # Strip code fences if present
-            if content.startswith("```"):
-                content = content.split("\n", 1)[-1].rsplit("```", 1)[0]
-            raw_atoms = json.loads(content)
-            if not isinstance(raw_atoms, list):
+        for _attempt in range(_MAX_ATOM_RETRIES + 1):
+            try:
+                response = await client.chat.completions.create(
+                    model=atom_model,
+                    messages=[
+                        {"role": "user", "content": _JD_ATOM_PROMPT +
+                            "\n\nJOB DESCRIPTION:\n" + jd_text},
+                    ],
+                    max_completion_tokens=6000,
+                )
+                content = _normalize_llm_content(
+                    response.choices[0].message.content)
+                parsed = _safe_json_parse(content)
+
+                if isinstance(parsed, list):
+                    raw_atoms = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("atoms"), list):
+                    # Accept wrapper format: {"atoms": [...]}
+                    raw_atoms = parsed["atoms"]
+                else:
+                    raw_atoms = []
+                    logger.warning(
+                        "JD atom extraction attempt %d returned non-JSON/empty payload "
+                        "(finish_reason=%s, chars=%d)",
+                        _attempt + 1,
+                        response.choices[0].finish_reason,
+                        len(content),
+                    )
+
+                # Validate: a well-formed JD should produce at least 1
+                # capability atom.  If empty, retry.
+                has_caps = any(
+                    isinstance(a, dict) and "capability" in a.get(
+                        "atom_type", "")
+                    for a in raw_atoms
+                )
+                if raw_atoms and has_caps:
+                    break  # Good extraction
+                logger.warning(
+                    "JD atom extraction attempt %d returned %d atoms "
+                    "(has_caps=%s) — retrying",
+                    _attempt + 1, len(raw_atoms), has_caps,
+                )
+            except Exception as e:
+                logger.warning(
+                    "JD LLM extraction attempt %d failed: %s",
+                    _attempt + 1, e,
+                )
                 raw_atoms = []
-        except Exception as e:
-            logger.exception("JD LLM extraction failed: %s", e)
-            raw_atoms = []
     else:
         logger.warning("No Azure OpenAI key — JD will have no atoms extracted")
 

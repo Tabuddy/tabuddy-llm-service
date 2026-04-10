@@ -28,9 +28,9 @@ from ranking_models import (
     TierClassification,
     TierPrediction,
 )
-from resume_scorer import score_resume, detect_experience_level
-from jd_parser import parse_jd
-import setfit_classifier as clf
+from resume_scorer import score_resume, detect_experience_level, estimate_candidate_years
+from jd_parser import parse_jd, _llm_classify_text
+from section_scorer import score_all_sections
 from pathlib import Path
 import tempfile
 import time
@@ -54,6 +54,10 @@ os.environ["TQDM_DISABLE"] = "1"
 
 
 logger = logging.getLogger(__name__)
+
+_BATCH_RESUME_CONCURRENCY = max(
+    1, int(os.getenv("RANKING_BATCH_CONCURRENCY", "4"))
+)
 
 
 load_dotenv()
@@ -79,14 +83,8 @@ if os.getenv("ENV") == "PROD":
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load SetFit models, MongoDB skill library on startup; unload on shutdown."""
-    logger.info("🚀 Loading SetFit classification models...")
-    loaded = clf.load_setfit_models()
-    if loaded:
-        logger.info("✅ SetFit models ready: %s", clf.get_loaded_tiers())
-    else:
-        logger.warning(
-            "⚠️  SetFit models not loaded — tier classification degraded")
+    """Initialize MongoDB skill library on startup; shutdown cleanly."""
+    logger.info("🚀 Starting TABuddy service (LLM-based classification)...")
 
     # Initialize MongoDB connection and merged skill library
     await db.init_db()
@@ -222,7 +220,7 @@ async def parse_resume_endpoint(file: UploadFile = File(...)):
 
     # Step 4: NLP Filter
     t2 = time.perf_counter()
-    blocks = filter_blocks(blocks)
+    blocks = await asyncio.to_thread(filter_blocks, blocks)
     logger.info("Step 4 (NLP filter) took %.2fs", time.perf_counter() - t2)
 
     # Steps 5+6+7 PARALLEL:
@@ -331,7 +329,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
     )
 
     # Same deterministic filter + tagging/meta/global flow as default.
-    blocks = filter_blocks(blocks)
+    blocks = await asyncio.to_thread(filter_blocks, blocks)
 
     async def _tag_and_build_meta(blks):
         br = await tag_all_blocks(blks)
@@ -454,7 +452,7 @@ async def parse_resume_hybrid_stage2_endpoint(
     ]
 
     # Deterministic filter (may reclassify "summary" -> "skills_dump")
-    blocks = filter_blocks(stage1_blocks)
+    blocks = await asyncio.to_thread(filter_blocks, stage1_blocks)
 
     async def _tag_and_build_meta(blks):
         br = await tag_all_blocks(blks)
@@ -529,7 +527,7 @@ async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
 
     candidate = extract_candidate_details(raw_text)
     blocks = await build_hybrid_blocks(raw_text, docling_md)
-    blocks = filter_blocks(blocks)
+    blocks = await asyncio.to_thread(filter_blocks, blocks)
 
     async def _tag_and_meta(blks):
         br = await tag_all_blocks(blks)
@@ -601,20 +599,19 @@ async def ranking_score_resume(
     t0 = time.perf_counter()
     resume = await _run_full_resume_pipeline(file)
 
-    # Classify resume with SetFit (use layered for multi-expertise support)
+    # Classify resume with LLM
     resume_text = resume.parsed_text[:2000] if resume.parsed_text else ""
-    if clf.models_available():
-        resume_lc = clf.classify_as_layered(resume_text)
-        resume_tier = resume_lc.to_legacy_tier()
-    else:
-        resume_lc = None
-        resume_tier = TierClassification(
-            tier1=TierPrediction(label="Unknown", score=0.0),
-            hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
-        )
+    resume_lc = await _llm_classify_text(resume_text)
+    resume_tier = resume_lc.to_legacy_tier()
+
+    # Run LLM section scoring
+    candidate_years = estimate_candidate_years(resume)
+    section_scores = await score_all_sections(
+        jd_profile.jd_profile, resume, candidate_years)
 
     result = score_resume(jd_profile.jd_profile, resume,
-                          resume_tier, resume_lc=resume_lc)
+                          resume_tier, resume_lc=resume_lc,
+                          section_scores=section_scores)
     logger.info("Single resume scoring took %.2fs", time.perf_counter() - t0)
     return result
 
@@ -645,21 +642,25 @@ async def ranking_batch_rank(
     logger.info("JD parsed in %.2fs", time.perf_counter() - t0)
 
     # Step 2: Process all resumes in parallel
+    sem = asyncio.Semaphore(_BATCH_RESUME_CONCURRENCY)
+
     async def _score_one(f: UploadFile) -> ResumeRankResult | str:
         try:
-            resume = await _run_full_resume_pipeline(f)
-            resume_text = resume.parsed_text[:
-                                             2000] if resume.parsed_text else ""
-            if clf.models_available():
-                resume_lc = clf.classify_as_layered(resume_text)
+            async with sem:
+                resume = await _run_full_resume_pipeline(f)
+                resume_text = resume.parsed_text[:
+                                                 2000] if resume.parsed_text else ""
+                resume_lc = await _llm_classify_text(resume_text)
                 resume_tier = resume_lc.to_legacy_tier()
-            else:
-                resume_lc = None
-                resume_tier = TierClassification(
-                    tier1=TierPrediction(label="Unknown", score=0.0),
-                    hierarchy_path="Unknown", final_label="Unknown", low_confidence=True,
+                # Run LLM section scoring in parallel
+                candidate_years = estimate_candidate_years(resume)
+                section_scores = await score_all_sections(
+                    jd_profile, resume, candidate_years)
+                return score_resume(
+                    jd_profile, resume, resume_tier,
+                    resume_lc=resume_lc,
+                    section_scores=section_scores,
                 )
-            return score_resume(jd_profile, resume, resume_tier, resume_lc=resume_lc)
         except Exception as e:
             fname = getattr(f, "filename", "unknown")
             logger.exception("Error scoring resume %s: %s", fname, e)
@@ -696,13 +697,14 @@ async def ranking_batch_rank(
 # ── 4. Expose SetFit classification directly ──────────────────────────────────
 @app.post("/classify-text", response_model=TierClassification)
 async def classify_text_endpoint(req: ClassifyTextRequest):
-    """Run the 3-tier SetFit cascade on arbitrary text.
+    """Run LLM-based classification on arbitrary text.
 
     Useful for debugging classification of JDs and resumes.
     """
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
-    return clf.classify_text(req.text[:3000])
+    lc = await _llm_classify_text(req.text[:3000])
+    return lc.to_legacy_tier()
 
 
 # ── 5. Resume Ranking Test UI ─────────────────────────────────────────────────
@@ -713,7 +715,7 @@ async def resume_ranking_ui(request: Request):
         "resume_ranking.html",
         {
             "request": request,
-            "setfit_loaded": clf.models_available(),
-            "loaded_tiers": clf.get_loaded_tiers(),
+            "setfit_loaded": False,
+            "loaded_tiers": [],
         },
     )

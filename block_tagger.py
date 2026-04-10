@@ -23,6 +23,10 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
+_BLOCK_TAGGER_CONCURRENCY = max(
+    1, int(os.getenv("BLOCK_TAGGER_MAX_CONCURRENCY", "4"))
+)
+
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 _AZURE_DEPLOYMENT = "gpt-4o-mini"
 _AZURE_API_VERSION = "2024-12-01-preview"
@@ -183,6 +187,12 @@ async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
         logger.warning("No Azure OpenAI key – using fallback extraction")
         return [_fallback_extract(b) for b in blocks]
 
+    sem = asyncio.Semaphore(_BLOCK_TAGGER_CONCURRENCY)
+
+    async def _guarded_tag(block: ResumeBlock) -> BlockTagResult:
+        async with sem:
+            return await _tag_single_block(client, block)
+
     tasks: list = []
     task_indices: list[int] = []
     results: list[BlockTagResult] = [
@@ -199,7 +209,7 @@ async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
             results[i] = _parse_skills_dump(block)
             continue
         # All other types → LLM call
-        tasks.append(_tag_single_block(client, block))
+        tasks.append(_guarded_tag(block))
         task_indices.append(i)
 
     if tasks:

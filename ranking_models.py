@@ -163,6 +163,32 @@ class JDProfile(BaseModel):
     required_tech_normalized: list[str] = []      # tech-specific atoms
 
 
+# ── Section-Level Scoring ──────────────────────────────────────────────────────
+
+class MatchDetail(BaseModel):
+    """Per-item match detail (skill, capability, experience entry, etc.)."""
+    item: str                          # skill name, company, capability, etc.
+    match_type: str                    # exact | transferable | partial | gap
+    score: float                       # 0-100
+    explanation: str                   # why this score
+
+
+class SectionScore(BaseModel):
+    """JD-aware score for a single resume section."""
+    section_name: str                  # summary | experience | skills | projects
+    score: float                       # 0-100
+    reasoning: str                     # LLM explanation of the score
+    match_details: list[MatchDetail] = []
+
+
+class PenaltyDetail(BaseModel):
+    """Records a scoring penalty applied."""
+    penalty_name: str
+    reason: str
+    score_before: float
+    score_after: float
+
+
 # ── Scoring Breakdown ─────────────────────────────────────────────────────────
 class DimensionScore(BaseModel):
     dimension: str
@@ -184,6 +210,11 @@ class ResumeRankResult(BaseModel):
     resume_strength_signals: list[str] = []
     tier_mismatch: bool = False
     low_confidence_classification: bool = False
+    # ── New: detailed breakdowns ──
+    section_scores: list[SectionScore] = []
+    penalties_applied: list[PenaltyDetail] = []
+    skill_gap_analysis: list[MatchDetail] = []
+    role_fit_reasoning: str | None = None
 
 
 class RankingSession(BaseModel):

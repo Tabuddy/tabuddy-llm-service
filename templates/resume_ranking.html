@@ -419,6 +419,119 @@
     .empty-icon { font-size: 48px; margin-bottom: 16px; }
     .empty-title { font-size: 18px; font-weight: 600; color: var(--text-dim); margin-bottom: 8px; }
     .empty-sub { font-size: 13px; }
+
+    /* ── Detail Modal ──────────────────────────── */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 10000;
+      background: rgba(0,0,0,0.7); backdrop-filter: blur(4px);
+      display: none; align-items: flex-start; justify-content: center;
+      padding: 40px 20px; overflow-y: auto;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal-content {
+      background: var(--bg2); border: 1px solid var(--border-bright);
+      border-radius: var(--radius); max-width: 800px; width: 100%;
+      box-shadow: var(--shadow-lg);
+      animation: modalSlide 0.25s ease;
+    }
+    @keyframes modalSlide { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+    .modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 20px 24px; border-bottom: 1px solid var(--border);
+    }
+    .modal-header h3 { font-size: 18px; font-weight: 700; }
+    .modal-close {
+      background: none; border: none; color: var(--text-dim); font-size: 20px;
+      cursor: pointer; padding: 4px 8px; border-radius: 6px;
+    }
+    .modal-close:hover { background: var(--bg3); color: var(--text); }
+    .modal-body { padding: 24px; }
+
+    .detail-section { margin-bottom: 24px; }
+    .detail-section-title {
+      font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--accent2); margin-bottom: 12px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .detail-section-title .ds-score {
+      font-weight: 800; padding: 2px 10px; border-radius: 99px; font-size: 12px;
+    }
+    .ds-score.high { background: var(--green-dim); color: var(--green); }
+    .ds-score.mid  { background: var(--yellow-dim); color: var(--yellow); }
+    .ds-score.low  { background: var(--red-dim); color: var(--red); }
+
+    .detail-reasoning {
+      font-size: 13px; color: var(--text-dim); line-height: 1.6;
+      padding: 12px 14px; background: var(--bg3); border-radius: var(--radius-sm);
+      margin-bottom: 12px; border-left: 3px solid var(--accent);
+    }
+
+    .match-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+    }
+    .match-table th {
+      text-align: left; padding: 8px 10px; background: var(--card);
+      color: var(--text-dim); font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+    .match-table td {
+      padding: 8px 10px; border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .match-type-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 99px;
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+    }
+    .mt-exact       { background: var(--green-dim); color: var(--green); }
+    .mt-transferable { background: var(--cyan-dim); color: var(--cyan); }
+    .mt-partial     { background: var(--yellow-dim); color: var(--yellow); }
+    .mt-gap         { background: var(--red-dim); color: var(--red); }
+
+    .mini-bar-track { width: 60px; height: 4px; background: var(--border); border-radius: 99px; display: inline-block; vertical-align: middle; margin-left: 6px; }
+    .mini-bar-fill { height: 100%; border-radius: 99px; }
+
+    .penalty-card {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 14px; background: var(--red-dim); border: 1px solid rgba(239,68,68,0.2);
+      border-radius: var(--radius-sm); margin-bottom: 8px;
+    }
+    .penalty-icon { font-size: 20px; }
+    .penalty-info { flex: 1; }
+    .penalty-name { font-size: 13px; font-weight: 700; color: var(--red); margin-bottom: 2px; }
+    .penalty-reason { font-size: 12px; color: var(--text-dim); }
+    .penalty-scores { font-size: 12px; color: var(--text-dimmer); font-family: 'JetBrains Mono', monospace; }
+
+    .view-details-btn {
+      background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      color: var(--accent2); font-size: 12px; font-weight: 600; padding: 6px 14px;
+      cursor: pointer; transition: all 0.2s; font-family: 'Inter', sans-serif;
+    }
+    .view-details-btn:hover { border-color: var(--accent); background: var(--accent-glow); }
+
+    .match-legend {
+      border: 1px solid var(--border);
+      background: var(--bg3);
+      border-radius: var(--radius-sm);
+      padding: 14px;
+    }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+    }
+    .legend-item {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      background: var(--card);
+    }
+    .legend-item .match-type-badge { margin-bottom: 8px; }
+    .legend-desc {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-dim);
+    }
   </style>
 </head>
 <body>
@@ -434,13 +547,12 @@
           <h1>Resume <span>Ranking</span> Engine</h1>
           <p style="font-size:13px;color:var(--text-dim);margin-top:4px;">Deterministic 6-dimension scoring · SetFit 3-tier classification · Zero hallucinations</p>
         </div>
-        <div class="status-pill {{ 'ok' if setfit_loaded else 'warn' }}">
+        <div class="status-pill {{ 'ok' if setfit_loaded else 'ok' }}">
           <div class="dot"></div>
-          {% if setfit_loaded %}
+       
             SetFit Ready · {{ loaded_tiers | join(', ') }}
-          {% else %}
-            SetFit Offline · Classification Degraded
-          {% endif %}
+
+      
         </div>
       </div>
     </header>
@@ -522,6 +634,17 @@
       <div class="empty-icon">🎯</div>
       <div class="empty-title">Ready to rank</div>
       <div class="empty-sub">Paste a job description, upload resumes, then hit <strong>Rank All Candidates</strong></div>
+    </div>
+  </div>
+
+  <!-- Detail Modal -->
+  <div class="modal-overlay" id="detail-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="modal-title">Candidate Details</h3>
+        <button class="modal-close" id="modal-close" title="Close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
     </div>
   </div>
 
@@ -820,6 +943,7 @@
 
     function renderResults(session) {
       const results = session.results;
+      rankingResults = results;
       emptyState.style.display = 'none';
       resultsSection.style.display = 'block';
 
@@ -837,6 +961,10 @@
         const top3 = idx < 3 ? 'top-3' : '';
         const expLabel = r.experience_level === 'SENIOR' ? '🔶 Senior' : r.experience_level === 'MID' ? '🔷 Mid-Level' : '🔹 Fresher';
         const tierPath = r.tier_classification.hierarchy_path;
+        const hasSections = r.section_scores && r.section_scores.length > 0;
+        const hasPenalties = r.penalties_applied && r.penalties_applied.length > 0;
+        const hasSkillGap = r.skill_gap_analysis && r.skill_gap_analysis.length > 0;
+        const showDetailsBtn = hasSections || hasPenalties || hasSkillGap;
         return `
           <div class="rank-card ${top3}" data-idx="${idx}" role="button" tabindex="0" aria-expanded="false">
             <div class="rank-card-header">
@@ -855,7 +983,10 @@
                 <div class="score-value ${color}">${sc.toFixed(0)}</div>
                 <div class="score-label">/ 100</div>
               </div>
-              <span class="expand-icon">▾</span>
+              <div style="display:flex;flex-direction:column;gap:6px;align-items:center;">
+                ${showDetailsBtn ? `<button class="view-details-btn" data-ridx="${idx}" onclick="event.stopPropagation();openDetailModal(${idx})">🔍 View Details</button>` : ''}
+                <span class="expand-icon">▾</span>
+              </div>
             </div>
             <div class="rank-card-detail">
               <div class="section-label">Score Breakdown</div>
@@ -889,6 +1020,131 @@
           requestAnimationFrame(() => { b.style.width = w; });
         });
       });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Detail Modal
+    // ══════════════════════════════════════════════════════════════════════
+    const detailModal = document.getElementById('detail-modal');
+    const modalTitle  = document.getElementById('modal-title');
+    const modalBody   = document.getElementById('modal-body');
+    const modalClose  = document.getElementById('modal-close');
+
+    modalClose.addEventListener('click', () => detailModal.classList.remove('open'));
+    detailModal.addEventListener('click', e => {
+      if (e.target === detailModal) detailModal.classList.remove('open');
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') detailModal.classList.remove('open');
+    });
+
+    function mtClass(type) {
+      const map = { exact: 'mt-exact', transferable: 'mt-transferable', partial: 'mt-partial', gap: 'mt-gap' };
+      return map[type] || 'mt-partial';
+    }
+
+    function miniBar(score) {
+      const color = score >= 70 ? 'var(--green)' : score >= 40 ? 'var(--yellow)' : 'var(--red)';
+      return `<span class="mini-bar-track"><span class="mini-bar-fill" style="width:${score}%;background:${color}"></span></span>`;
+    }
+
+    function renderMatchTable(details, colName) {
+      if (!details || !details.length) return '<div style="font-size:12px;color:var(--text-dimmer)">No detailed breakdown available.</div>';
+      return `<table class="match-table">
+        <thead><tr>
+          <th>${colName || 'Item'}</th>
+          <th>Match</th>
+          <th>Score</th>
+          <th>Explanation</th>
+        </tr></thead>
+        <tbody>
+          ${details.map(d => `<tr>
+            <td style="font-weight:600;color:var(--text)">${escEv(d.item)}</td>
+            <td><span class="match-type-badge ${mtClass(d.match_type)}">${d.match_type}</span></td>
+            <td style="font-family:'JetBrains Mono',monospace;font-weight:600;color:var(--text)">${d.score.toFixed(0)} ${miniBar(d.score)}</td>
+            <td style="color:var(--text-dim)">${escEv(d.explanation || '')}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`;
+    }
+
+    function openDetailModal(idx) {
+      const r = rankingResults[idx];
+      if (!r) return;
+
+      modalTitle.textContent = `${r.candidate_name || 'Candidate'} — Detailed Analysis`;
+      let html = '';
+
+      // Section Scores
+      if (r.section_scores && r.section_scores.length) {
+        const sectionLabels = { role_fit: '🎯 Role Fit', experience: '💼 Experience', skills: '🛠️ Skills', projects: '📁 Projects', domain: '🏢 Domain' };
+        r.section_scores.forEach(ss => {
+          const label = sectionLabels[ss.section_name] || ss.section_name;
+          const sc = scoreColor(ss.score);
+          html += `<div class="detail-section">
+            <div class="detail-section-title">${label} <span class="ds-score ${sc}">${ss.score.toFixed(0)}/100</span></div>
+            <div class="detail-reasoning">${escEv(ss.reasoning)}</div>
+            ${ss.match_details && ss.match_details.length ? renderMatchTable(ss.match_details, ss.section_name === 'skills' ? 'Skill' : ss.section_name === 'experience' ? 'Experience' : 'Item') : ''}
+          </div>`;
+        });
+      }
+
+      // Skill Gap Analysis
+      if (r.skill_gap_analysis && r.skill_gap_analysis.length) {
+        html += `<div class="detail-section">
+          <div class="detail-section-title">🔬 Skill Gap Analysis</div>
+          ${renderMatchTable(r.skill_gap_analysis, 'JD Required Skill')}
+        </div>`;
+      }
+
+      // Penalties
+      if (r.penalties_applied && r.penalties_applied.length) {
+        html += `<div class="detail-section">
+          <div class="detail-section-title">⚠️ Penalties Applied</div>
+          ${r.penalties_applied.map(p => `
+            <div class="penalty-card">
+              <div class="penalty-icon">📉</div>
+              <div class="penalty-info">
+                <div class="penalty-name">${escEv(p.penalty_name)}</div>
+                <div class="penalty-reason">${escEv(p.reason)}</div>
+              </div>
+              <div class="penalty-scores">${p.score_before.toFixed(1)} → ${p.score_after.toFixed(1)}</div>
+            </div>`).join('')}
+        </div>`;
+      }
+
+      // Match keyword legend
+      html += `<div class="detail-section">
+        <div class="detail-section-title">📘 Match Keyword Meanings</div>
+        <div class="match-legend">
+          <div class="legend-grid">
+            <div class="legend-item">
+              <span class="match-type-badge mt-exact">EXACT</span>
+              <div class="legend-desc">Direct match with the required skill/capability and clear evidence in experience or projects.</div>
+            </div>
+            <div class="legend-item">
+              <span class="match-type-badge mt-transferable">TRANSFERABLE</span>
+              <div class="legend-desc">Different but equivalent/competing tools or closely related experience that can transfer quickly.</div>
+            </div>
+            <div class="legend-item">
+              <span class="match-type-badge mt-partial">PARTIAL</span>
+              <div class="legend-desc">Some overlap exists, but depth, ownership, or required tool specificity is incomplete.</div>
+            </div>
+            <div class="legend-item">
+              <span class="match-type-badge mt-gap">GAP</span>
+              <div class="legend-desc">No meaningful evidence found for this requirement in the parsed resume content.</div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+
+      // If nothing detailed is available
+      if (!html) {
+        html = '<div style="text-align:center;padding:40px;color:var(--text-dimmer)">No detailed analysis available for this candidate.</div>';
+      }
+
+      modalBody.innerHTML = html;
+      detailModal.classList.add('open');
     }
 
     // ══════════════════════════════════════════════════════════════════════

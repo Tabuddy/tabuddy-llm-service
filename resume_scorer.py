@@ -1,18 +1,17 @@
-"""Resume Scorer — Deterministic 6-Dimension Scoring Engine.
+"""Resume Scorer — Hybrid 6-Dimension Scoring Engine.
 
-Zero LLM calls. All scoring is pure arithmetic based on structured data
-from both the JDProfile and the ResumeTaggingResponse.
+Blends deterministic scoring with LLM-based section scores for accuracy.
 
 Dimensions & Adaptive Weights:
 ┌─────────────────────────┬────────┬──────┬─────────┐
 │ Dimension               │ Senior │ Mid  │ Fresher │
 ├─────────────────────────┼────────┼──────┼─────────┤
-│ Tier Alignment          │  15%   │  15% │   15%   │
-│ Core Capability Match   │  25%   │  30% │   15%   │
-│ Skill Match             │  10%   │  20% │   35%   │
-│ Experience Quality      │  30%   │  20% │    5%   │
-│ Scale & Impact          │  10%   │   5% │    5%   │
-│ Domain & Context        │  10%   │  10% │   25%   │
+│ Role Fit (LLM)          │  15%   │  15% │   15%   │
+│ Core Capability Match   │  20%   │  30% │   15%   │
+│ Skill Match (hybrid)    │  20%   │  20% │   35%   │
+│ Experience Quality      │  20%   │  20% │    5%   │
+│ Scale & Impact          │  15%   │   5% │    5%   │
+│ Domain & Context (LLM)  │  10%   │  10% │   25%   │
 └─────────────────────────┴────────┴──────┴─────────┘
 """
 
@@ -28,8 +27,11 @@ from ranking_models import (
     ExperienceLevel,
     DimensionScore,
     LayeredClassification,
+    MatchDetail,
+    PenaltyDetail,
     ResumeRankResult,
     JDProfile,
+    SectionScore,
     TierClassification,
 )
 from models import ResumeTaggingResponse  # existing model from the service
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ── Weight Profiles (must sum to 1.0) ─────────────────────────────────────────
 _WEIGHTS: dict[ExperienceLevel, dict[str, float]] = {
     ExperienceLevel.SENIOR: {
-        "tier_alignment": 0.15,
+        "role_fit": 0.15,
         "capability_match": 0.20,
         "skill_match": 0.20,
         "experience_quality": 0.20,
@@ -51,7 +53,7 @@ _WEIGHTS: dict[ExperienceLevel, dict[str, float]] = {
         "domain_context": 0.10,
     },
     ExperienceLevel.MID: {
-        "tier_alignment": 0.15,
+        "role_fit": 0.15,
         "capability_match": 0.30,
         "skill_match": 0.20,
         "experience_quality": 0.20,
@@ -59,7 +61,7 @@ _WEIGHTS: dict[ExperienceLevel, dict[str, float]] = {
         "domain_context": 0.10,
     },
     ExperienceLevel.FRESHER: {
-        "tier_alignment": 0.15,
+        "role_fit": 0.15,
         "capability_match": 0.15,
         "skill_match": 0.35,
         "experience_quality": 0.05,
@@ -287,6 +289,34 @@ def _normalize_term(text: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
 
 
+_NICHE_DATA_SKILL_TERMS = {
+    "xslt", "sparql", "knowledge graph", "rdf", "embedding",
+    "embeddings", "vector", "vector data", "ontology",
+}
+
+
+def _is_niche_data_skill(text: str) -> bool:
+    norm = _normalize_term(text)
+    if not norm:
+        return False
+    return any(term in norm for term in _NICHE_DATA_SKILL_TERMS)
+
+
+def _is_data_engineering_jd(jd: JDProfile) -> bool:
+    role = _normalize_term(jd.role_family or "")
+    objective = _normalize_term(jd.role_objective or "")
+    layer = ""
+    if jd.layered_classification and jd.layered_classification.layer:
+        layer = _normalize_term(jd.layered_classification.layer.label)
+    return (
+        "data engineering" in role
+        or "data engineer" in role
+        or "data pipeline" in role
+        or "data pipeline" in objective
+        or layer == "dataengineering"
+    )
+
+
 def _fuzzy_match_score(a: str, b: str) -> float:
     """Jaccard similarity on word-tokens for soft matching (0.0-1.0)."""
     tokens_a = set(_normalize_term(a).split())
@@ -353,24 +383,45 @@ def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4,
     if not norm_q:
         return 0.0
 
-    # Normalize candidates too
-    norm_candidates = [_normalize_term(c)
-                       for c in candidates if _normalize_term(c)]
-    if not norm_candidates:
+    # Normalize candidates while preserving original text for aligned lookups.
+    normalized_pairs = [
+        (c, _normalize_term(c))
+        for c in candidates
+        if _normalize_term(c)
+    ]
+    if not normalized_pairs:
         return 0.0
+    norm_candidates = [norm for _, norm in normalized_pairs]
 
     # Tier 1: Exact / substring match on normalized forms
     for norm_c in norm_candidates:
-        if norm_q == norm_c or norm_q in norm_c or norm_c in norm_q:
+        if norm_q == norm_c:
             return 1.0
+        if norm_q in norm_c:
+            # Query is contained in a larger candidate skill — full match
+            return 1.0
+        if norm_c in norm_q:
+            # Candidate is a fragment of the query — check coverage to
+            # prevent short/generic tokens ("etl", "etlelt") from fully
+            # matching long compound terms ("informatica iics etlelt
+            # development").  Use whichever coverage metric is higher:
+            # token-overlap ratio  OR  character-length ratio.
+            c_tokens = set(norm_c.split())
+            q_tokens = set(norm_q.split())
+            tok_cov = len(c_tokens & q_tokens) / \
+                len(q_tokens) if q_tokens else 0
+            char_cov = len(norm_c) / len(norm_q) if norm_q else 0
+            if tok_cov >= 0.3 or char_cov >= 0.3:
+                return 1.0
+            # Low coverage — fall through to Jaccard / semantic tiers
 
     # Tier 2: Dictionary-normalized match
     query_canonical = _normalize_to_canonical(query)
     if query_canonical:
         norm_q_canonical = _normalize_term(query_canonical)
-        for idx, norm_c in enumerate(norm_candidates):
+        for original_cand, norm_c in normalized_pairs:
             # Check if candidate normalizes to same canonical
-            cand_canonical = _normalize_to_canonical(candidates[idx])
+            cand_canonical = _normalize_to_canonical(original_cand)
             if cand_canonical:
                 norm_c_canonical = _normalize_term(cand_canonical)
                 if (norm_q_canonical == norm_c_canonical
@@ -416,6 +467,9 @@ def _best_match_score(query: str, candidates: list[str], threshold: float = 0.4,
 # ── LLM-based skill context fallback ──────────────────────────────────────────
 _LLM_SKILL_CACHE: dict[str, bool] = {}
 _LLM_SKILL_CACHE_MAX: int = int(os.getenv("LLM_SKILL_CACHE_MAX", "10000"))
+_ENABLE_SKILL_LLM_FALLBACK: bool = os.getenv(
+    "ENABLE_SKILL_LLM_FALLBACK", "false"
+).lower() in {"1", "true", "yes", "on"}
 
 
 def _match_skill_llm(skill_a: str, skill_b: str) -> bool:
@@ -426,6 +480,9 @@ def _match_skill_llm(skill_a: str, skill_b: str) -> bool:
 
     Returns True if the LLM judges the skills as related, False otherwise.
     """
+    if not _ENABLE_SKILL_LLM_FALLBACK:
+        return False
+
     # Normalize key for caching (order-independent)
     key = "|".join(sorted([skill_a, skill_b]))
     if key in _LLM_SKILL_CACHE:
@@ -551,6 +608,31 @@ def _collect_all_resume_tech(resume: ResumeTaggingResponse) -> list[str]:
     return tech
 
 
+def _infer_terms_from_resume_text(
+    resume: ResumeTaggingResponse,
+    terms: list[str],
+) -> list[str]:
+    """Infer JD-required terms directly from raw resume text.
+
+    This is a safety net for cases where block extraction misses explicit
+    mentions (e.g., Java/Git appearing in summary or older roles).
+    """
+    raw = _normalize_term(resume.parsed_text or "")
+    if not raw:
+        return []
+
+    found: list[str] = []
+    for t in terms:
+        norm_t = _normalize_term(t)
+        if not norm_t or len(norm_t) < 2:
+            continue
+        # Exact phrase/word-boundary search in normalized text.
+        pattern = r"\b" + re.escape(norm_t) + r"\b"
+        if re.search(pattern, raw):
+            found.append(norm_t)
+    return list(dict.fromkeys(found))
+
+
 # Generic words that don't represent specific technologies
 _GENERIC_SKILL_WORDS = {
     "development", "implementation", "engineering", "management", "design",
@@ -558,6 +640,8 @@ _GENERIC_SKILL_WORDS = {
     "deployment", "testing", "analysis", "building", "creating", "maintaining",
     "configuration", "administration", "operations", "automation", "programming",
     "best", "practices", "and", "the", "for", "with", "using",
+    # Truly context-free nouns (no domain signal)
+    "solution", "solutions", "process", "strategy",
 }
 
 # Stack-indicator words that MUST be kept during decomposition because they
@@ -620,14 +704,23 @@ def _has_stack_breadth(signals: list[str], min_categories: int = 2) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _compute_tech_coherence(jd_tech: list[str], resume_tech: list[str]) -> float:
-    """Compute Jaccard similarity between JD tech requirements and resume's primary tech stack."""
+    """Compute tech overlap between JD requirements and resume's tech stack.
+
+    Uses coverage ratio (what fraction of JD tech is found in resume)
+    rather than Jaccard, which penalizes candidates with broad tech stacks.
+    """
     jd_norm = {_normalize_term(t) for t in jd_tech if _normalize_term(t)}
     res_norm = {_normalize_term(t) for t in resume_tech if _normalize_term(t)}
     if not jd_norm or not res_norm:
         return 0.0
-    intersection = jd_norm & res_norm
-    union = jd_norm | res_norm
-    return len(intersection) / len(union)
+    # Check each JD term against resume terms (including substring containment)
+    matched = 0
+    for jd_t in jd_norm:
+        if jd_t in res_norm:
+            matched += 1
+        elif any(jd_t in rt or rt in jd_t for rt in res_norm if len(rt) > 2):
+            matched += 1
+    return matched / len(jd_norm)
 
 
 def _count_primary_caps_high_match(jd: JDProfile, resume: ResumeTaggingResponse, threshold: float = 0.7) -> int:
@@ -865,8 +958,25 @@ def score_capability_match(
     for focus in resume.context_meta_tags.summary_tags.domain_focus:
         resume_signals.append(_normalize_term(focus))
 
+    # Narrative signals from work/project text improve capability coverage
+    # for transferable profiles where exact phrase overlap is low.
+    for exp in resume.context_meta_tags.experience_tags.experience_timeline:
+        if exp.role:
+            resume_signals.append(_normalize_term(exp.role))
+        if exp.company:
+            resume_signals.append(_normalize_term(exp.company))
+        for ach in exp.key_achievements:
+            resume_signals.append(_normalize_term(ach))
+    for proj in resume.context_meta_tags.project_tags.projects:
+        if proj.description:
+            resume_signals.append(_normalize_term(proj.description))
+        for h in proj.key_highlights:
+            resume_signals.append(_normalize_term(h))
+
     total_weight = 0.0
     matched_weight = 0.0
+    strict_data_jd = _is_data_engineering_jd(
+        jd) and len(jd.core_capabilities) >= 6
 
     for cap in all_caps:
         # Weight: PRIMARY = 2x, SECONDARY = 1x, ownership bonus
@@ -875,6 +985,11 @@ def score_capability_match(
             base_w *= 1.2
         elif cap.ownership_level == "Support":
             base_w *= 0.8
+
+        # Niche specialization requirements (e.g., XSLT/SPARQL/Embeddings)
+        # should influence ranking without dominating core data-engineering fit.
+        if strict_data_jd and _is_niche_data_skill(cap.normalized_entity):
+            base_w *= 0.35
 
         total_weight += base_w
         match = _best_match_score(cap.normalized_entity, resume_signals)
@@ -934,22 +1049,85 @@ def score_skill_match(
     resume_skills = _collect_resume_skills(resume)
     all_resume_skills_norm = list(resume_skills.keys())
 
+    # Safety net: infer required terms from raw resume text when structured
+    # extraction misses explicit mentions.
+    inferred = _infer_terms_from_resume_text(resume, required + required_tech)
+    for term in inferred:
+        if term not in resume_skills:
+            resume_skills[term] = "contextual"
+            all_resume_skills_norm.append(term)
+
     # ── Match compound capability terms ─────────────────────────────────────
+    # Some normalized JD entries are broad capability statements rather than
+    # concrete skills/technologies. Score them with lower deterministic weight
+    # and let role-fit/capability dimensions carry more of that signal.
+    soft_hints = {
+        "understanding", "familiarity", "collaboration", "mentoring",
+        "leadership", "requirements", "governance", "standards",
+        "domain", "expertise", "insights",
+    }
+    req_tech_vocab = {
+        tok
+        for t in required_tech
+        for tok in _normalize_term(t).split()
+    }
+    strict_data_jd = _is_data_engineering_jd(jd) and len(required) >= 8
+
+    def _skill_requirement_weight(req: str) -> float:
+        norm = _normalize_term(req)
+        if not norm:
+            return 0.0
+        if strict_data_jd and _is_niche_data_skill(norm):
+            return 0.25
+        toks = norm.split()
+        has_tech_overlap = bool(set(toks) & req_tech_vocab)
+        has_soft_hint = any(h in norm for h in soft_hints)
+        if len(toks) >= 6 and not has_tech_overlap:
+            return 0.5
+        if has_soft_hint and not has_tech_overlap:
+            return 0.5
+        return 1.0
+
+    weighted_required = [
+        (req_skill, _skill_requirement_weight(req_skill))
+        for req_skill in required
+    ]
+
     compound_matched = 0.0
-    compound_total = len(required)
+    compound_total = sum(w for _, w in weighted_required)
     compound_missing: list[str] = []
 
-    for req_skill in required:
+    for req_skill, req_weight in weighted_required:
+        if req_weight <= 0:
+            continue
         best_score = _best_match_score(req_skill, all_resume_skills_norm)
 
         # If compound term doesn't match well, decompose and try parts
         if best_score < 0.6:
             parts = _decompose_compound_skill(req_skill)
-            for part in parts:
-                part_score = _best_match_score(
-                    part, all_resume_skills_norm, strict=True)
-                if part_score > best_score:
-                    best_score = part_score
+            if len(parts) >= 2:
+                # Multi-word compound: require majority of distinctive
+                # parts to match.  Prevents a single generic keyword
+                # (e.g. "etl") from fully matching a tool-specific
+                # compound ("informatica iics etl/elt development").
+                part_hits = sum(
+                    1 for p in parts
+                    if _best_match_score(
+                        p, all_resume_skills_norm, strict=True
+                    ) >= 0.6
+                )
+                coverage = part_hits / len(parts)
+                if coverage >= 0.5:
+                    decomposed = min(coverage * 0.85, 0.85)
+                    if decomposed > best_score:
+                        best_score = decomposed
+            elif len(parts) == 1:
+                # Single distinctive word from a long compound:
+                # cap credit at partial (0.5) at most.
+                ps = _best_match_score(
+                    parts[0], all_resume_skills_norm, strict=True)
+                if ps > best_score:
+                    best_score = min(ps, 0.5)
 
         if best_score >= 0.8:
             # Check provenance: contextual or listed?
@@ -961,13 +1139,13 @@ def score_skill_match(
                         prov = "contextual"
                         break
             if prov == "contextual":
-                compound_matched += 1.5
+                compound_matched += 1.5 * req_weight
                 evidence.append(f"✓ {req_skill} (experienced in context)")
             else:
-                compound_matched += 1.0
+                compound_matched += 1.0 * req_weight
                 evidence.append(f"✓ {req_skill} (listed)")
         elif best_score >= 0.4:
-            compound_matched += 0.5
+            compound_matched += 0.5 * req_weight
             evidence.append(f"△ ~{req_skill} (partial match)")
         else:
             compound_missing.append(req_skill)
@@ -1081,13 +1259,17 @@ def score_experience_quality(
         role_str = f"{exp.role or ''} {exp.company or ''}"
         # Also match tech_stack against JD signals for relevance
         tech_signals = [_normalize_term(t) for t in exp.tech_stack]
+        achievement_text = " ".join(exp.key_achievements[:8])
         role_relevance = _best_match_score(
             role_str, jd_signals_norm) if jd_signals_norm else 0.5
         tech_relevance = max(
             (_best_match_score(t, jd_signals_norm) for t in tech_signals),
             default=0.0,
         ) if tech_signals and jd_signals_norm else 0.0
-        relevance = max(role_relevance, tech_relevance)
+        achievement_relevance = _best_match_score(
+            achievement_text, jd_signals_norm
+        ) if achievement_text and jd_signals_norm else 0.0
+        relevance = max(role_relevance, tech_relevance, achievement_relevance)
 
         # Achievement quality: count quantified achievements
         quant_count = len(exp.quantifiers)
@@ -1195,6 +1377,19 @@ def score_scale_and_impact(
               for p in resume.context_meta_tags.project_tags.projects)
     )
 
+    # Fallback: count numeric evidence in achievements/highlights when
+    # structured quantifier extraction under-detects metrics.
+    quant_from_text = 0
+    for exp in resume.context_meta_tags.experience_tags.experience_timeline:
+        quant_from_text += sum(
+            1 for ach in exp.key_achievements if re.search(r"\d", ach)
+        )
+    for proj in resume.context_meta_tags.project_tags.projects:
+        quant_from_text += sum(
+            1 for h in proj.key_highlights if re.search(r"\d", h)
+        )
+    quant_count += quant_from_text
+
     if not resume_scale:
         evidence.append("No scale or impact metrics found in resume")
         return 20.0, evidence
@@ -1211,11 +1406,32 @@ def score_scale_and_impact(
         return 50.0 + bonus, evidence
 
     matched = 0.0
+    # Build combined token set from all resume scale signals for keyword
+    # coverage matching.  Scale atoms are broad concepts (e.g. "Large-scale
+    # data volumes") that should match against keywords scattered across
+    # achievement text, not skill-to-skill like _best_match_score expects.
+    combined_tokens = set()
+    for sig in resume_scale:
+        combined_tokens.update(sig.split())
+
     for atom in jd.scale_atoms + jd.impact_atoms:
-        match = _best_match_score(atom.normalized_entity, resume_scale)
-        matched += match
-        if match >= 0.5:
-            evidence.append(f"✓ Scale/impact: {atom.normalized_entity}")
+        atom_norm = _normalize_term(atom.normalized_entity)
+        atom_tokens = set(atom_norm.split())
+        if not atom_tokens:
+            matched += 0.5
+            continue
+        # Keyword coverage: what fraction of atom words appear in resume?
+        overlap = len(atom_tokens & combined_tokens) / len(atom_tokens)
+        # Also try direct skill match for precise atoms (e.g. "SOC 2")
+        direct = _best_match_score(atom.normalized_entity, resume_scale)
+        atom_score = max(overlap, direct)
+        matched += atom_score
+        if atom_score >= 0.4:
+            evidence.append(
+                f"✓ Scale/impact: {atom.normalized_entity} "
+                f"(coverage={overlap:.0%})")
+        elif atom_score >= 0.2:
+            evidence.append(f"△ Partial scale: {atom.normalized_entity}")
 
     score = (matched / total_atoms) * 70  # Base
 
@@ -1419,6 +1635,7 @@ def score_resume(
     resume_tier: TierClassification,
     rank: int = 0,
     resume_lc: LayeredClassification | None = None,
+    section_scores: list[SectionScore] | None = None,
 ) -> ResumeRankResult:
     """Score a parsed resume against a parsed JD.
 
@@ -1428,8 +1645,9 @@ def score_resume(
         resume_tier: SetFit classification of the resume (legacy)
         rank: Position in final ranking (set by caller after sorting)
         resume_lc: LayeredClassification for the resume (new 4-layer taxonomy).
-                   When provided alongside jd.layered_classification, enables
-                   multi-expertise tier matching via compatible_layers.
+        section_scores: LLM-based per-section scores from section_scorer.
+                        When provided, blends with deterministic scores for
+                        improved accuracy on transferable-skill scenarios.
 
     Returns:
         ResumeRankResult with full dimension breakdown
@@ -1439,30 +1657,60 @@ def score_resume(
     candidate_years = estimate_candidate_years(resume)
     weights = _WEIGHTS[exp_level]
 
-    # ── Dimension 1: Tier Alignment ──────────────────────────────────────────
-    # Use layered classification (multi-expertise) when available
-    if resume_lc and jd.layered_classification:
-        tier_raw, tier_ev = score_layered_tier_alignment(
+    # Build section_scores lookup by name
+    ss_map: dict[str, SectionScore] = {}
+    if section_scores:
+        for ss in section_scores:
+            ss_map[ss.section_name] = ss
+
+    # ── Dimension 1: Role Fit (LLM-based, replaces Tier Alignment) ───────────
+    role_fit_ss = ss_map.get("role_fit")
+    if role_fit_ss:
+        role_fit_raw = role_fit_ss.score
+        role_fit_ev = [f"LLM Role Fit: {role_fit_ss.reasoning}"]
+    elif resume_lc and jd.layered_classification:
+        role_fit_raw, role_fit_ev = score_layered_tier_alignment(
             jd.layered_classification, resume_lc
         )
     else:
-        tier_raw, tier_ev = score_tier_alignment(
+        role_fit_raw, role_fit_ev = score_tier_alignment(
             jd.tier_classification, resume_tier
         )
+
     # ── Dimension 2: Core Capability Match ───────────────────────────────────
     cap_raw, cap_ev = score_capability_match(jd, resume, exp_level)
 
-    # ── Dimension 3: Skill Match ─────────────────────────────────────────────
-    skill_raw, skill_ev = score_skill_match(jd, resume, exp_level)
+    # ── Dimension 3: Skill Match (hybrid: deterministic + LLM) ───────────────
+    skill_raw_det, skill_ev = score_skill_match(jd, resume, exp_level)
+    skills_ss = ss_map.get("skills")
+    if skills_ss:
+        # Stabilized blend: deterministic carries more weight to reduce rerun
+        # variance from LLM section-score drift.
+        skill_raw = 0.65 * skill_raw_det + 0.35 * skills_ss.score
+        skill_ev.append(f"LLM Skill Analysis: {skills_ss.reasoning}")
+    else:
+        skill_raw = skill_raw_det
 
-    # ── Dimension 4: Experience Quality ──────────────────────────────────────
-    exp_raw, exp_ev = score_experience_quality(jd, resume, exp_level)
+    # ── Dimension 4: Experience Quality (hybrid) ─────────────────────────────
+    exp_raw_det, exp_ev = score_experience_quality(jd, resume, exp_level)
+    exp_ss = ss_map.get("experience")
+    if exp_ss:
+        exp_raw = 0.65 * exp_raw_det + 0.35 * exp_ss.score
+        exp_ev.append(f"LLM Experience Analysis: {exp_ss.reasoning}")
+    else:
+        exp_raw = exp_raw_det
 
     # ── Dimension 5: Scale & Impact ──────────────────────────────────────────
     scale_raw, scale_ev = score_scale_and_impact(jd, resume)
 
-    # ── Dimension 6: Domain & Context ────────────────────────────────────────
-    domain_raw, domain_ev = score_domain_context(jd, resume)
+    # ── Dimension 6: Domain & Context (LLM-enhanced) ─────────────────────────
+    domain_raw_det, domain_ev = score_domain_context(jd, resume)
+    domain_ss = ss_map.get("domain")
+    if domain_ss:
+        domain_raw = 0.6 * domain_raw_det + 0.4 * domain_ss.score
+        domain_ev.append(f"LLM Domain Analysis: {domain_ss.reasoning}")
+    else:
+        domain_raw = domain_raw_det
 
     # ── Dimension 7 (conditional): Experience Adequacy ───────────────────────
     exp_adequacy_raw, exp_adequacy_ev = score_experience_adequacy(
@@ -1472,11 +1720,11 @@ def score_resume(
     # ── Assemble Dimension Scores ─────────────────────────────────────────────
     dimension_scores = [
         DimensionScore(
-            dimension="Tier Alignment",
-            raw_score=round(tier_raw, 1),
-            weight=weights["tier_alignment"],
-            weighted_score=round(tier_raw * weights["tier_alignment"], 1),
-            evidence=tier_ev,
+            dimension="Role Fit",
+            raw_score=round(role_fit_raw, 1),
+            weight=weights["role_fit"],
+            weighted_score=round(role_fit_raw * weights["role_fit"], 1),
+            evidence=role_fit_ev,
         ),
         DimensionScore(
             dimension="Core Capability Match",
@@ -1516,8 +1764,6 @@ def score_resume(
     ]
 
     if has_exp_adequacy:
-        # When Experience Adequacy is active, reduce other weights proportionally
-        # and give Experience Adequacy a 20% weight
         adeq_weight = 0.20
         scale_factor = 1.0 - adeq_weight  # 0.8
         dimension_scores.append(
@@ -1529,18 +1775,18 @@ def score_resume(
                 evidence=exp_adequacy_ev or [],
             )
         )
-        # Scale down other weights proportionally
         for ds in dimension_scores[:-1]:
             ds.weight *= scale_factor
             ds.weighted_score = round(ds.raw_score * ds.weight, 1)
 
     final_score = sum(d.weighted_score for d in dimension_scores)
+    penalties: list[PenaltyDetail] = []
 
-    # ——— Penalty 1: Tech Stack Coherence ———
-    # If JD specifies a clear tech stack (>=3 tech keywords) and candidate's primary tech
-    # has very low overlap (<0.3 Jaccard), apply a 30% penalty.
+    # ——— Penalty 1: Tech Stack Coherence (softened from 0.7 to 0.85) ———
     if jd.required_tech_normalized and len(jd.required_tech_normalized) >= 3:
-        # Gather resume's primary tech: contextual skills + tech from experience/projects
+        strict_data_jd = _is_data_engineering_jd(jd) and len(
+            jd.required_tech_normalized) >= 6
+        coherence_threshold = 0.20 if strict_data_jd else 0.30
         resume_contextual_skills = [
             skill for skill, prov in _collect_resume_skills(resume).items()
             if prov == "contextual"
@@ -1549,33 +1795,209 @@ def score_resume(
             _collect_all_resume_tech(resume)
         coherence = _compute_tech_coherence(
             jd.required_tech_normalized, resume_primary_tech)
-        if coherence < 0.3:
-            final_score *= 0.7
-            logger.debug(
-                "Tech stack coherence penalty: coherence=%.2f, score adjusted to %.1f",
-                coherence, final_score
-            )
+        if coherence < coherence_threshold:
+            transferable_signal = None
+            if role_fit_ss and skills_ss and exp_ss:
+                transferable_signal = (
+                    role_fit_ss.score + skills_ss.score + exp_ss.score
+                ) / 3.0
+
+            strict_transferable_bypass = 46.0 if strict_data_jd else 58.0
+
+            # Strong transferable profiles should not be heavily penalized only
+            # because exact vendor stack overlap is low.
+            if (
+                transferable_signal is not None
+                and transferable_signal >= strict_transferable_bypass
+            ):
+                role_fit_ev.append(
+                    "Tech coherence penalty bypassed due to strong "
+                    f"transferable section alignment (avg={transferable_signal:.1f})."
+                )
+            else:
+                score_before = final_score
+                # Smooth penalty in [0.90, 1.00] based on overlap level;
+                # prevents abrupt score cliffs between reruns.
+                min_factor = 0.94 if strict_data_jd else 0.90
+                penalty_factor = min_factor + \
+                    (1.0 - min_factor) * (coherence / coherence_threshold)
+                penalty_factor = max(min_factor, min(1.00, penalty_factor))
+                final_score *= penalty_factor
+                penalties.append(PenaltyDetail(
+                    penalty_name="Tech Stack Coherence",
+                    reason=(
+                        f"Low tech overlap (overlap={coherence:.2f} "
+                        f"< {coherence_threshold:.2f}). "
+                        "Candidate's primary tech stack has minimal intersection "
+                        "with JD requirements."
+                    ),
+                    score_before=round(score_before, 1),
+                    score_after=round(final_score, 1),
+                ))
 
     # ——— Penalty 2: Must-Have Primary Capability Gate ———
-    # Ensure at least one PRIMARY core capability is strongly matched (≥0.7)
-    primary_high_count = _count_primary_caps_high_match(
-        jd, resume, threshold=0.7)
-    if primary_high_count == 0:
-        # Cap the final score at 60 if no core capability strongly matches
-        final_score = min(final_score, 60.0)
-        logger.debug(
-            "No PRIMARY capability matched ≥0.7; capping final_score at 60 (was %.1f)",
-            final_score
-        )
+    # Only apply when JD actually has PRIMARY core capabilities extracted.
+    # When atom extraction fails / returns empty, there are 0 PRIMARY caps in
+    # the JD, so the gate cannot meaningfully fire.
+    primary_caps = [c for c in jd.core_capabilities
+                    if c.classification == "PRIMARY"]
+    if primary_caps:
+        primary_high_count = _count_primary_caps_high_match(
+            jd, resume, threshold=0.7)
+        if primary_high_count == 0:
+            score_before = final_score
+            final_score = min(final_score, 60.0)
+            if final_score < score_before:
+                penalties.append(PenaltyDetail(
+                    penalty_name="Primary Capability Gate",
+                    reason="No PRIMARY core capability matched ≥0.7. "
+                           "Score capped at 60.",
+                    score_before=round(score_before, 1),
+                    score_after=round(final_score, 1),
+                ))
 
-    # Tier mismatch hard penalty (only if tier1 completely wrong)
-    tier_mismatch = (
-        jd.tier_classification.tier1.label != "Unknown"
-        and resume_tier.tier1.label != "Unknown"
-        and jd.tier_classification.tier1.label != resume_tier.tier1.label
-    )
-    if tier_mismatch:
-        final_score *= 0.7  # 30% penalty for wrong industry entirely
+    # ——— Penalty 3: Pillar Alignment (soft) ———
+    # Keep ranking anchored to the JD domain family. Without this, strong
+    # adjacent profiles (e.g., App Engineering) can outrank true Data
+    # Engineering resumes on generic engineering signals.
+    if jd.layered_classification and resume_lc:
+        jd_pillar = (jd.layered_classification.pillar.label or "").strip()
+        res_pillar = (resume_lc.pillar.label or "").strip()
+        if (
+            jd_pillar and res_pillar
+            and jd_pillar.lower() != "unknown"
+            and res_pillar.lower() != "unknown"
+            and jd_pillar != res_pillar
+        ):
+            role_signal = role_fit_ss.score if role_fit_ss else role_fit_raw
+            if role_signal < 70:
+                score_before = final_score
+                strict_data_jd = _is_data_engineering_jd(jd) and (
+                    len(jd.required_skills_normalized) >= 8
+                    or len(jd.required_tech_normalized) >= 6
+                )
+                pillar_penalty_factor = 0.96 if strict_data_jd else 0.92
+                if strict_data_jd and role_fit_ss and skills_ss and exp_ss:
+                    transferable_signal = (
+                        role_fit_ss.score + skills_ss.score + exp_ss.score
+                    ) / 3.0
+                    if transferable_signal >= 55.0:
+                        pillar_penalty_factor = 0.98
+
+                final_score *= pillar_penalty_factor
+                penalties.append(PenaltyDetail(
+                    penalty_name="Pillar Alignment",
+                    reason=f"JD pillar={jd_pillar}, resume pillar={res_pillar}. "
+                    f"Applied soft cross-domain penalty "
+                    f"(x{pillar_penalty_factor:.2f}).",
+                    score_before=round(score_before, 1),
+                    score_after=round(final_score, 1),
+                ))
+
+    # ——— Transferable-fit uplift (bounded) ———
+    # When section-level LLM scorers show consistent transferable alignment,
+    # avoid over-penalization from strict deterministic phrase mismatch.
+    if role_fit_ss and skills_ss and exp_ss:
+        has_hard_gate = any(
+            p.penalty_name in {"Primary Capability Gate", "Pillar Alignment"}
+            for p in penalties
+        )
+        transferable_signal = (
+            role_fit_ss.score + skills_ss.score + exp_ss.score
+        ) / 3.0
+        transferable_target = min(80.0, transferable_signal + 10.0)
+        if (
+            not has_hard_gate
+            and transferable_signal >= 52.0
+            and final_score < transferable_target
+        ):
+            # Soft uplift rather than hard floor to avoid large jumps when
+            # section LLM scores fluctuate between runs.
+            uplift = min((transferable_target - final_score) * 0.40, 8.0)
+            final_score += max(0.0, uplift)
+            role_fit_ev.append(
+                "Transferable-fit uplift applied (smoothed) from "
+                f"section-level alignment (avg={transferable_signal:.1f})."
+            )
+
+    # ——— Specialization tolerance uplift for strict Data Engineering JDs ———
+    # Prevent niche stacks (RDF/SPARQL/XSLT/Embeddings) from overwhelming
+    # core data-engineering fit for otherwise strong candidates.
+    if _is_data_engineering_jd(jd) and resume_lc and jd.layered_classification:
+        same_pillar = (
+            (jd.layered_classification.pillar.label or "")
+            == (resume_lc.pillar.label or "")
+        )
+        niche_count = sum(
+            1 for s in jd.required_skills_normalized
+            if _is_niche_data_skill(s)
+        )
+        if same_pillar and niche_count >= 2 and has_exp_adequacy and exp_adequacy_raw >= 90:
+            if cap_raw >= 22 and skill_raw >= 30:
+                uplift = min(6.0, 1.5 + 0.8 * niche_count)
+                final_score = min(100.0, final_score + uplift)
+                role_fit_ev.append(
+                    "Applied data-specialization tolerance uplift "
+                    f"(+{uplift:.1f}) for niche-heavy JD stack."
+                )
+
+    # ——— Same-pillar transfer uplift for strict Data Engineering JDs ———
+    # For niche-heavy data stacks, strong transferable data engineers should
+    # not remain trapped in low-50s solely due specialized tool gaps.
+    if _is_data_engineering_jd(jd) and resume_lc and jd.layered_classification:
+        strict_data_jd = len(jd.required_skills_normalized) >= 8 or len(
+            jd.required_tech_normalized) >= 6
+        same_pillar = (
+            (jd.layered_classification.pillar.label or "")
+            == (resume_lc.pillar.label or "")
+        )
+        if strict_data_jd and same_pillar and has_exp_adequacy and exp_adequacy_raw >= 90:
+            transferable_signal = None
+            if role_fit_ss and skills_ss and exp_ss:
+                transferable_signal = (
+                    role_fit_ss.score + skills_ss.score + exp_ss.score
+                ) / 3.0
+            else:
+                transferable_signal = 0.45 * role_fit_raw + 0.35 * skill_raw + 0.20 * exp_raw
+
+            if transferable_signal >= 46 and role_fit_raw >= 30:
+                score_before = final_score
+                uplift = min(
+                    10.0,
+                    1.5
+                    + 0.25 * (transferable_signal - 46.0)
+                    + 0.08 * max(0.0, cap_raw - 15.0)
+                    + 0.06 * max(0.0, skill_raw - 20.0),
+                )
+                final_score = min(100.0, final_score + uplift)
+                role_fit_ev.append(
+                    "Applied same-pillar transferable uplift "
+                    f"(+{uplift:.1f}) for strict data-engineering JD "
+                    f"(transferable={transferable_signal:.1f})."
+                )
+                penalties.append(PenaltyDetail(
+                    penalty_name="Same-Pillar Transfer Uplift",
+                    reason=(
+                        "Strong same-pillar transferable fit under niche-heavy "
+                        f"data requirements (avg={transferable_signal:.1f})."
+                    ),
+                    score_before=round(score_before, 1),
+                    score_after=round(final_score, 1),
+                ))
+
+    # NOTE: Tier mismatch hard penalty REMOVED — role fit dimension now
+    # handles alignment assessment via LLM, which understands transferable roles.
+    tier_mismatch = False  # Legacy field, kept for backward compat
+
+    # ── Populate detailed breakdowns ──────────────────────────────────────────
+    skill_gap: list[MatchDetail] = []
+    role_fit_reasoning: str | None = None
+
+    if role_fit_ss:
+        role_fit_reasoning = role_fit_ss.reasoning
+
+    if skills_ss:
+        skill_gap = skills_ss.match_details
 
     cand = resume.candidate
     return ResumeRankResult(
@@ -1592,4 +2014,8 @@ def score_resume(
         low_confidence_classification=(
             resume_tier.low_confidence or jd.tier_classification.low_confidence
         ),
+        section_scores=section_scores or [],
+        penalties_applied=penalties,
+        skill_gap_analysis=skill_gap,
+        role_fit_reasoning=role_fit_reasoning,
     )
