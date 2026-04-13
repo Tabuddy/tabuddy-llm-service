@@ -12,6 +12,7 @@ import asyncio
 import os
 import json
 import logging
+from pydantic import ValidationError
 from openai import AsyncAzureOpenAI
 from models import (
     ResumeBlock,
@@ -88,95 +89,140 @@ Return ONLY valid JSON:
 Include experience_detail ONLY for experience blocks, project_detail ONLY for project blocks. Set unused detail to null.
 """
 
+_SCHEMA_RETRY_HINT = (
+    "Your previous JSON failed our schema. Return ONLY valid JSON. "
+    "Every quantifiers entry (top-level, experience_detail.quantifiers, "
+    "project_detail.quantifiers) must be a STRING (e.g. \"70\" or \"10%\"), never a raw number."
+)
+
+
+def _build_block_tag_result(block: ResumeBlock, bd: dict) -> BlockTagResult:
+    """Build BlockTagResult from parsed LLM JSON; may raise ValidationError."""
+    skills = [
+        BlockSkillEntry(
+            skill=s.get("skill", ""),
+            action_verb=s.get("action_verb", "Applied"),
+            context=s.get("context", ""),
+            co_dependent_skills=s.get("co_dependent_skills", []),
+            metric=s.get("metric"),
+        )
+        for s in bd.get("skills", [])
+        if s.get("skill")
+    ]
+
+    exp_detail = None
+    exp_data = bd.get("experience_detail")
+    if exp_data and isinstance(exp_data, dict):
+        exp_detail = ExperienceDetail(
+            company=exp_data.get("company"),
+            role=exp_data.get("role"),
+            duration=exp_data.get("duration"),
+            is_current=exp_data.get("is_current", False),
+            key_achievements=exp_data.get("key_achievements", []),
+            quantifiers=exp_data.get("quantifiers", []),
+            tech_stack=exp_data.get("tech_stack", []),
+        )
+
+    proj_detail = None
+    proj_data = bd.get("project_detail")
+    if proj_data and isinstance(proj_data, dict):
+        proj_detail = ProjectDetail(
+            project_name=proj_data.get("project_name"),
+            description=proj_data.get("description"),
+            tech_stack=proj_data.get("tech_stack", []),
+            quantifiers=proj_data.get("quantifiers", []),
+            key_highlights=proj_data.get("key_highlights", []),
+        )
+
+    return BlockTagResult(
+        block_name=block.block_name,
+        block_type=block.block_type,
+        skills=skills,
+        quantifiers=bd.get("quantifiers", []),
+        experience_detail=exp_detail,
+        project_detail=proj_detail,
+    )
+
 
 async def _tag_single_block(
     client: AsyncAzureOpenAI, block: ResumeBlock,
 ) -> BlockTagResult:
-    """Send a single block to the LLM for extraction."""
+    """Send a single block to the LLM for extraction; one retry on JSON/schema failure."""
     input_data = {
         "block_name": block.block_name,
         "block_type": block.block_type,
         "raw_text": block.raw_text,
     }
-    try:
-        response = await client.chat.completions.create(
-            model=_AZURE_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": _SKILL_EXTRACTION_PROMPT},
-                {"role": "user", "content": json.dumps(input_data)},
-            ],
-            max_completion_tokens=8000,
-        )
-        choice = response.choices[0]
-        content = choice.message.content or ""
-        logger.info(
-            "Block tagger [%s] LLM: finish=%s, len=%d, reasoning=%s, completion=%s",
-            block.block_name,
-            choice.finish_reason,
-            len(content),
-            getattr(response.usage.completion_tokens_details,
-                    "reasoning_tokens", "N/A")
-            if response.usage and response.usage.completion_tokens_details else "N/A",
-            response.usage.completion_tokens if response.usage else "N/A",
-        )
+    for attempt in range(2):
+        try:
+            payload = dict(input_data)
+            if attempt == 1:
+                payload["_schema_retry"] = _SCHEMA_RETRY_HINT
 
-        if not content.strip():
-            logger.warning(
-                "Block [%s] LLM returned empty – using fallback", block.block_name)
+            response = await client.chat.completions.create(
+                model=_AZURE_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": _SKILL_EXTRACTION_PROMPT},
+                    {"role": "user", "content": json.dumps(payload)},
+                ],
+                max_completion_tokens=8000,
+            )
+            choice = response.choices[0]
+            content = choice.message.content or ""
+            logger.info(
+                "Block tagger [%s] LLM: finish=%s, len=%d, reasoning=%s, completion=%s",
+                block.block_name,
+                choice.finish_reason,
+                len(content),
+                getattr(response.usage.completion_tokens_details,
+                        "reasoning_tokens", "N/A")
+                if response.usage and response.usage.completion_tokens_details else "N/A",
+                response.usage.completion_tokens if response.usage else "N/A",
+            )
+
+            if not content.strip():
+                logger.warning(
+                    "Block [%s] LLM returned empty – using fallback", block.block_name)
+                return _fallback_extract(block)
+
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[-1].rsplit("```", 1)[0]
+            bd = json.loads(content)
+            return _build_block_tag_result(block, bd)
+
+        except json.JSONDecodeError as e:
+            if attempt == 0:
+                logger.warning(
+                    "Block [%s] invalid JSON, retrying LLM once: %s",
+                    block.block_name,
+                    e,
+                )
+                continue
+            logger.error(
+                "Block [%s] invalid JSON after retry: %s", block.block_name, e)
             return _fallback_extract(block)
 
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[-1].rsplit("```", 1)[0]
-        bd = json.loads(content)
-
-        skills = [
-            BlockSkillEntry(
-                skill=s.get("skill", ""),
-                action_verb=s.get("action_verb", "Applied"),
-                context=s.get("context", ""),
-                co_dependent_skills=s.get("co_dependent_skills", []),
-                metric=s.get("metric"),
+        except ValidationError as e:
+            if attempt == 0:
+                logger.warning(
+                    "Block [%s] schema validation failed, retrying LLM once: %s",
+                    block.block_name,
+                    e,
+                )
+                continue
+            logger.error(
+                "Block [%s] schema validation failed after retry: %s",
+                block.block_name,
+                e,
             )
-            for s in bd.get("skills", [])
-            if s.get("skill")
-        ]
+            return _fallback_extract(block)
 
-        exp_detail = None
-        exp_data = bd.get("experience_detail")
-        if exp_data and isinstance(exp_data, dict):
-            exp_detail = ExperienceDetail(
-                company=exp_data.get("company"),
-                role=exp_data.get("role"),
-                duration=exp_data.get("duration"),
-                is_current=exp_data.get("is_current", False),
-                key_achievements=exp_data.get("key_achievements", []),
-                quantifiers=exp_data.get("quantifiers", []),
-                tech_stack=exp_data.get("tech_stack", []),
-            )
+        except Exception as e:
+            logger.exception("Block [%s] LLM failed: %s", block.block_name, e)
+            return _fallback_extract(block)
 
-        proj_detail = None
-        proj_data = bd.get("project_detail")
-        if proj_data and isinstance(proj_data, dict):
-            proj_detail = ProjectDetail(
-                project_name=proj_data.get("project_name"),
-                description=proj_data.get("description"),
-                tech_stack=proj_data.get("tech_stack", []),
-                quantifiers=proj_data.get("quantifiers", []),
-                key_highlights=proj_data.get("key_highlights", []),
-            )
-
-        return BlockTagResult(
-            block_name=block.block_name,
-            block_type=block.block_type,
-            skills=skills,
-            quantifiers=bd.get("quantifiers", []),
-            experience_detail=exp_detail,
-            project_detail=proj_detail,
-        )
-    except Exception as e:
-        logger.exception("Block [%s] LLM failed: %s", block.block_name, e)
-        return _fallback_extract(block)
+    return _fallback_extract(block)
 
 
 async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
