@@ -33,7 +33,7 @@ Hard rules:
 3) Use BOTH inputs:
    - normal_text: plain text extracted from the PDF/DOCX/TXT
    - docling_markdown: Docling markdown for layout-aware hints
-4) Do not invent content. Only copy/paraphrase small portions from the inputs.
+4) Do not invent facts (no fake employers, dates, or projects). Prefer **verbatim copy** from the inputs for resumes that use labeled subsections (see rules 8–10).
 5) Prefer accurate boundaries: identify section headings (Summary, Experience, Projects, Skills, Education).
 6) Exclude top-level section headings (e.g. "EXPERIENCE", "WORK EXPERIENCE") from `raw_text` when possible.
 7) CRITICAL for `block_type="experience"`: each experience `raw_text` MUST begin with the **verbatim** job header from the inputs before any narrative bullets:
@@ -41,6 +41,9 @@ Hard rules:
    - Line 2 (if present in source): company name and location line.
    Only after those lines, include responsibilities / bullet paragraphs.
    Never start an experience block with mid-role prose (e.g. "Working as a lead...") if the title+company lines exist above it in `normal_text` or `docling_markdown`.
+8) CRITICAL for `block_type="project"`: many resumes use fixed labels—**Project Name**, **Client**, **Role**, **Technologies** (or "Technology:"), **Project Description**, **Responsibilities**. When those appear in the source for a project, the project's `raw_text` MUST include **every such section** that exists, in sensible order, with **headings preserved** (same or minimally normalized wording). Include the **full Technologies line** (comma-separated tools are important). Include the **full Project Description** paragraph(s). Under **Responsibilities**, include **every bullet or line** from the source for that project—do not summarize down to 1–2 bullets unless the source truly has that few. If you must shorten for length, drop the **least** specific tail content last—never drop an entire Responsibilities or Technologies section that exists in the inputs.
+9) For `block_type="experience"`: if the source has **MODULES**, **Technologies**, **Technical environment**, **Skills / Tools used**, or long comma-separated module/platform lines under that role, copy them **in full** into that experience block (same order as source). Do not strip inventory-style lines; they are first-class content for downstream tagging.
+10) **Skills_dump** vs project tech: listing tools under a project ("Technologies: Java, Selenium…") belongs in the **project** (or experience) block, not only in Skills_Dump. Keep project-scoped tech with the project.
 
 Naming conventions (for consistency with the existing pipeline):
 - Header/intro content before the first known section: block_name = "Header", block_type="other"
@@ -55,7 +58,7 @@ Naming conventions (for consistency with the existing pipeline):
 
 Content size guidance:
 - Keep each `raw_text` reasonably sized so the downstream LLM can extract from it.
-  If needed, truncate body text but **never** drop the title + company/date header lines for experience blocks.
+  If you must truncate: (1) never remove experience job title + company + date header lines; (2) for projects, never remove **Technologies**, **Project Description**, or the **Responsibilities** heading—trim from the **end** of the longest bullet list first, not from the middle of responsibilities.
 """
 
 
@@ -81,7 +84,7 @@ async def build_hybrid_blocks(
     normal_text: str,
     docling_markdown: str,
     *,
-    max_completion_tokens: int = 6000,
+    max_completion_tokens: int = 8000,
 ) -> list[ResumeBlock]:
     try:
         client = _get_client()
