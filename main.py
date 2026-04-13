@@ -13,9 +13,9 @@ from meta_tag_extractor import extract_context_meta_tags
 from global_parameter_extractor import extract_global_parameters
 from block_tagger import tag_all_blocks
 from nlp_filter import filter_blocks
-from candidate_extractor import extract_candidate_details
+from candidate_extractor import extract_candidate_details, extract_candidate_details_for_hybrid
 from resume_zoner import zone_resume
-from resume_parser import extract_text, extract_pdf_links
+from resume_parser import extract_docx_plain_text, extract_pdf_links, extract_text
 import skill_library
 import db
 from ranking_models import (
@@ -186,6 +186,33 @@ async def extract_pdf_links_endpoint(file: UploadFile = File(...)):
     return PdfLinksResponse(links=[PdfLinkItem(**item) for item in links])
 
 
+def _resolve_hybrid_raw_text(
+    raw_plain: str,
+    docling_markdown: str,
+    *,
+    filename: str,
+) -> str:
+    """Prefer python-docx/pdf text; if empty, use Docling markdown (table-heavy DOCX)."""
+    plain = (raw_plain or "").strip()
+    md = (docling_markdown or "").strip()
+    if plain:
+        return plain
+    if md:
+        logger.info(
+            "Hybrid: empty plain-text parse for %s; using Docling markdown as raw_text.",
+            filename or "upload",
+        )
+        return md
+    lower = (filename or "").lower()
+    if lower.endswith((".docx", ".doc")):
+        detail = "Could not extract text from DOCX."
+    elif lower.endswith(".pdf"):
+        detail = "Could not extract text from PDF."
+    else:
+        detail = "Could not extract text from document."
+    raise HTTPException(status_code=422, detail=detail)
+
+
 # ── NEW: Resume upload & contextual meta-tagging endpoint ──
 @app.post("/parse-resume", response_model=ResumeTaggingResponse)
 async def parse_resume_endpoint(file: UploadFile = File(...)):
@@ -279,13 +306,13 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
     # - pdf links -> extracted_links (pdf only)
     #
     # These are CPU-heavy/sync operations, so we run them in threads.
-    from resume_parser import _parse_docx, _parse_pdf
+    from resume_parser import _parse_pdf
 
     def _normal_parse() -> str:
         if filename.endswith(".pdf"):
             return _parse_pdf(raw_bytes)
         if filename.endswith(".docx") or filename.endswith(".doc"):
-            return _parse_docx(raw_bytes)
+            return extract_docx_plain_text(raw_bytes)
         # txt and fallback
         return raw_bytes.decode("utf-8", errors="replace")
 
@@ -315,12 +342,13 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
         parse_tasks.append(asyncio.to_thread(extract_pdf_links, raw_bytes))
 
     parse_results = await asyncio.gather(*parse_tasks)
-    raw_text = parse_results[0]
     docling_markdown = parse_results[1]
     extracted_links = parse_results[2] if wants_pdf_links else []
-
-    # Candidate + zoning downstream uses raw_text.
-    candidate = extract_candidate_details(raw_text)
+    raw_text = _resolve_hybrid_raw_text(
+        parse_results[0],
+        docling_markdown,
+        filename=filename,
+    )
 
     # Build blocks via LLM using both texts (fallback inside builder if needed).
     blocks = await build_hybrid_blocks(
@@ -330,6 +358,9 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
 
     # Same deterministic filter + tagging/meta/global flow as default.
     blocks = await asyncio.to_thread(filter_blocks, blocks)
+
+    # Candidate regex on Header block matches zoned preview; raw_text alone can reorder lines.
+    candidate = extract_candidate_details_for_hybrid(blocks, raw_text)
 
     async def _tag_and_build_meta(blks):
         br = await tag_all_blocks(blks)
@@ -370,13 +401,13 @@ async def parse_resume_hybrid_stage1_endpoint(file: UploadFile = File(...)):
     raw_bytes = await file.read()
     filename = (file.filename or "upload").lower()
 
-    from resume_parser import _parse_docx, _parse_pdf
+    from resume_parser import _parse_pdf
 
     def _normal_parse() -> str:
         if filename.endswith(".pdf"):
             return _parse_pdf(raw_bytes)
         if filename.endswith(".docx") or filename.endswith(".doc"):
-            return _parse_docx(raw_bytes)
+            return extract_docx_plain_text(raw_bytes)
         return raw_bytes.decode("utf-8", errors="replace")
 
     def _docling_parse() -> str:
@@ -404,12 +435,16 @@ async def parse_resume_hybrid_stage1_endpoint(file: UploadFile = File(...)):
         parse_tasks.append(asyncio.to_thread(extract_pdf_links, raw_bytes))
 
     parse_results = await asyncio.gather(*parse_tasks)
-    raw_text = parse_results[0]
     docling_markdown = parse_results[1]
     extracted_links_raw = parse_results[2] if wants_pdf_links else []
+    raw_text = _resolve_hybrid_raw_text(
+        parse_results[0],
+        docling_markdown,
+        filename=filename,
+    )
 
-    candidate = extract_candidate_details(raw_text)
     blocks = await build_hybrid_blocks(raw_text, docling_markdown)
+    candidate = extract_candidate_details_for_hybrid(blocks, raw_text)
 
     zoned_preview = [
         ZonedBlockPreview(
@@ -493,7 +528,7 @@ async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
     raw_bytes = await file.read()
     filename = file.filename or "resume.pdf"
 
-    from resume_parser import _parse_docx, _parse_pdf
+    from resume_parser import _parse_pdf
 
     fname_lower = filename.lower()
 
@@ -501,7 +536,7 @@ async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
         if fname_lower.endswith(".pdf"):
             return _parse_pdf(raw_bytes)
         if fname_lower.endswith(".docx") or fname_lower.endswith(".doc"):
-            return _parse_docx(raw_bytes)
+            return extract_docx_plain_text(raw_bytes)
         return raw_bytes.decode("utf-8", errors="replace")
 
     def _docling_parse() -> str:
@@ -520,14 +555,19 @@ async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
                 "Docling failed in ranking fallback pipeline: %s", e)
             return ""
 
-    raw_text, docling_md = await asyncio.gather(
+    plain, docling_md = await asyncio.gather(
         asyncio.to_thread(_normal_parse),
         asyncio.to_thread(_docling_parse),
     )
+    raw_text = _resolve_hybrid_raw_text(
+        plain,
+        docling_md,
+        filename=filename,
+    )
 
-    candidate = extract_candidate_details(raw_text)
     blocks = await build_hybrid_blocks(raw_text, docling_md)
     blocks = await asyncio.to_thread(filter_blocks, blocks)
+    candidate = extract_candidate_details_for_hybrid(blocks, raw_text)
 
     async def _tag_and_meta(blks):
         br = await tag_all_blocks(blks)

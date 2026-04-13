@@ -193,12 +193,72 @@ def extract_pdf_links(data: bytes) -> list[dict[str, Any]]:
     return out
 
 
-def _parse_docx(data: bytes) -> str:
+def _table_cell_text_parts(cell: Any) -> list[str]:
+    """Paragraphs and nested tables inside one table cell."""
+    out: list[str] = []
+    for p in cell.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            out.append(t)
+    for nested in cell.tables:
+        out.extend(_table_text_parts(nested))
+    return out
+
+
+def _table_text_parts(table: Any) -> list[str]:
+    out: list[str] = []
+    for row in table.rows:
+        for cell in row.cells:
+            out.extend(_table_cell_text_parts(cell))
+    return out
+
+
+def _header_footer_text_parts(doc: Any) -> list[str]:
+    out: list[str] = []
+    try:
+        for section in doc.sections:
+            for part in (section.header, section.footer):
+                if part is None:
+                    continue
+                for p in part.paragraphs:
+                    t = (p.text or "").strip()
+                    if t:
+                        out.append(t)
+                for tbl in part.tables:
+                    out.extend(_table_text_parts(tbl))
+    except Exception as e:
+        logger.debug("DOCX header/footer extraction skipped: %s", e)
+    return out
+
+
+def extract_docx_plain_text(data: bytes) -> str:
+    """Best-effort plain text from a DOCX (body paragraphs, tables, headers/footers).
+
+    Does not raise; returns \"\" if the file cannot be read or has no extractable text.
+    Use :func:`_parse_docx` when an empty result should be a 422 for strict APIs.
+    """
     import docx
 
-    doc = docx.Document(io.BytesIO(data))
-    text_parts = [p.text for p in doc.paragraphs if p.text.strip()]
-    full = "\n".join(text_parts).strip()
+    try:
+        doc = docx.Document(io.BytesIO(data))
+    except Exception as e:
+        logger.warning("DOCX could not be opened: %s", e)
+        return ""
+
+    chunks: list[str] = []
+    for p in doc.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            chunks.append(t)
+    for table in doc.tables:
+        chunks.extend(_table_text_parts(table))
+    chunks.extend(_header_footer_text_parts(doc))
+
+    return "\n".join(chunks).strip()
+
+
+def _parse_docx(data: bytes) -> str:
+    full = extract_docx_plain_text(data)
     if not full:
         raise HTTPException(
             status_code=422, detail="Could not extract text from DOCX."
