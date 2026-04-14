@@ -14,7 +14,6 @@ Design:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,6 +21,70 @@ logger = logging.getLogger(__name__)
 # ── In-memory merged cache ────────────────────────────────────────────────────
 _merged: dict[str, str] = {}
 _initialized: bool = False
+
+_ACRONYMS = {
+    "ai", "api", "aws", "ci", "cd", "dbt", "etl", "gcp", "llm",
+    "ml", "nlp", "qa", "sql", "ui", "ux",
+}
+
+_SPECIAL_CANONICAL_CASE = {
+    "snowflake": "Snowflake",
+    "node.js": "Node.js",
+    "next.js": "Next.js",
+    "vue.js": "Vue.js",
+    "express.js": "Express.js",
+    "socket.io": "Socket.IO",
+    "postgresql": "PostgreSQL",
+    "mysql": "MySQL",
+    "mongodb": "MongoDB",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+    "tensorflow": "TensorFlow",
+    "pytorch": "PyTorch",
+    "swiftui": "SwiftUI",
+}
+
+
+def _title_token(token: str) -> str:
+    token = token.strip()
+    if not token:
+        return token
+
+    lower = token.lower()
+
+    if lower in _ACRONYMS:
+        return lower.upper()
+    if lower in {"c#", "c++"}:
+        return lower.upper()
+
+    if "/" in token:
+        return "/".join(_title_token(part) for part in token.split("/"))
+    if "-" in token:
+        return "-".join(_title_token(part) for part in token.split("-"))
+    if "." in token:
+        dotted = ".".join(_title_token(part) for part in token.split("."))
+        return dotted.replace(".Js", ".js").replace(".Io", ".IO")
+
+    return token[:1].upper() + token[1:].lower()
+
+
+def normalize_canonical_case(canonical: str) -> str:
+    """Normalize canonical skill display casing while keeping matching case-insensitive."""
+    value = canonical.strip()
+    if not value:
+        return canonical
+
+    aliases = get_aliases()
+    key = value.lower()
+
+    # Prefer existing canonical forms from dictionary/learned aliases.
+    if key in aliases:
+        return aliases[key]
+
+    if key in _SPECIAL_CANONICAL_CASE:
+        return _SPECIAL_CANONICAL_CASE[key]
+
+    return " ".join(_title_token(token) for token in value.split())
 
 
 async def init() -> None:
@@ -59,7 +122,13 @@ def get_aliases() -> dict[str, str]:
     return SKILL_ALIASES
 
 
-async def learn(alias: str, canonical: str, confidence: float = 0.85) -> None:
+async def learn(
+    alias: str,
+    canonical: str,
+    confidence: float = 0.85,
+    category: str = "Other",
+    source: str = "llm",
+) -> None:
     """Persist a new alias → canonical mapping and update the in-memory cache.
 
     Called automatically by normalizer.py after every successful LLM
@@ -74,8 +143,16 @@ async def learn(alias: str, canonical: str, confidence: float = 0.85) -> None:
     if not key:
         return
 
+    canonical_value = normalize_canonical_case(canonical)
+
     # Update in-memory cache immediately (no wait for DB round-trip)
-    _merged[key] = canonical
+    _merged[key] = canonical_value
 
     import db
-    await db.upsert_learned_skill(key, canonical, source="llm", confidence=confidence)
+    await db.upsert_learned_skill(
+        key,
+        canonical_value,
+        source=source,
+        confidence=confidence,
+        category=category,
+    )

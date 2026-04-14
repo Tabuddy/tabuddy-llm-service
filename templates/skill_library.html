@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TABuddy – Skill Library</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #23273a;
+      --border: #2e3348;
+      --primary: #6c5ce7;
+      --primary-light: #a29bfe;
+      --accent: #00cec9;
+      --accent2: #fdcb6e;
+      --text: #dfe6e9;
+      --text-dim: #8395a7;
+      --success: #00b894;
+      --danger: #e17055;
+      --tag-bg: rgba(108,92,231,0.15);
+      --tag-border: rgba(108,92,231,0.3);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+    .container { max-width: 1400px; margin: 0 auto; padding: 2rem 1.5rem; }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 2rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--primary-light), var(--accent));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.3rem;
+    }
+    .header p { color: var(--text-dim); font-size: 0.95rem; }
+
+    /* Stats bar */
+    .stats-bar {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.5rem;
+      min-width: 160px;
+      flex: 1;
+    }
+    .stat-card .stat-value {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: var(--primary-light);
+    }
+    .stat-card .stat-label {
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* Controls */
+    .controls {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .search-box {
+      flex: 1;
+      min-width: 250px;
+      position: relative;
+    }
+    .search-box input {
+      width: 100%;
+      padding: 0.7rem 1rem 0.7rem 2.5rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.3s;
+    }
+    .search-box input:focus { border-color: var(--primary); }
+    .search-box::before {
+      content: '🔍';
+      position: absolute;
+      left: 0.8rem;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 0.9rem;
+    }
+    .filter-select {
+      padding: 0.7rem 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      min-width: 170px;
+      cursor: pointer;
+    }
+    .filter-select:focus { border-color: var(--primary); }
+    .filter-select option { background: var(--surface2); color: var(--text); }
+
+    .btn {
+      padding: 0.7rem 1.5rem;
+      border: none;
+      border-radius: 10px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+    }
+    .btn-primary:hover { background: #5b4bd5; }
+    .btn-danger {
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid var(--danger);
+      padding: 0.4rem 0.8rem;
+      font-size: 0.8rem;
+    }
+    .btn-danger:hover { background: rgba(225,112,85,0.15); }
+    .btn-sm {
+      padding: 0.4rem 0.8rem;
+      font-size: 0.8rem;
+    }
+
+    /* Table */
+    .table-container {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    thead th {
+      background: var(--surface2);
+      padding: 0.8rem 1rem;
+      text-align: left;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: rgba(108,92,231,0.05); }
+
+    .skill-name { font-weight: 600; color: var(--primary-light); }
+    .canonical-name { color: var(--accent); }
+
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 20px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .badge-llm {
+      background: rgba(108,92,231,0.15);
+      color: var(--primary-light);
+      border: 1px solid rgba(108,92,231,0.3);
+    }
+    .badge-admin {
+      background: rgba(0,206,201,0.15);
+      color: var(--accent);
+      border: 1px solid rgba(0,206,201,0.3);
+    }
+    .badge-static {
+      background: rgba(99,110,114,0.15);
+      color: #b2bec3;
+      border: 1px solid rgba(99,110,114,0.3);
+    }
+    .badge-category {
+      background: rgba(253,203,110,0.12);
+      color: var(--accent2);
+      border: 1px solid rgba(253,203,110,0.25);
+    }
+
+    /* Modal */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      width: 90%;
+      max-width: 500px;
+    }
+    .modal h2 {
+      margin-bottom: 1.5rem;
+      font-size: 1.3rem;
+      color: var(--primary-light);
+    }
+    .form-group {
+      margin-bottom: 1.2rem;
+    }
+    .form-group label {
+      display: block;
+      margin-bottom: 0.4rem;
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .form-group input,
+    .form-group select {
+      width: 100%;
+      padding: 0.7rem 1rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.95rem;
+      outline: none;
+    }
+    .form-group input:focus,
+    .form-group select:focus { border-color: var(--primary); }
+    .modal-actions {
+      display: flex;
+      gap: 0.8rem;
+      justify-content: flex-end;
+      margin-top: 1.5rem;
+    }
+    .btn-cancel {
+      background: transparent;
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+    }
+    .btn-cancel:hover { border-color: var(--text-dim); }
+
+    /* Pagination */
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 1.2rem;
+    }
+    .pagination button {
+      padding: 0.5rem 1rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    .pagination button:hover:not(:disabled) { border-color: var(--primary); }
+    .pagination button:disabled { opacity: 0.4; cursor: default; }
+    .pagination .page-info { color: var(--text-dim); font-size: 0.85rem; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      padding: 0.8rem 1.5rem;
+      border-radius: 10px;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.9rem;
+      z-index: 2000;
+      opacity: 0;
+      transform: translateY(20px);
+      transition: all 0.3s;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.success { background: var(--success); }
+    .toast.error { background: var(--danger); }
+
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--text-dim);
+    }
+    .empty-state .icon { font-size: 2.5rem; margin-bottom: 0.8rem; }
+
+    .confidence-bar {
+      width: 60px;
+      height: 6px;
+      background: var(--surface2);
+      border-radius: 3px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+      margin-left: 0.4rem;
+    }
+    .confidence-fill {
+      height: 100%;
+      border-radius: 3px;
+      background: var(--success);
+    }
+
+    @media (max-width: 768px) {
+      .controls { flex-direction: column; }
+      .search-box { min-width: 100%; }
+      .stats-bar { flex-direction: column; }
+      .stat-card { min-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <h1>Skill Library</h1>
+      <p>Auto-growing skill normalization library — learned via LLM and managed by admins</p>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-bar">
+      <div class="stat-card">
+        <div class="stat-value" id="totalCount">0</div>
+        <div class="stat-label">Total Skills</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="staticCount">0</div>
+        <div class="stat-label">Static (Built-in)</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="llmCount">0</div>
+        <div class="stat-label">LLM Learned</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="adminCount">0</div>
+        <div class="stat-label">Admin Added</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="categoryCount">0</div>
+        <div class="stat-label">Categories</div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="controls">
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="Search skills by alias or canonical name..." />
+      </div>
+      <select class="filter-select" id="categoryFilter">
+        <option value="">All Categories</option>
+      </select>
+      <select class="filter-select" id="sourceFilter">
+        <option value="">All Sources</option>
+        <option value="static">Static (Built-in)</option>
+        <option value="llm">LLM Learned</option>
+        <option value="admin">Admin Added</option>
+        <option value="manual">Manual</option>
+      </select>
+      <button class="btn btn-primary" onclick="openAddModal()">+ Add Skill</button>
+    </div>
+
+    <!-- Table -->
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>Alias</th>
+            <th>Canonical Skill</th>
+            <th>Category</th>
+            <th>Added By</th>
+            <th>Date Added</th>
+            <th>Hits</th>
+            <th>Confidence</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="skillsBody">
+          <tr>
+            <td colspan="8" class="empty-state">
+              <div class="icon">📚</div>
+              <div>Loading skills...</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="pagination">
+        <button id="prevBtn" onclick="changePage(-1)" disabled>← Prev</button>
+        <span class="page-info" id="pageInfo">Page 1</span>
+        <button id="nextBtn" onclick="changePage(1)">Next →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add/Edit Modal -->
+  <div class="modal-overlay" id="addModal">
+    <div class="modal">
+      <h2 id="modalTitle">Add Skill to Library</h2>
+      <div class="form-group">
+        <label>Alias (how it appears in resumes)</label>
+        <input type="text" id="aliasInput" placeholder="e.g. reactjs, react.js" />
+      </div>
+      <div class="form-group">
+        <label>Canonical Name</label>
+        <input type="text" id="canonicalInput" placeholder="e.g. React" />
+      </div>
+      <div class="form-group">
+        <label>Category</label>
+        <select id="categoryInput">
+          <option value="Web Development">Web Development</option>
+          <option value="Mobile Development">Mobile Development</option>
+          <option value="Backend Development">Backend Development</option>
+          <option value="Frontend Development">Frontend Development</option>
+          <option value="AI/ML">AI/ML</option>
+          <option value="Data Science">Data Science</option>
+          <option value="DevOps/Cloud">DevOps/Cloud</option>
+          <option value="Databases">Databases</option>
+          <option value="Programming Languages">Programming Languages</option>
+          <option value="Testing/QA">Testing/QA</option>
+          <option value="Design/UI/UX">Design/UI/UX</option>
+          <option value="Marketing">Marketing</option>
+          <option value="Project Management">Project Management</option>
+          <option value="Cybersecurity">Cybersecurity</option>
+          <option value="Networking">Networking</option>
+          <option value="Blockchain">Blockchain</option>
+          <option value="Game Development">Game Development</option>
+          <option value="Embedded/IoT">Embedded/IoT</option>
+          <option value="Soft Skills">Soft Skills</option>
+          <option value="Other">Other</option>
+        </select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-cancel" onclick="closeAddModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitSkill()">Add Skill</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const API = '/api/skill-library';
+    let currentPage = 0;
+    const PAGE_SIZE = 30;
+    let currentTotal = 0;
+
+    // ── Fetch & Render ──
+    async function fetchSkills() {
+      const query = document.getElementById('searchInput').value;
+      const category = document.getElementById('categoryFilter').value;
+      const source = document.getElementById('sourceFilter').value;
+
+      const params = new URLSearchParams();
+      if (query) params.set('q', query);
+      if (category) params.set('category', category);
+      if (source) params.set('source', source);
+      params.set('skip', currentPage * PAGE_SIZE);
+      params.set('limit', PAGE_SIZE);
+
+      try {
+        const res = await fetch(`${API}?${params}`);
+        const data = await res.json();
+        currentTotal = data.total;
+        renderTable(data.skills);
+        renderPagination();
+        updateStats(data);
+      } catch (e) {
+        console.error('Fetch failed:', e);
+      }
+    }
+
+    function renderTable(skills) {
+      const body = document.getElementById('skillsBody');
+      if (!skills || skills.length === 0) {
+        body.innerHTML = `
+          <tr><td colspan="8" class="empty-state">
+            <div class="icon">📭</div>
+            <div>No skills found. Skills are auto-learned via LLM or add them manually.</div>
+          </td></tr>`;
+        return;
+      }
+      body.innerHTML = skills.map(s => {
+        const date = s.first_seen
+          ? new Date(s.first_seen).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+          : '—';
+        const source = s.source || 'llm';
+        const badgeClass = source === 'admin' ? 'badge-admin' : source === 'static' ? 'badge-static' : 'badge-llm';
+        const badgeLabel = source === 'admin' ? 'Admin' : source === 'static' ? 'Static' : source === 'manual' ? 'Manual' : 'LLM';
+        const category = s.category || 'Other';
+        const conf = s.confidence != null ? s.confidence : 0;
+        const confPct = Math.round(conf * 100);
+        const confColor = conf >= 0.9 ? '#00b894' : conf >= 0.7 ? '#fdcb6e' : '#e17055';
+        const hits = s.hit_count || 0;
+
+        return `<tr>
+          <td class="skill-name">${esc(s.alias)}</td>
+          <td class="canonical-name">${esc(s.canonical)}</td>
+          <td><span class="badge badge-category">${esc(category)}</span></td>
+          <td><span class="badge ${badgeClass}">${badgeLabel}</span></td>
+          <td>${date}</td>
+          <td>${hits}</td>
+          <td>
+            ${confPct}%
+            <span class="confidence-bar">
+              <span class="confidence-fill" style="width:${confPct}%;background:${confColor}"></span>
+            </span>
+          </td>
+          <td>
+            <button class="btn btn-danger btn-sm" onclick="deleteSkill('${esc(s.alias)}')">Delete</button>
+          </td>
+        </tr>`;
+      }).join('');
+    }
+
+    function renderPagination() {
+      const totalPages = Math.max(1, Math.ceil(currentTotal / PAGE_SIZE));
+      document.getElementById('pageInfo').textContent = `Page ${currentPage + 1} of ${totalPages}`;
+      document.getElementById('prevBtn').disabled = currentPage === 0;
+      document.getElementById('nextBtn').disabled = currentPage >= totalPages - 1;
+    }
+
+    function changePage(dir) {
+      currentPage += dir;
+      fetchSkills();
+    }
+
+    function updateStats(data) {
+      document.getElementById('totalCount').textContent = data.total || 0;
+      document.getElementById('staticCount').textContent = data.static_count || 0;
+      document.getElementById('llmCount').textContent = data.llm_count || 0;
+      document.getElementById('adminCount').textContent = data.admin_count || 0;
+      document.getElementById('categoryCount').textContent = data.category_count || 0;
+    }
+
+    // ── Add Skill ──
+    function openAddModal() {
+      document.getElementById('addModal').classList.add('active');
+      document.getElementById('aliasInput').value = '';
+      document.getElementById('canonicalInput').value = '';
+      document.getElementById('aliasInput').focus();
+    }
+
+    function closeAddModal() {
+      document.getElementById('addModal').classList.remove('active');
+    }
+
+    async function submitSkill() {
+      const alias = document.getElementById('aliasInput').value.trim();
+      const canonical = document.getElementById('canonicalInput').value.trim();
+      const category = document.getElementById('categoryInput').value;
+
+      if (!alias || !canonical) {
+        showToast('Please fill alias and canonical name', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch(API, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ alias, canonical, category }),
+        });
+        if (res.ok) {
+          showToast('Skill added successfully', 'success');
+          closeAddModal();
+          fetchSkills();
+        } else {
+          const err = await res.json();
+          showToast(err.detail || 'Failed to add skill', 'error');
+        }
+      } catch (e) {
+        showToast('Network error', 'error');
+      }
+    }
+
+    // ── Delete ──
+    async function deleteSkill(alias) {
+      if (!confirm(`Delete skill alias "${alias}"?`)) return;
+      try {
+        const res = await fetch(`${API}/${encodeURIComponent(alias)}`, { method: 'DELETE' });
+        if (res.ok) {
+          showToast('Skill deleted', 'success');
+          fetchSkills();
+        } else {
+          showToast('Delete failed', 'error');
+        }
+      } catch (e) {
+        showToast('Network error', 'error');
+      }
+    }
+
+    // ── Utils ──
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s || '';
+      return d.innerHTML;
+    }
+
+    function showToast(msg, type) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = `toast ${type} show`;
+      setTimeout(() => t.classList.remove('show'), 3000);
+    }
+
+    // ── Search debounce ──
+    let searchTimeout;
+    document.getElementById('searchInput').addEventListener('input', () => {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => { currentPage = 0; fetchSkills(); }, 300);
+    });
+    document.getElementById('categoryFilter').addEventListener('change', () => { currentPage = 0; fetchSkills(); });
+    document.getElementById('sourceFilter').addEventListener('change', () => { currentPage = 0; fetchSkills(); });
+
+    // ── Load categories ──
+    async function loadCategories() {
+      try {
+        const res = await fetch(`${API}/categories`);
+        const cats = await res.json();
+        const sel = document.getElementById('categoryFilter');
+        cats.forEach(c => {
+          const opt = document.createElement('option');
+          opt.value = c;
+          opt.textContent = c;
+          sel.appendChild(opt);
+        });
+      } catch (e) {
+        console.error('Failed to load categories:', e);
+      }
+    }
+
+    // ── Init ──
+    loadCategories();
+    fetchSkills();
+  </script>
+</body>
+</html>

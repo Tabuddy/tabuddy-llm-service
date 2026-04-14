@@ -18,6 +18,7 @@ from resume_zoner import zone_resume
 from resume_parser import extract_docx_plain_text, extract_pdf_links, extract_text
 import skill_library
 import db
+from normalizer import normalize_skills
 from ranking_models import (
     JDProfile,
     RankingSession,
@@ -88,6 +89,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize MongoDB connection and merged skill library
     await db.init_db()
+    await db.seed_static_skills()
     await skill_library.init()
 
     yield
@@ -759,3 +761,85 @@ async def resume_ranking_ui(request: Request):
             "loaded_tiers": [],
         },
     )
+
+
+# ── 6. Skill Library Panel ───────────────────────────────────────────────────
+
+class AdminSkillPayload(BaseModel):
+    alias: str = Field(..., min_length=1, max_length=200)
+    canonical: str = Field(..., min_length=1, max_length=200)
+    category: str = Field(default="Other", max_length=100)
+
+
+@app.get("/skill-library", response_class=HTMLResponse)
+async def skill_library_ui(request: Request):
+    """Jinja2 panel for viewing and managing the skill library."""
+    return templates.TemplateResponse("skill_library.html", {"request": request})
+
+
+@app.get("/api/skill-library")
+async def api_skill_library(
+    q: str = "",
+    category: str = "",
+    source: str = "",
+    skip: int = 0,
+    limit: int = 50,
+):
+    """Search / list learned skills for the admin panel."""
+    limit = min(limit, 200)
+    skills, total = await db.search_learned_skills(
+        query=q, category=category, source=source, skip=skip, limit=limit,
+    )
+
+    # Compute quick counts for the stats bar
+    _, llm_total = await db.search_learned_skills(source="llm", limit=1)
+    _, admin_total = await db.search_learned_skills(source="admin", limit=1)
+    _, static_total = await db.search_learned_skills(source="static", limit=1)
+    categories = await db.get_skill_categories()
+
+    # Serialize datetimes to ISO strings
+    for s in skills:
+        for key in ("first_seen", "last_seen"):
+            if key in s and s[key] is not None:
+                s[key] = s[key].isoformat()
+
+    return {
+        "skills": skills,
+        "total": total,
+        "static_count": static_total,
+        "llm_count": llm_total,
+        "admin_count": admin_total,
+        "category_count": len(categories),
+    }
+
+
+@app.get("/api/skill-library/categories")
+async def api_skill_categories():
+    """Return distinct categories from the skill library."""
+    return await db.get_skill_categories()
+
+
+@app.post("/api/skill-library", status_code=201)
+async def api_add_skill(payload: AdminSkillPayload):
+    """Admin-add a skill to the library."""
+    await skill_library.learn(
+        alias=payload.alias,
+        canonical=payload.canonical,
+        confidence=1.0,
+        category=payload.category,
+        source="admin",
+    )
+    return {"ok": True, "alias": payload.alias.strip().lower(), "canonical": payload.canonical}
+
+
+@app.delete("/api/skill-library/{alias}")
+async def api_delete_skill(alias: str):
+    """Delete a learned skill from the library."""
+    deleted = await db.delete_learned_skill(alias)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail="Skill not found or DB unavailable")
+    # Also remove from in-memory cache
+    merged = skill_library.get_aliases()
+    merged.pop(alias.strip().lower(), None)
+    return {"ok": True}

@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -99,18 +100,23 @@ def _get_azure_client() -> AsyncAzureOpenAI | None:
 
 _LLM_SYSTEM_PROMPT = """\
 You are a skill normalizer. Given a list of tech/professional skill strings, \
-return their canonical (standard) forms.
+return their canonical (standard) forms along with a category.
 
 Rules:
 - Use the most widely recognized name (e.g. "React" not "ReactJS").
 - Preserve proper casing (e.g. "Node.js", "PostgreSQL", "C#").
 - If the input is already canonical, return it as-is.
 - If you don't recognize a skill, return the original string unchanged.
-- Return ONLY a JSON array of strings, no explanation.
+- Assign each skill ONE category from this list:
+  Web Development, Mobile Development, Backend Development, Frontend Development,
+  AI/ML, Data Science, DevOps/Cloud, Databases, Programming Languages,
+  Testing/QA, Design/UI/UX, Marketing, Project Management, Cybersecurity,
+  Networking, Blockchain, Game Development, Embedded/IoT, Soft Skills, Other
+- Return ONLY a JSON array of objects with "name" and "category" keys, no explanation.
 
 Example:
 Input: ["Reactjs", "PSQL", "k8s", "some-unknown-tool"]
-Output: ["React", "PostgreSQL", "Kubernetes", "some-unknown-tool"]
+Output: [{"name": "React", "category": "Frontend Development"}, {"name": "PostgreSQL", "category": "Databases"}, {"name": "Kubernetes", "category": "DevOps/Cloud"}, {"name": "some-unknown-tool", "category": "Other"}]
 """
 
 
@@ -136,30 +142,41 @@ async def _llm_normalize(skills: list[str]) -> list[NormalizedSkill]:
             max_completion_tokens=16000,
         )
         content = response.choices[0].message.content or "[]"
-        normalized: list[str] = json.loads(content)
+        normalized: list[dict] = json.loads(content)
 
         # Safety: ensure lengths match
         if len(normalized) != len(skills):
             raise ValueError("LLM returned mismatched array length")
 
-        results = [
-            NormalizedSkill(
-                original=orig,
-                normalized=norm,
-                method="llm",
-                confidence=0.85,
-            )
-            for orig, norm in zip(skills, normalized)
-        ]
+        results = []
+        for orig, entry in zip(skills, normalized):
+            if isinstance(entry, dict):
+                norm_name = entry.get("name", orig)
+                category = entry.get("category", "Other")
+            else:
+                # Backward compat: plain string
+                norm_name = str(entry)
+                category = "Other"
 
-        # Persist newly learned skills to MongoDB (fire-and-forget)
-        import asyncio
-        for r in results:
-            if r.normalized.lower() != r.original.lower():
-                asyncio.create_task(
-                    skill_library.learn(
-                        r.original, r.normalized, confidence=r.confidence)
+            norm_name = skill_library.normalize_canonical_case(norm_name)
+
+            results.append(
+                NormalizedSkill(
+                    original=orig,
+                    normalized=norm_name,
+                    method="llm",
+                    confidence=0.85,
                 )
+            )
+            # Persist every LLM-tier skill to MongoDB (fire-and-forget),
+            # including same-name canonical forms like "Snowflake".
+            asyncio.create_task(
+                skill_library.learn(
+                    orig, norm_name,
+                    confidence=0.85,
+                    category=category,
+                )
+            )
 
         return results
     except Exception as e:

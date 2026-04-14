@@ -99,6 +99,7 @@ async def upsert_learned_skill(
     canonical: str,
     source: str = "llm",
     confidence: float = 0.85,
+    category: str = "Other",
 ) -> bool:
     """Insert or update a learned skill mapping.
 
@@ -125,6 +126,7 @@ async def upsert_learned_skill(
                     "canonical": canonical,
                     "source": source,
                     "confidence": confidence,
+                    "category": category,
                     "last_seen": now,
                 },
                 "$inc": {"hit_count": 1},
@@ -153,3 +155,136 @@ async def get_skill_hit_counts(top_n: int = 100) -> list[dict]:
     except Exception as e:
         logger.warning("get_skill_hit_counts failed: %s", e)
         return []
+
+
+async def search_learned_skills(
+    query: str = "",
+    category: str = "",
+    source: str = "",
+    skip: int = 0,
+    limit: int = 50,
+) -> tuple[list[dict], int]:
+    """Search / filter learned skills for the admin panel.
+
+    Returns (docs, total_count).
+    """
+    if not _available or _collection is None:
+        return [], 0
+
+    try:
+        filt: dict = {}
+        if query:
+            filt["$or"] = [
+                {"alias": {"$regex": query, "$options": "i"}},
+                {"canonical": {"$regex": query, "$options": "i"}},
+            ]
+        if category:
+            filt["category"] = category
+        if source:
+            filt["source"] = source
+
+        total = await _collection.count_documents(filt)
+        docs = await (
+            _collection.find(filt, {"_id": 0})
+            .sort("last_seen", -1)
+            .skip(skip)
+            .limit(limit)
+            .to_list(length=limit)
+        )
+        return docs, total
+    except Exception as e:
+        logger.warning("search_learned_skills failed: %s", e)
+        return [], 0
+
+
+async def delete_learned_skill(alias: str) -> bool:
+    """Delete a learned skill by alias key."""
+    if not _available or _collection is None:
+        return False
+    try:
+        result = await _collection.delete_one({"alias": alias.strip().lower()})
+        if result.deleted_count:
+            return True
+        return False
+    except Exception as e:
+        logger.warning("delete_learned_skill failed for %r: %s", alias, e)
+        return False
+
+
+async def get_skill_categories() -> list[str]:
+    """Return distinct category values from learned_skills."""
+    if not _available or _collection is None:
+        return []
+    try:
+        cats = await _collection.distinct("category")
+        return sorted([c for c in cats if c])
+    except Exception as e:
+        logger.warning("get_skill_categories failed: %s", e)
+        return []
+
+
+async def seed_static_skills() -> int:
+    """Bulk-insert static SKILL_ALIASES into MongoDB (skip existing).
+
+    Uses a fast count check to skip entirely on subsequent startups.
+    Only runs the full diff + insert on first boot or when new static
+    skills are added to the code.
+    """
+    if not _available or _collection is None:
+        return 0
+
+    from skills_dictionary import SKILL_ALIASES, SKILL_CATEGORIES
+
+    # Fast path: if static count matches, nothing to do
+    try:
+        static_count = await _collection.count_documents({"source": "static"})
+        if static_count >= len(SKILL_ALIASES):
+            return 0
+    except Exception as e:
+        logger.warning("seed_static_skills: count check failed: %s", e)
+        return 0
+
+    now = datetime.now(timezone.utc)
+
+    # Only fetch existing aliases when we actually need to diff
+    existing = set()
+    try:
+        cursor = _collection.find({}, {"alias": 1, "_id": 0})
+        async for doc in cursor:
+            existing.add(doc["alias"])
+    except Exception as e:
+        logger.warning("seed_static_skills: failed to read existing: %s", e)
+        return 0
+
+    # Build insert batch for aliases not yet in DB
+    to_insert = []
+    for alias_key, canonical in SKILL_ALIASES.items():
+        key = alias_key.strip().lower()
+        if key in existing:
+            continue
+        category = SKILL_CATEGORIES.get(canonical, "Other")
+        to_insert.append({
+            "alias": key,
+            "canonical": canonical,
+            "source": "static",
+            "category": category,
+            "confidence": 1.0,
+            "first_seen": now,
+            "last_seen": now,
+            "hit_count": 0,
+        })
+
+    if not to_insert:
+        logger.info("Seed: all %d static skills already present",
+                    len(SKILL_ALIASES))
+        return 0
+
+    try:
+        result = await _collection.insert_many(to_insert, ordered=False)
+        inserted = len(result.inserted_ids)
+        logger.info(
+            "Seed: inserted %d new static skills into MongoDB", inserted)
+        return inserted
+    except Exception as e:
+        logger.warning("seed_static_skills bulk insert error: %s", e)
+        return 0
