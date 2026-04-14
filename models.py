@@ -57,6 +57,8 @@ class ExperienceDetail(BaseModel):
     key_achievements: list[str] = []
     quantifiers: list[str] = []
     tech_stack: list[str] = []
+    # Verbatim experience block text as zoned/built upstream.
+    full_block_text: str | None = None
 
 
 # ── Project detail ──

@@ -318,6 +318,21 @@
       left: 0;
       color: var(--accent);
     }
+    .timeline-full-block {
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      margin: 0.35rem 0 0.75rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: min(70vh, 28rem);
+      overflow-y: auto;
+      line-height: 1.45;
+    }
     .tech-inline {
       display: flex;
       flex-wrap: wrap;
@@ -989,7 +1004,9 @@
         expHtml += '<div class="timeline-role">' + esc(exp.role || 'Role not specified') + '</div>';
         expHtml += '<div class="timeline-company">' + esc(exp.company || '') + '</div>';
         if (exp.duration) expHtml += '<div class="timeline-duration">' + esc(exp.duration) + '</div>';
-        if (exp.key_achievements && exp.key_achievements.length) {
+        if (exp.full_block_text) {
+          expHtml += '<pre class="timeline-full-block">' + esc(exp.full_block_text) + '</pre>';
+        } else if (exp.key_achievements && exp.key_achievements.length) {
           expHtml += '<ul class="timeline-achievements">';
           exp.key_achievements.forEach(a => { expHtml += '<li>' + esc(a) + '</li>'; });
           expHtml += '</ul>';
