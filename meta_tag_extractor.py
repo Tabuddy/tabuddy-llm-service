@@ -212,9 +212,22 @@ def _build_project_tags(block_results: list[BlockTagResult]) -> ProjectMetaTags:
     all_tech: list[str] = []
 
     for br in block_results:
-        if br.block_type == "project" and br.project_detail:
-            projects.append(br.project_detail)
+        if br.block_type != "project":
+            continue
+        rt = (br.raw_text or "").strip()
+        if br.project_detail:
+            pd = br.project_detail.model_copy(
+                update={"full_block_text": rt or None},
+            )
+            projects.append(pd)
             all_tech.extend(br.project_detail.tech_stack)
+        elif rt:
+            projects.append(
+                ProjectDetail(
+                    project_name=br.block_name,
+                    full_block_text=rt,
+                )
+            )
 
     seen: set[str] = set()
     unique_tech: list[str] = []

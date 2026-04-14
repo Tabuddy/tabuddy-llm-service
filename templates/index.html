@@ -351,6 +351,21 @@
     }
     .project-card h4 { font-size: 0.95rem; color: var(--text); margin-bottom: 0.3rem; }
     .project-card .desc { font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.5rem; }
+    .project-card .project-full-block {
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      margin: 0.35rem 0 0.75rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: min(70vh, 28rem);
+      overflow-y: auto;
+      line-height: 1.45;
+    }
 
     /* Global Skill Index */
     .gsi-table {
@@ -1002,11 +1017,15 @@
       projects.forEach(p => {
         projHtml += '<div class="project-card">';
         projHtml += '<h4>' + esc(p.project_name || 'Unnamed Project') + '</h4>';
-        if (p.description) projHtml += '<div class="desc">' + esc(p.description) + '</div>';
-        if (p.key_highlights && p.key_highlights.length) {
-          projHtml += '<ul class="timeline-achievements">';
-          p.key_highlights.forEach(h => { projHtml += '<li>' + esc(h) + '</li>'; });
-          projHtml += '</ul>';
+        if (p.full_block_text) {
+          projHtml += '<pre class="project-full-block">' + esc(p.full_block_text) + '</pre>';
+        } else {
+          if (p.description) projHtml += '<div class="desc">' + esc(p.description) + '</div>';
+          if (p.key_highlights && p.key_highlights.length) {
+            projHtml += '<ul class="timeline-achievements">';
+            p.key_highlights.forEach(h => { projHtml += '<li>' + esc(h) + '</li>'; });
+            projHtml += '</ul>';
+          }
         }
         if (p.quantifiers && p.quantifiers.length) {
           projHtml += '<div class="tech-inline" style="margin-top:0.4rem">';

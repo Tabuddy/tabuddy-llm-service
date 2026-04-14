@@ -22,7 +22,8 @@ _SECTION_PATTERNS: list[tuple[str, str]] = [
     (r"(?i)^project\s+experience", "project"),
     (
         r"(?i)^(work\s+)?experience|^employment|^professional\s+experience"
-        r"|^career\s+history|^work\s+history",
+        r"|^career\s+history|^work\s+history"
+        r"|^organizational\s+experiences?$",
         "experience",
     ),
     (

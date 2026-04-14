@@ -66,11 +66,15 @@ class ProjectDetail(BaseModel):
     tech_stack: list[str] = []
     quantifiers: list[str] = []
     key_highlights: list[str] = []
+    # Verbatim project block (Client, Role, Technologies, description, responsibilities)
+    full_block_text: str | None = None
 
 
 class BlockTagResult(BaseModel):
     block_name: str
     block_type: str = "other"
+    # Verbatim zoned block body (for UI / audit; same as hybrid block raw_text)
+    raw_text: str | None = None
     skills: list[BlockSkillEntry] = []
     quantifiers: list[str] = []
     experience_detail: ExperienceDetail | None = None

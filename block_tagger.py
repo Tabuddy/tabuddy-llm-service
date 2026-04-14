@@ -67,6 +67,11 @@ Extract "quantifiers": ALL numeric claims (percentages, counts, scales, duration
 WHAT IS A SKILL: Languages, frameworks, tools, databases, methodologies, architectural patterns, domain competencies, business tools, soft/leadership skills.
 NOT A SKILL: Company names, locations, job titles, dates, generic words (engineering, team, development), financial metrics.
 
+PROJECT & EXPERIENCE — SKILLS MUST COVER THE **ENTIRE** `raw_text` (critical):
+- For block_type="project": scan **all** sections—**Technologies** / **Technology** lines, **Project Description**, **Responsibilities** bullets, and any narrative. Emit a **skills** entry for each tool/framework clearly used or named anywhere in the block (e.g. SoapUI, SQL, Oracle, Swagger, ALM, Jenkins, BDD, REST, JSON), not only tools listed on the **Technologies:** comma line. Quote **context** from the line where each skill appears (description or bullet).
+- For block_type="experience": likewise extract skills from **every** bullet, tech inventory line, and MODULES/tools line in the block—not only the job title line.
+- "tech_stack" / project_detail should list the same technologies you infer from the **full** block text, aligned with the skills you found.
+
 FOR block_type="experience", also extract "experience_detail":
 - "company", "role", "duration" (date range as written), "is_current" (true if "Present"/"Current" in dates)
 - "key_achievements": Up to 5 impactful 1-sentence achievements with quantified results
@@ -75,7 +80,8 @@ FOR block_type="experience", also extract "experience_detail":
 
 FOR block_type="project", also extract "project_detail":
 - "project_name" (infer 3-5 word name if none), "description" (1-2 sentences)
-- "tech_stack", "quantifiers", "key_highlights"
+- "tech_stack": **every** distinct tool/framework named in the **entire** block (Technologies line **and** tools mentioned in Project Description and **each** Responsibilities bullet—e.g. SQL, Oracle, SoapUI, Swagger, ALM, Jenkins, REST, JSON, BDD). Merge into one deduplicated list.
+- "quantifiers", "key_highlights"
 
 FOR block_type="summary": Extract ALL skills (even casual mentions), quantifiers, domain focus areas.
 
@@ -137,6 +143,7 @@ def _build_block_tag_result(block: ResumeBlock, bd: dict) -> BlockTagResult:
     return BlockTagResult(
         block_name=block.block_name,
         block_type=block.block_type,
+        raw_text=block.raw_text,
         skills=skills,
         quantifiers=bd.get("quantifiers", []),
         experience_detail=exp_detail,
@@ -242,7 +249,7 @@ async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
     tasks: list = []
     task_indices: list[int] = []
     results: list[BlockTagResult] = [
-        BlockTagResult(block_name=b.block_name, block_type=b.block_type)
+        BlockTagResult(block_name=b.block_name, block_type=b.block_type, raw_text=b.raw_text)
         for b in blocks
     ]
 
@@ -274,7 +281,11 @@ async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
 def _fallback_extract(block: ResumeBlock) -> BlockTagResult:
     """Fallback when LLM is unavailable – deterministic extraction."""
     if block.block_type in ("other", "education"):
-        return BlockTagResult(block_name=block.block_name, block_type=block.block_type)
+        return BlockTagResult(
+            block_name=block.block_name,
+            block_type=block.block_type,
+            raw_text=block.raw_text,
+        )
 
     if block.block_type == "skills_dump":
         return _parse_skills_dump(block)
@@ -285,7 +296,11 @@ def _fallback_extract(block: ResumeBlock) -> BlockTagResult:
     if block.block_type == "project":
         return _parse_project_block(block)
 
-    return BlockTagResult(block_name=block.block_name, block_type=block.block_type)
+    return BlockTagResult(
+        block_name=block.block_name,
+        block_type=block.block_type,
+        raw_text=block.raw_text,
+    )
 
 
 def _parse_experience_block(block: ResumeBlock) -> BlockTagResult:
@@ -384,6 +399,7 @@ def _parse_experience_block(block: ResumeBlock) -> BlockTagResult:
     return BlockTagResult(
         block_name=block.block_name,
         block_type=block.block_type,
+        raw_text=block.raw_text,
         quantifiers=quantifiers,
         experience_detail=exp_detail,
     )
@@ -429,6 +445,7 @@ def _parse_project_block(block: ResumeBlock) -> BlockTagResult:
     return BlockTagResult(
         block_name=block.block_name,
         block_type=block.block_type,
+        raw_text=block.raw_text,
         quantifiers=quantifiers,
         project_detail=proj_detail,
     )
@@ -463,5 +480,6 @@ def _parse_skills_dump(block: ResumeBlock) -> BlockTagResult:
     return BlockTagResult(
         block_name=block.block_name,
         block_type=block.block_type,
+        raw_text=block.raw_text,
         skills=skills,
     )
