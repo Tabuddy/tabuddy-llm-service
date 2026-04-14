@@ -53,17 +53,20 @@ def _fuzzy_match(skill: str) -> NormalizedSkill | None:
     key = skill.strip().lower()
     aliases = skill_library.get_aliases()
     alias_keys = _get_alias_keys()
-    result = process.extractOne(
-        key, alias_keys, scorer=fuzz.WRatio, score_cutoff=FUZZY_THRESHOLD
+    candidates = process.extract(
+        key,
+        alias_keys,
+        scorer=fuzz.WRatio,
+        score_cutoff=FUZZY_THRESHOLD,
+        limit=8,
     )
-    if result:
-        matched_alias, score, _ = result
+    for matched_alias, score, _ in candidates:
         # Guard against short-string false positives:
-        # reject if the lengths differ too much
+        # reject if the lengths differ too much.
         len_ratio = min(len(key), len(matched_alias)) / \
             max(len(key), len(matched_alias))
         if len_ratio < 0.5:
-            return None
+            continue
         return NormalizedSkill(
             original=skill,
             normalized=aliases[matched_alias],
