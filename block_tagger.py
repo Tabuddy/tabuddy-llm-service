@@ -69,8 +69,9 @@ NOT A SKILL: Company names, locations, job titles, dates, generic words (enginee
 
 PROJECT & EXPERIENCE — SKILLS MUST COVER THE **ENTIRE** `raw_text` (critical):
 - For block_type="project": scan **all** sections—**Technologies** / **Technology** lines, **Project Description**, **Responsibilities** bullets, and any narrative. Emit a **skills** entry for each tool/framework clearly used or named anywhere in the block (e.g. SoapUI, SQL, Oracle, Swagger, ALM, Jenkins, BDD, REST, JSON), not only tools listed on the **Technologies:** comma line. Quote **context** from the line where each skill appears (description or bullet).
-- For block_type="experience": likewise extract skills from **every** bullet, tech inventory line, and MODULES/tools line in the block—not only the job title line.
-- "tech_stack" / project_detail should list the same technologies you infer from the **full** block text, aligned with the skills you found.
+- For block_type="experience": scan the **entire** block—role header, **Module/Modules**, **Technologies/Technology**, **Tools/Technical Environment** lines, responsibilities bullets, and narrative. Emit a **skills** entry for each tool/framework clearly used or named anywhere in the block (e.g. Oracle PTM, Order Management, Inventory, Salesforce, Azure DevOps, ALM), not only from bullets. Quote **context** from the exact line where each skill appears.
+- For experience, `experience_detail.tech_stack` must list the same technologies you infer from the **full** experience block text, aligned with the skills you found (deduplicated merge of module/technology lines + responsibility text).
+- "tech_stack" / project_detail should list the same technologies you infer from the **full** project block text, aligned with the skills you found.
 
 FOR block_type="experience", also extract "experience_detail":
 - "company", "role", "duration" (date range as written), "is_current" (true if "Present"/"Current" in dates)
