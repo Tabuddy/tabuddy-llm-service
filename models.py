@@ -11,6 +11,8 @@ class CandidateDetails(BaseModel):
     phone: str | None = None
     linkedin_url: str | None = None
     github_url: str | None = None
+    # Computed from experience timeline union (overlap removed).
+    total_years_of_experience: float | None = None
 
 
 # ── Resume Block (internal) ──
