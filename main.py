@@ -1,5 +1,8 @@
 from __future__ import annotations
-from hybrid_block_builder import build_hybrid_blocks
+from hybrid_block_builder import (
+    analyze_resume_from_images_one_shot,
+    build_hybrid_blocks,
+)
 from docling_api import docling_router
 from models import (
     ResumeTaggingResponse,
@@ -213,6 +216,42 @@ def _resolve_hybrid_raw_text(
     raise HTTPException(status_code=422, detail=detail)
 
 
+async def _run_resume_pipeline_from_blocks(
+    *,
+    raw_text: str,
+    blocks: list[ResumeBlock],
+    extracted_links: list[dict] | list[ExtractedLink] | None = None,
+    enrich_skill_temporal: bool = True,
+) -> ResumeTaggingResponse:
+    """Run the shared post-parse resume pipeline from prebuilt blocks."""
+    filtered_blocks = await asyncio.to_thread(filter_blocks, blocks)
+    candidate = extract_candidate_details_for_hybrid(filtered_blocks, raw_text)
+
+    async def _tag_and_build_meta(blks):
+        br = await tag_all_blocks(blks)
+        cmt = await extract_context_meta_tags(br)
+        return br, cmt
+
+    (block_results, context_meta_tags), (global_params, reasoning_log) = (
+        await asyncio.gather(
+            _tag_and_build_meta(filtered_blocks),
+            extract_global_parameters(filtered_blocks),
+        )
+    )
+
+    return aggregate(
+        candidate,
+        block_results,
+        global_params,
+        context_meta_tags,
+        reasoning_log,
+        parsed_text=raw_text,
+        zoned_blocks=filtered_blocks,
+        extracted_links=extracted_links or [],
+        enrich_skill_temporal=enrich_skill_temporal,
+    )
+
+
 # ── NEW: Resume upload & contextual meta-tagging endpoint ──
 @app.post("/parse-resume", response_model=ResumeTaggingResponse)
 async def parse_resume_endpoint(file: UploadFile = File(...)):
@@ -344,6 +383,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
     parse_results = await asyncio.gather(*parse_tasks)
     docling_markdown = parse_results[1]
     extracted_links = parse_results[2] if wants_pdf_links else []
+
     raw_text = _resolve_hybrid_raw_text(
         parse_results[0],
         docling_markdown,
@@ -355,38 +395,97 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
         raw_text,
         docling_markdown,
     )
-
-    # Same deterministic filter + tagging/meta/global flow as default.
-    blocks = await asyncio.to_thread(filter_blocks, blocks)
-
-    # Candidate regex on Header block matches zoned preview; raw_text alone can reorder lines.
-    candidate = extract_candidate_details_for_hybrid(blocks, raw_text)
-
-    async def _tag_and_build_meta(blks):
-        br = await tag_all_blocks(blks)
-        cmt = await extract_context_meta_tags(br)
-        return br, cmt
-
-    (block_results, context_meta_tags), (global_params, reasoning_log) = (
-        await asyncio.gather(
-            _tag_and_build_meta(blocks),
-            extract_global_parameters(blocks),
-        )
-    )
-
-    response = aggregate(
-        candidate,
-        block_results,
-        global_params,
-        context_meta_tags,
-        reasoning_log,
-        parsed_text=raw_text,
-        zoned_blocks=blocks,
+    response = await _run_resume_pipeline_from_blocks(
+        raw_text=raw_text,
+        blocks=blocks,
         extracted_links=extracted_links,
         enrich_skill_temporal=True,
     )
 
     logger.info("Hybrid pipeline total took %.2fs", time.perf_counter() - t0)
+    return response
+
+
+@app.post("/parse-resume-hybrid-img", response_model=ResumeTaggingResponse)
+async def parse_resume_hybrid_img_endpoint(file: UploadFile = File(...)):
+    """Hybrid pipeline using images:
+    - convert pages to images
+    - send all page images in one vision request
+    - return the parsed response directly from that one-shot analysis
+    """
+    t0 = time.perf_counter()
+
+    read_started_at = time.perf_counter()
+    raw_bytes = await file.read()
+    filename = (file.filename or "upload").lower()
+    logger.info(
+        "Hybrid-img: read upload %s (%d bytes) in %.2fs",
+        filename,
+        len(raw_bytes),
+        time.perf_counter() - read_started_at,
+    )
+
+    parse_tasks = [
+        analyze_resume_from_images_one_shot(raw_bytes, filename),
+    ]
+    wants_pdf_links = filename.endswith(".pdf")
+    if wants_pdf_links:
+        parse_tasks.append(asyncio.to_thread(extract_pdf_links, raw_bytes))
+
+    parse_started_at = time.perf_counter()
+    parse_results = await asyncio.gather(*parse_tasks)
+    logger.info(
+        "Hybrid-img: parallel parse stage for %s completed in %.2fs",
+        filename,
+        time.perf_counter() - parse_started_at,
+    )
+    (
+        vision_raw_text,
+        zoned_blocks,
+        block_results,
+        context_meta_tags,
+        global_parameters,
+        reasoning_log,
+    ) = parse_results[0]
+    extracted_links = parse_results[1] if wants_pdf_links else []
+
+    raw_text = (vision_raw_text or "").strip()
+    if not raw_text:
+        raise HTTPException(
+            status_code=422,
+            detail="Image-to-LLM parsing did not return resume text.",
+        )
+    if not zoned_blocks:
+        raise HTTPException(
+            status_code=422,
+            detail="Image-to-LLM parsing did not return resume blocks.",
+        )
+    if not block_results:
+        raise HTTPException(
+            status_code=422,
+            detail="Image-to-LLM parsing did not return tagged blocks.",
+        )
+
+    candidate = extract_candidate_details_for_hybrid(zoned_blocks, raw_text)
+    response = aggregate(
+        candidate,
+        block_results,
+        global_parameters,
+        context_meta_tags,
+        reasoning_log,
+        parsed_text=raw_text,
+        zoned_blocks=zoned_blocks,
+        extracted_links=extracted_links,
+        enrich_skill_temporal=True,
+    )
+    logger.info(
+        "Hybrid-img: one-shot aggregation for %s completed with %d blocks and %d tagged blocks",
+        filename,
+        len(zoned_blocks),
+        len(block_results),
+    )
+
+    logger.info("Hybrid-img pipeline total took %.2fs", time.perf_counter() - t0)
     return response
 
 
