@@ -923,6 +923,10 @@
       if (c.name) candHtml += candidateItem('Name', esc(c.name));
       if (c.email) candHtml += candidateItem('Email', '<a href="mailto:' + esc(c.email) + '">' + esc(c.email) + '</a>');
       if (c.phone) candHtml += candidateItem('Phone', esc(c.phone));
+      if (c.total_years_of_experience != null) {
+        const expLabel = fmtYearsLabel(c.total_years_of_experience);
+        if (expLabel) candHtml += candidateItem('Total Experience', esc(expLabel));
+      }
       if (c.linkedin_url) candHtml += candidateItem('LinkedIn', '<a href="' + esc(c.linkedin_url) + '" target="_blank">' + esc(c.linkedin_url) + '</a>');
       if (c.github_url) candHtml += candidateItem('GitHub', '<a href="' + esc(c.github_url) + '" target="_blank">' + esc(c.github_url) + '</a>');
       candHtml += '</div>';

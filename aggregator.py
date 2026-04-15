@@ -36,6 +36,19 @@ _PRESENT_RE = re.compile(
 )
 
 
+def _normalize_duration_text(raw: str) -> str:
+    """Normalize noisy duration strings before split/parse."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\u2012", "-")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"(?i)^\s*(?:from|since)\s+", "", s).strip()
+    # Normalize malformed month-year joins, e.g. "Apr -2018", "Mar-2022".
+    s = re.sub(r"(?i)\b([A-Za-z]{3,9})\s*-\s*(\d{2,4})\b", r"\1 \2", s)
+    return s
+
+
 def _month_index(token: str) -> int | None:
     t = token.lower().strip().rstrip(".")
     return _MONTH_NAMES.get(t)
@@ -54,7 +67,10 @@ def _parse_month_year_token(
     as_of: date,
 ) -> date | None:
     """Parse trailing/leading 'Mon YYYY', 'MM/YYYY', or 'YYYY' from a short string."""
-    s = s.strip()
+    s = _normalize_duration_text(s).strip().strip(",.;")
+    s = re.sub(r"(?i)^\s*(?:from|since)\s+", "", s).strip()
+    # Trim tails like "at Company" when they leak into duration tokens.
+    s = re.sub(r"(?i)\s+(?:at|in)\s+.*$", "", s).strip()
     if not s:
         return None
     if _PRESENT_RE.search(s):
@@ -87,22 +103,29 @@ def _parse_month_year_token(
 
 
 def _split_duration_halves(duration: str) -> tuple[str | None, str | None]:
-    d = duration.strip()
-    parts = re.split(r"\s*[-–—]\s*|\s+to\s+", d, maxsplit=1, flags=re.IGNORECASE)
-    if len(parts) == 2 and parts[1].strip():
+    d = _normalize_duration_text(duration)
+    if not d:
+        return None, None
+    # Prefer "to" first: "Mar 2022 to Present".
+    parts = re.split(r"(?i)\s+\bto\b\s+", d, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    # Then range dash.
+    parts = re.split(r"\s*-\s*", d, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
         return parts[0].strip(), parts[1].strip()
     return None, None
 
 
 def _years_from_explicit_duration(duration: str) -> float | None:
     """Parse phrases like '6 months', '2 years', '1 year 3 months'."""
-    d = duration.lower().strip()
-    m = re.search(r"(\d+(?:\.\d+)?)\s*months?", d)
-    if m:
-        return float(m.group(1)) / 12.0
+    d = _normalize_duration_text(duration).lower().strip()
     m = re.search(r"(\d+(?:\.\d+)?)\s*years?\s+(\d+)\s*months?", d)
     if m:
         return float(m.group(1)) + float(m.group(2)) / 12.0
+    m = re.search(r"(\d+(?:\.\d+)?)\s*months?", d)
+    if m:
+        return float(m.group(1)) / 12.0
     m = re.search(r"(\d+(?:\.\d+)?)\s*year", d)
     if m:
         return float(m.group(1))
@@ -185,6 +208,84 @@ def _temporal_for_block(br: BlockTagResult, as_of: date) -> tuple[str | None, fl
     return _temporal_from_experience_detail(ed, as_of)
 
 
+def _interval_from_experience_detail(
+    ed: ExperienceDetail,
+    as_of: date,
+) -> tuple[date | None, date | None]:
+    """Parse an approximate [start, end] interval for one experience detail."""
+    raw = (ed.duration or "").strip()
+    is_current = ed.is_current or (bool(raw) and bool(_PRESENT_RE.search(raw)))
+    left, right = _split_duration_halves(raw) if raw else (None, None)
+
+    if left and right:
+        start_d = _parse_month_year_token(left, end_of_month=False, as_of=as_of)
+        if _PRESENT_RE.search(right):
+            end_d = as_of
+        else:
+            end_d = _parse_month_year_token(right, end_of_month=True, as_of=as_of)
+        if start_d and end_d and end_d >= start_d:
+            return start_d, end_d
+
+    # Year-only range: "2020 - 2023"
+    m = re.search(r"(\d{4})\s*[-–—]\s*(\d{4})", raw)
+    if m:
+        y0, y1 = int(m.group(1)), int(m.group(2))
+        if y1 >= y0:
+            return date(y0, 1, 1), date(y1, 12, 31)
+
+    # Single-sided current range: "Mar 2022 - Present"
+    if is_current and left and not right:
+        start_d = _parse_month_year_token(left, end_of_month=False, as_of=as_of)
+        if start_d and as_of >= start_d:
+            return start_d, as_of
+
+    return None, None
+
+
+def _interval_for_block(
+    br: BlockTagResult,
+    as_of: date,
+) -> tuple[date | None, date | None]:
+    if br.block_type != "experience" or not br.experience_detail:
+        return None, None
+    ed = br.experience_detail
+    if not (ed.duration or ed.is_current):
+        return None, None
+    return _interval_from_experience_detail(ed, as_of)
+
+
+def _merge_interval_years(intervals: list[tuple[date, date]]) -> float | None:
+    """Compute total years from union of possibly overlapping intervals."""
+    if not intervals:
+        return None
+    intervals_sorted = sorted(intervals, key=lambda x: (x[0], x[1]))
+    merged: list[tuple[date, date]] = []
+    cur_start, cur_end = intervals_sorted[0]
+    for start, end in intervals_sorted[1:]:
+        if start <= cur_end:
+            if end > cur_end:
+                cur_end = end
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+    merged.append((cur_start, cur_end))
+    total_days = sum(max((end - start).days, 0) for start, end in merged)
+    return total_days / 365.25
+
+
+def _total_experience_years_from_blocks(
+    block_results: list[BlockTagResult],
+    as_of: date,
+) -> float | None:
+    """Unique total years of experience from experience block intervals."""
+    intervals: list[tuple[date, date]] = []
+    for br in block_results:
+        start_d, end_d = _interval_for_block(br, as_of)
+        if start_d and end_d and end_d >= start_d:
+            intervals.append((start_d, end_d))
+    return _merge_interval_years(intervals)
+
+
 def build_global_skill_index(
     block_results: list[BlockTagResult],
     *,
@@ -198,12 +299,23 @@ def build_global_skill_index(
     """
     skill_traces: dict[str, list[SkillTrace]] = defaultdict(list)
     as_of = reference_date or date.today()
+    block_intervals: dict[str, tuple[date, date]] = {}
 
     for br in block_results:
         last_u: str | None = None
         yrs: float | None = None
         if enrich_skill_temporal:
             last_u, yrs = _temporal_for_block(br, as_of)
+            start_d, end_d = _interval_for_block(br, as_of)
+            if start_d and end_d:
+                prior = block_intervals.get(br.block_name)
+                if prior is None:
+                    block_intervals[br.block_name] = (start_d, end_d)
+                else:
+                    block_intervals[br.block_name] = (
+                        min(prior[0], start_d),
+                        max(prior[1], end_d),
+                    )
         for entry in br.skills:
             key = entry.skill.strip().lower()
             skill_traces[key].append(
@@ -229,8 +341,31 @@ def build_global_skill_index(
     def _rollup_years(ts: list[SkillTrace]) -> float | None:
         if not enrich_skill_temporal:
             return None
-        vals = [t.computed_years_with_skill for t in ts if t.computed_years_with_skill is not None]
-        return sum(vals) if vals else None
+        if not ts:
+            return None
+
+        # Preserve existing trace data; only dedupe overlap at aggregate total.
+        years_by_provenance: dict[str, float] = {}
+        for t in ts:
+            y = t.computed_years_with_skill
+            if y is None:
+                continue
+            prev = years_by_provenance.get(t.provenance)
+            if prev is None or y > prev:
+                years_by_provenance[t.provenance] = y
+
+        interval_list: list[tuple[date, date]] = []
+        fallback_years = 0.0
+        for provenance, y in years_by_provenance.items():
+            interval = block_intervals.get(provenance)
+            if interval is not None:
+                interval_list.append(interval)
+            else:
+                fallback_years += y
+
+        union_years = _merge_interval_years(interval_list) or 0.0
+        total = union_years + fallback_years
+        return total if total > 0 else None
 
     return sorted(
         [
@@ -267,6 +402,12 @@ def aggregate(
     values across traces (overlapping timelines may double-count). Hybrid endpoints
     pass True; ranking and /parse-resume use False.
     """
+    as_of = skill_temporal_reference_date or date.today()
+    total_exp_years = _total_experience_years_from_blocks(block_results, as_of)
+    candidate_out = candidate.model_copy(
+        update={"total_years_of_experience": total_exp_years}
+    )
+
     zoned_preview = []
     if zoned_blocks:
         zoned_preview = [
@@ -278,7 +419,7 @@ def aggregate(
             for b in zoned_blocks
         ]
     return ResumeTaggingResponse(
-        candidate=candidate,
+        candidate=candidate_out,
         extracted_links=extracted_links or [],
         context_meta_tags=context_meta_tags,
         global_skill_index=build_global_skill_index(
