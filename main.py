@@ -365,7 +365,7 @@ async def parse_resume_hybrid_endpoint(file: UploadFile = File(...)):
     candidate = extract_candidate_details_for_hybrid(blocks, raw_text)
 
     async def _tag_and_build_meta(blks):
-        br = await tag_all_blocks(blks)
+        br = await tag_all_blocks(blks, normalize_skills_per_block=True)
         cmt = await extract_context_meta_tags(br)
         return br, cmt
 
@@ -492,7 +492,7 @@ async def parse_resume_hybrid_stage2_endpoint(
     blocks = await asyncio.to_thread(filter_blocks, stage1_blocks)
 
     async def _tag_and_build_meta(blks):
-        br = await tag_all_blocks(blks)
+        br = await tag_all_blocks(blks, normalize_skills_per_block=True)
         cmt = await extract_context_meta_tags(br)
         return br, cmt
 
@@ -572,7 +572,7 @@ async def _run_full_resume_pipeline(file: UploadFile) -> ResumeTaggingResponse:
     candidate = extract_candidate_details_for_hybrid(blocks, raw_text)
 
     async def _tag_and_meta(blks):
-        br = await tag_all_blocks(blks)
+        br = await tag_all_blocks(blks, normalize_skills_per_block=True)
         cmt = await extract_context_meta_tags(br)
         return br, cmt
 

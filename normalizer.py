@@ -144,15 +144,27 @@ async def _llm_normalize(skills: list[str]) -> list[NormalizedSkill]:
             ],
             max_completion_tokens=16000,
         )
-        content = response.choices[0].message.content or "[]"
-        normalized: list[dict] = json.loads(content)
+        content = (response.choices[0].message.content or "[]").strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(content)
 
-        # Safety: ensure lengths match
-        if len(normalized) != len(skills):
-            raise ValueError("LLM returned mismatched array length")
+        # Accept common variants instead of hard-failing.
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("skills"), list):
+                normalized = parsed["skills"]
+            elif isinstance(parsed.get("items"), list):
+                normalized = parsed["items"]
+            else:
+                normalized = [parsed]
+        elif isinstance(parsed, list):
+            normalized = parsed
+        else:
+            normalized = []
 
         results = []
-        for orig, entry in zip(skills, normalized):
+        n = min(len(skills), len(normalized))
+        for orig, entry in zip(skills[:n], normalized[:n]):
             if isinstance(entry, dict):
                 norm_name = entry.get("name", orig)
                 category = entry.get("category", "Other")
@@ -180,6 +192,24 @@ async def _llm_normalize(skills: list[str]) -> list[NormalizedSkill]:
                     category=category,
                 )
             )
+
+        # If LLM returned fewer items than requested, preserve remaining originals
+        # instead of failing the whole batch.
+        if len(normalized) != len(skills):
+            logger.warning(
+                "LLM normalization length mismatch: requested=%d returned=%d",
+                len(skills),
+                len(normalized),
+            )
+            for orig in skills[n:]:
+                results.append(
+                    NormalizedSkill(
+                        original=orig,
+                        normalized=orig,
+                        method="unmatched",
+                        confidence=0.0,
+                    )
+                )
 
         return results
     except Exception as e:

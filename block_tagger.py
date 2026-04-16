@@ -14,6 +14,7 @@ import json
 import logging
 from pydantic import ValidationError
 from openai import AsyncAzureOpenAI
+from normalizer import normalize_skills
 from models import (
     ResumeBlock,
     BlockTagResult,
@@ -27,12 +28,20 @@ logger = logging.getLogger(__name__)
 _BLOCK_TAGGER_CONCURRENCY = max(
     1, int(os.getenv("BLOCK_TAGGER_MAX_CONCURRENCY", "4"))
 )
+_SKILL_NORMALIZER_CONCURRENCY = max(
+    1, int(os.getenv("SKILL_NORMALIZER_MAX_CONCURRENCY", "6"))
+)
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 _AZURE_DEPLOYMENT = "gpt-4o-mini"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 _client: AsyncAzureOpenAI | None = None
+
+
+def _should_normalize_block_type(block_type: str) -> bool:
+    """Normalize only selected block types."""
+    return block_type in {"summary", "experience", "project", "skills_dump", "education"}
 
 
 def _get_client() -> AsyncAzureOpenAI | None:
@@ -233,22 +242,129 @@ async def _tag_single_block(
     return _fallback_extract(block)
 
 
-async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
-    """Process each block in parallel via concurrent LLM calls."""
+async def _normalize_block_result_skills(br: BlockTagResult) -> BlockTagResult:
+    """Normalize all skill-like fields in one BlockTagResult while preserving structure."""
+    if not _should_normalize_block_type(br.block_type):
+        return br
+
+    skill_slots: list[tuple[str, int, int | None]] = []
+    raw_inputs: list[str] = []
+
+    # Main extracted skills + co-dependent skills.
+    for i, s in enumerate(br.skills):
+        base = (s.skill or "").strip()
+        if base:
+            skill_slots.append(("skill", i, None))
+            raw_inputs.append(base)
+        for j, dep in enumerate(s.co_dependent_skills or []):
+            d = (dep or "").strip()
+            if d:
+                skill_slots.append(("co", i, j))
+                raw_inputs.append(d)
+
+    # Experience/project tech stack.
+    if br.experience_detail:
+        for j, t in enumerate(br.experience_detail.tech_stack or []):
+            tt = (t or "").strip()
+            if tt:
+                skill_slots.append(("exp_tech", -1, j))
+                raw_inputs.append(tt)
+    if br.project_detail:
+        for j, t in enumerate(br.project_detail.tech_stack or []):
+            tt = (t or "").strip()
+            if tt:
+                skill_slots.append(("proj_tech", -1, j))
+                raw_inputs.append(tt)
+
+    if not raw_inputs:
+        return br
+
+    try:
+        normalized = await normalize_skills(raw_inputs)
+    except Exception as e:
+        logger.warning("Skill normalization failed for %s: %s", br.block_name, e)
+        return br
+
+    if len(normalized) != len(skill_slots):
+        logger.warning(
+            "Skill normalization size mismatch for %s: in=%d out=%d",
+            br.block_name,
+            len(skill_slots),
+            len(normalized),
+        )
+        return br
+
+    method_counts: dict[str, int] = {}
+    for ns in normalized:
+        method_counts[ns.method] = method_counts.get(ns.method, 0) + 1
+    logger.info(
+        "Normalizer [%s]: in=%d dict=%d fuzzy=%d llm=%d unmatched=%d",
+        br.block_name,
+        len(raw_inputs),
+        method_counts.get("dictionary", 0),
+        method_counts.get("fuzzy", 0),
+        method_counts.get("llm", 0),
+        method_counts.get("unmatched", 0),
+    )
+
+    for (kind, i, j), ns in zip(skill_slots, normalized):
+        norm = (ns.normalized or "").strip()
+        if not norm:
+            continue
+        if kind == "skill":
+            br.skills[i].skill = norm
+        elif kind == "co" and j is not None:
+            br.skills[i].co_dependent_skills[j] = norm
+        elif kind == "exp_tech" and br.experience_detail and j is not None:
+            br.experience_detail.tech_stack[j] = norm
+        elif kind == "proj_tech" and br.project_detail and j is not None:
+            br.project_detail.tech_stack[j] = norm
+    return br
+
+
+async def tag_all_blocks(
+    blocks: list[ResumeBlock],
+    *,
+    normalize_skills_per_block: bool = False,
+) -> list[BlockTagResult]:
+    """Process blocks in parallel; optionally normalize each result as it finishes."""
     client = _get_client()
 
-    if client is None:
-        logger.warning("No Azure OpenAI key – using fallback extraction")
-        return [_fallback_extract(b) for b in blocks]
-
     sem = asyncio.Semaphore(_BLOCK_TAGGER_CONCURRENCY)
+    norm_sem = asyncio.Semaphore(_SKILL_NORMALIZER_CONCURRENCY)
 
     async def _guarded_tag(block: ResumeBlock) -> BlockTagResult:
         async with sem:
             return await _tag_single_block(client, block)
 
-    tasks: list = []
-    task_indices: list[int] = []
+    async def _guarded_norm(br: BlockTagResult) -> BlockTagResult:
+        async with norm_sem:
+            return await _normalize_block_result_skills(br)
+
+    if client is None:
+        logger.warning("No Azure OpenAI key – using fallback extraction")
+        out = [_fallback_extract(b) for b in blocks]
+        if normalize_skills_per_block:
+            norm_candidates = [x for x in out if _should_normalize_block_type(x.block_type)]
+            normd = await asyncio.gather(
+                *(_guarded_norm(x) for x in norm_candidates),
+                return_exceptions=True,
+            )
+            for nr in normd:
+                if isinstance(nr, Exception):
+                    logger.warning("Fallback block normalization failed: %s", nr)
+        return out
+
+    async def _tag_with_index(idx: int, block: ResumeBlock) -> tuple[int, BlockTagResult]:
+        try:
+            res = await _guarded_tag(block)
+        except Exception as e:
+            logger.error("Block [%s] raised: %s", block.block_name, e)
+            res = _fallback_extract(block)
+        return idx, res
+
+    tagging_tasks: list[asyncio.Task] = []
+    norm_tasks: list[asyncio.Task] = []
     results: list[BlockTagResult] = [
         BlockTagResult(block_name=b.block_name, block_type=b.block_type, raw_text=b.raw_text)
         for b in blocks
@@ -261,20 +377,24 @@ async def tag_all_blocks(blocks: list[ResumeBlock]) -> list[BlockTagResult]:
         if block.block_type == "skills_dump":
             # Deterministic – no LLM needed
             results[i] = _parse_skills_dump(block)
+            if normalize_skills_per_block and _should_normalize_block_type(results[i].block_type):
+                norm_tasks.append(asyncio.create_task(_guarded_norm(results[i])))
             continue
         # All other types → LLM call
-        tasks.append(_guarded_tag(block))
-        task_indices.append(i)
+        tagging_tasks.append(asyncio.create_task(_tag_with_index(i, block)))
 
-    if tasks:
-        llm_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for idx, res in zip(task_indices, llm_results):
-            if isinstance(res, Exception):
-                logger.error("Block [%s] raised: %s",
-                             blocks[idx].block_name, res)
-                results[idx] = _fallback_extract(blocks[idx])
-            else:
-                results[idx] = res
+    if tagging_tasks:
+        for fut in asyncio.as_completed(tagging_tasks):
+            idx, res = await fut
+            results[idx] = res
+            if normalize_skills_per_block and _should_normalize_block_type(res.block_type):
+                norm_tasks.append(asyncio.create_task(_guarded_norm(results[idx])))
+
+    if normalize_skills_per_block and norm_tasks:
+        norm_results = await asyncio.gather(*norm_tasks, return_exceptions=True)
+        for nr in norm_results:
+            if isinstance(nr, Exception):
+                logger.warning("Per-block skill normalization task failed: %s", nr)
 
     return results
 
