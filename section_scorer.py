@@ -59,6 +59,7 @@ SCORING RULES:
 4. Do NOT penalize heavily for missing specific vendor tools if the candidate has equivalent experience with competing tools.
 5. DO penalize if the candidate's career direction is fundamentally different (e.g., frontend dev for data architect role).
 6. Treat JD year ranges correctly: `min_years` is the hard threshold; `max_years` is an upper preference and NOT a disqualifier.
+7. IMPORTANT: Carefully check "Tech Stack Highlights" — if a technology (Docker, Kubernetes, Python, Java, etc.) appears there, the candidate HAS that skill. Do NOT list it as a gap.
 
 Return ONLY a JSON object:
 {{
@@ -90,6 +91,7 @@ SCORING RULES:
 5. Leadership and architecture experience are valuable for senior roles.
 6. Consider career progression — growing responsibility signals are positive.
 7. For JD year ranges, evaluate against `min_years` as threshold. Do not penalize candidates for exceeding `max_years`.
+8. IMPORTANT: Check the "Tech" line for each entry carefully — if a technology appears in an entry's tech stack, it is CONFIRMED usage. Do NOT say the candidate is missing that technology.
 
 For each experience entry, return a match assessment.
 Return ONLY a JSON object:
@@ -129,6 +131,8 @@ SCORING RULES:
 4. For vendor-specific tools (Informatica IICS, Snowflake), check if candidate has equivalent open-source/competing tools.
 5. If resume evidence mentions XML transformation, treat XSLT as at least transferable unless explicitly contradicted.
 6. If resume evidence shows CI/CD, GitHub, or branch workflows, treat Git as transferable (not hard gap).
+7. IMPORTANT: Check ALL data sources provided — "Skills demonstrated", "Tech used in work experience/projects", "Categorized", "Raw text tech mentions". If a technology appears in ANY of these sections, the candidate HAS that skill — do NOT mark it as a gap.
+8. If a technology (e.g., Docker, Kubernetes, Python, Java) appears in "Tech used in work experience/projects", it is CONFIRMED experience — score it as "exact" (90-100).
 
 Return ONLY a JSON object:
 {{
@@ -277,8 +281,14 @@ def _safe_json_parse(text: str) -> dict | None:
 
 
 def _build_experience_text(resume: ResumeTaggingResponse) -> str:
-    """Build formatted experience entries for prompt."""
+    """Build formatted experience entries for prompt.
+
+    When structured extraction is thin (few experience entries, empty tech
+    stacks), compensate by including project blocks that look like work
+    experience and the professional-experience portion of parsed_text.
+    """
     entries = []
+    exp_companies: set[str] = set()
     for exp in resume.context_meta_tags.experience_tags.experience_timeline:
         parts = [f"- {exp.company} | {exp.role} | {exp.duration}"]
         if exp.is_current:
@@ -291,11 +301,95 @@ def _build_experience_text(resume: ResumeTaggingResponse) -> str:
         if exp.quantifiers:
             parts.append(f"  Metrics: {', '.join(exp.quantifiers[:3])}")
         entries.append("\n".join(parts))
+        if exp.company:
+            exp_companies.add(exp.company.lower().strip())
+
+    # Include project blocks that likely represent work experience
+    # (misclassified by the block zoner). These have company/role data
+    # in their description but ended up as "projects".
+    for proj in resume.context_meta_tags.project_tags.projects:
+        pname = (proj.project_name or "").lower()
+        # Skip genuine non-work entries
+        if pname in {"education", "certifications", "awards", "accolades"}:
+            continue
+        parts = [f"- (Project/Role) {proj.project_name}"]
+        if proj.description:
+            parts.append(f"  Description: {proj.description[:300]}")
+        if proj.tech_stack:
+            parts.append(f"  Tech: {', '.join(proj.tech_stack)}")
+        if proj.key_highlights:
+            for h in proj.key_highlights[:3]:
+                parts.append(f"  • {h}")
+        entries.append("\n".join(parts))
+
+    # When structured extraction is thin, include raw resume text so the LLM
+    # can analyse actual work descriptions.
+    structured_has_tech = any(
+        exp.tech_stack
+        for exp in resume.context_meta_tags.experience_tags.experience_timeline
+    )
+    exp_count = len(
+        resume.context_meta_tags.experience_tags.experience_timeline)
+    if (exp_count <= 2 or not structured_has_tech) and resume.parsed_text:
+        # Extract PROFESSIONAL EXPERIENCE section if possible
+        raw = resume.parsed_text
+        excerpt = _extract_experience_section(raw)
+        if excerpt:
+            entries.append(
+                f"\n--- Additional context from resume text ---\n{excerpt}"
+            )
+
     return "\n\n".join(entries) if entries else "No experience entries found."
 
 
-def _build_skills_text(resume: ResumeTaggingResponse) -> str:
-    """Build formatted candidate skills with context for prompt."""
+def _extract_experience_section(raw_text: str, max_chars: int = 2500) -> str:
+    """Extract the professional experience portion from raw resume text."""
+    text = raw_text
+    # Try to find the experience section start
+    exp_headers = [
+        "PROFESSIONAL EXPERIENCE", "WORK EXPERIENCE", "EXPERIENCE",
+        "EMPLOYMENT HISTORY", "CAREER HISTORY",
+    ]
+    start = -1
+    for header in exp_headers:
+        idx = text.upper().find(header)
+        if idx >= 0:
+            start = idx
+            break
+    if start < 0:
+        # No header found; use everything after the first 300 chars
+        # (skipping header/summary)
+        start = min(300, len(text) // 4)
+
+    # Try to find where experience ends (education/certifications)
+    end_headers = [
+        "EDUCATION", "CERTIFICATIONS", "PROFESSIONAL ACCOLADES",
+        "AWARDS", "PUBLICATIONS",
+    ]
+    end = len(text)
+    for header in end_headers:
+        idx = text.upper().find(header, start + 20)
+        if idx >= 0 and idx < end:
+            end = idx
+
+    excerpt = text[start:end].strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars] + "..."
+    return excerpt
+
+
+def _build_skills_text(
+    resume: ResumeTaggingResponse,
+    jd: JDProfile | None = None,
+) -> str:
+    """Build formatted candidate skills with context for prompt.
+
+    When *jd* is provided, the JD's required tech keywords are added to
+    the raw-text search so we dynamically surface relevant mentions.
+    When structured extraction is thin (no contextual skills, empty tech
+    stacks), a truncated resume text excerpt is appended to give the LLM
+    real evidence to work with.
+    """
     lines = []
     sc = resume.context_meta_tags.skill_categories
 
@@ -322,6 +416,21 @@ def _build_skills_text(resume: ResumeTaggingResponse) -> str:
     if listed:
         lines.append(f"\nSkills listed: {', '.join(listed[:30])}")
 
+    # ── Tech stack from experience & project entries ────────────────────
+    exp_tech: list[str] = []
+    for exp in resume.context_meta_tags.experience_tags.experience_timeline:
+        for t in exp.tech_stack:
+            if t not in exp_tech:
+                exp_tech.append(t)
+    for proj in resume.context_meta_tags.project_tags.projects:
+        for t in proj.tech_stack:
+            if t not in exp_tech:
+                exp_tech.append(t)
+    if exp_tech:
+        lines.append(
+            f"\nTech used in work experience/projects: {', '.join(exp_tech[:40])}"
+        )
+
     # Categorized skills
     cats = []
     if sc.languages:
@@ -342,22 +451,42 @@ def _build_skills_text(resume: ResumeTaggingResponse) -> str:
         lines.extend(f"  {c}" for c in cats)
 
     # Raw-text fallback: surface explicit tech mentions even when structured
-    # extraction is incomplete.
+    # extraction is incomplete.  Also dynamically add JD required tech
+    # keywords so we catch matches the static list might miss.
     raw = (resume.parsed_text or "").lower()
     if raw:
-        keyword_list = [
+        keyword_set: set[str] = {
             "python", "java", "docker", "docker compose", "kubernetes",
             "knowledge graph", "rdf", "sparql", "xslt", "embedding",
             "embeddings", "vector", "azure storage", "git",
-        ]
+            "spark", "kafka", "airflow", "hive", "bigquery",
+            "databricks", "snowflake", "dbt", "redshift",
+        }
+        # Also search for JD-specific tech keywords
+        if jd and jd.required_tech_normalized:
+            for tech in jd.required_tech_normalized:
+                keyword_set.add(tech.lower().strip())
+
         raw_hits: list[str] = []
-        for kw in keyword_list:
+        for kw in sorted(keyword_set):
             pattern = r"\b" + re.escape(kw) + r"\b"
             if re.search(pattern, raw):
                 raw_hits.append(kw)
         if raw_hits:
             lines.append(
                 "\nRaw text tech mentions: " + ", ".join(sorted(set(raw_hits)))
+            )
+
+    # When structured extraction is thin, include a resume text excerpt
+    # so the LLM has real evidence to work with.
+    has_structured_tech = bool(exp_tech) or bool(contextual)
+    if not has_structured_tech and resume.parsed_text:
+        excerpt = _extract_experience_section(
+            resume.parsed_text, max_chars=2000)
+        if excerpt:
+            lines.append(
+                "\n--- Resume work-experience text (for additional evidence) ---"
+                f"\n{excerpt}"
             )
 
     return "\n".join(lines) if lines else "No skills found."
@@ -487,7 +616,28 @@ async def score_role_fit(
     for entry in resume.global_skill_index:
         if entry.skill:
             tech_highlights.append(entry.skill)
-    tech_highlights = list(dict.fromkeys(tech_highlights))[:40]
+
+    # When structured tech_stack extraction is thin, mine parsed_text
+    # for common data-engineering terms so the LLM sees real tech evidence.
+    has_structured_tech = any(
+        exp.tech_stack
+        for exp in exp_tags.experience_timeline
+    )
+    if not has_structured_tech and resume.parsed_text:
+        raw = resume.parsed_text.lower()
+        _raw_tech_keywords = [
+            "python", "java", "docker", "kubernetes", "spark", "kafka",
+            "airflow", "hive", "bigquery", "databricks", "snowflake",
+            "dbt", "redshift", "git", "azure", "aws", "gcp",
+            "xslt", "sparql", "rdf", "embedding", "vector",
+            "oracle", "presto", "flink", "oozie", "informatica",
+        ]
+        for kw in _raw_tech_keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", raw):
+                tech_highlights.append(
+                    kw.title() if len(kw) > 3 else kw.upper())
+
+    tech_highlights = list(dict.fromkeys(tech_highlights))[:50]
 
     caps_text = "; ".join(
         c.normalized_entity for c in jd.core_capabilities[:8])
@@ -600,7 +750,7 @@ async def score_skills_section(
 
     prompt = _SKILLS_PROMPT.format(
         jd_skills=_jd_skills_text(jd),
-        candidate_skills=_build_skills_text(resume),
+        candidate_skills=_build_skills_text(resume, jd=jd),
     )
 
     try:
