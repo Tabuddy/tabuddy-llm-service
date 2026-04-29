@@ -210,7 +210,7 @@ class SkillMatcher:
                 dbname=self.config.pg_database,
                 user=self.config.pg_user,
                 password=self.config.pg_password,
-                sslmode="require",
+                sslmode=os.getenv("DB_SSLMODE", "require"),
                 connect_timeout=30,
             )
         return self._pg_pool
@@ -244,10 +244,11 @@ class SkillMatcher:
                            cs.id::text,
                            cs.display_name,
                            cs.slug,
-                           cs.category::text
+                           c.display_name AS category
                     FROM unnest(%s::text[]) AS input_skill
                     JOIN dev.skill_aliases sa ON sa.alias_lower = lower(input_skill)
                     JOIN dev.canonical_skills cs ON cs.id = sa.skill_id
+                    LEFT JOIN dev.categories c ON c.id = cs.category_id
                 """, (skills,))
                 for input_lower, cid, display_name, slug, category in cur.fetchall():
                     results[input_lower] = SkillMatch(
@@ -276,7 +277,7 @@ class SkillMatcher:
                                    cs.id::text,
                                    cs.display_name,
                                    cs.slug,
-                                   cs.category::text,
+                                   c.display_name AS category,
                                    best.sim
                             FROM unnest(%s::text[]) AS q(skill)
                             CROSS JOIN LATERAL (
@@ -289,6 +290,7 @@ class SkillMatcher:
                                 LIMIT 1
                             ) AS best
                             JOIN dev.canonical_skills cs ON cs.id = best.skill_id
+                            LEFT JOIN dev.categories c ON c.id = cs.category_id
                         """, (skills, self.config.fuzzy_threshold))
                         for skill, cid, display_name, slug, category, sim in cur.fetchall():
                             results[skill.lower()] = SkillMatch(
@@ -318,9 +320,10 @@ class SkillMatcher:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT sa.alias_lower, sa.skill_id::text,
-                       cs.display_name, cs.slug, cs.category::text
+                       cs.display_name, cs.slug, c.display_name AS category
                 FROM dev.skill_aliases sa
                 JOIN dev.canonical_skills cs ON cs.id = sa.skill_id
+                LEFT JOIN dev.categories c ON c.id = cs.category_id
             """)
             all_aliases = cur.fetchall()
         results: dict[str, SkillMatch] = {}
@@ -423,20 +426,21 @@ class SkillMatcher:
 
 
 
-jd = """
-Job Title: Sr. Java Backend Developer
+if __name__ == "__main__":
+    jd = """
+    Job Title: Sr. Java Backend Developer
 
-Requirements:
-- Java 8, 17 and Spring Boot
-- RestAPI, XML and JSON
-- Maven, Gitlab, Jenkins, Kubernetes
-- JUnit, Mockito
-- Oracle, PLSQL
-- Docker, Agile and Scrum
-- Experience with amazon web service is a plus
-- Familiarity with angularx or ReactJS for frontend collaboration
-- Good understanding of k8s deployments
-"""
+    Requirements:
+    - Java 8, 17 and Spring Boot
+    - RestAPI, XML and JSON
+    - Maven, Gitlab, Jenkins, Kubernetes
+    - JUnit, Mockito
+    - Oracle, PLSQL
+    - Docker, Agile and Scrum
+    - Experience with amazon web service is a plus
+    - Familiarity with angularx or ReactJS for frontend collaboration
+    - Good understanding of k8s deployments
+    """
 
-result = process_jd(jd)
-print(json.dumps(result, indent=2))
+    result = process_jd(jd)
+    print(json.dumps(result, indent=2))
