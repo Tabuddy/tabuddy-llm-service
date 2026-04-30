@@ -217,6 +217,14 @@ class AliasInfo(BaseModel):
     is_primary: bool | None = None
 
 
+class NewSkillMeta(BaseModel):
+    """LLM-inferred metadata for a skill not yet in the canonical library."""
+    category: str | None = None
+    sub_category: str | None = None
+    skill_nature: str | None = None
+    typical_lifespan: str | None = None
+
+
 class SkillDetail(BaseModel):
     """One entry per skill in final_skills.
 
@@ -236,6 +244,7 @@ class SkillDetail(BaseModel):
     new_alias_persisted: bool = False
     new_alias_text: str | None = None
     dimensions: list[DimensionDetail] = Field(default_factory=list)
+    new_skill_meta: NewSkillMeta | None = None
 
 
 class ChosenRole(BaseModel):
@@ -282,6 +291,7 @@ class PersistenceItem(BaseModel):
 class PersistenceReport(BaseModel):
     skill_dimension_saved: int = 0
     role_dimension_saved: int = 0
+    new_skills_created: int = 0
     skipped: int = 0
     items: list[PersistenceItem] = Field(default_factory=list)
 
@@ -653,9 +663,10 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
     # ── Stage 3: reverse planner for unmatched llm_skills ───────────────────
     # Pass the existing dimension catalogue so the LLM reuses canonical slugs
-    # instead of minting near-synonyms.
+    # instead of minting near-synonyms. Run skill enrichment concurrently.
     dimension_catalogue: list[dict] = []
     dimensions_by_skill: dict[str, list[dict]] = {}
+    skill_enrichment: dict[str, dict] = {}
 
     if unmatched_llm_skills:
         try:
@@ -668,16 +679,25 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 exc,
             )
             dimension_catalogue = []
-        try:
-            dimensions_by_skill = await planner.infer_dimensions(
+
+        dims_result, enrich_result = await asyncio.gather(
+            planner.infer_dimensions(
                 unmatched_llm_skills,
                 dimension_catalogue=dimension_catalogue,
-            )
-        except Exception as exc:
+            ),
+            planner.enrich_new_skills(unmatched_llm_skills),
+            return_exceptions=True,
+        )
+        if isinstance(dims_result, Exception):
             raise HTTPException(
                 status_code=502,
-                detail=f"Reverse planner LLM (infer_dimensions) failed: {exc}",
-            ) from exc
+                detail=f"Reverse planner LLM (infer_dimensions) failed: {dims_result}",
+            ) from dims_result
+        dimensions_by_skill = dims_result
+        if isinstance(enrich_result, Exception):
+            logger.warning("enrich_new_skills failed: %s", enrich_result)
+        else:
+            skill_enrichment = enrich_result
 
     # Collect every (skill, llm_dim) pair for DB lookup and possible LLM role.
     llm_pairs: list[tuple[str, dict]] = []
@@ -941,6 +961,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             continue
 
         if was_llm:
+            enrich = skill_enrichment.get(term)
             skills_detail.append(SkillDetail(
                 input_skill=term,
                 source_tag="llm",
@@ -951,6 +972,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 new_alias_persisted=False,
                 new_alias_text=None,
                 dimensions=llm_dim_details_by_skill.get(term, []),
+                new_skill_meta=NewSkillMeta(**enrich) if enrich else None,
             ))
         else:
             # initial_skills term that didn't canonicalize — surface it but
@@ -1180,6 +1202,47 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         src = final_skill_by_lower.get(k)
         if src and rec.get("skill_id") is not None:
             skill_id_by_input[src] = int(rec["skill_id"])
+
+    # 3.5) Create canonical_skills rows for new LLM-discovered skills that carry
+    # enrichment metadata (category, skill_nature, typical_lifespan from API 2).
+    new_skill_metas = {
+        sd.input_skill: sd.new_skill_meta
+        for sd in req.skills_detail
+        if sd.source_tag == "llm"
+        and sd.new_skill_meta is not None
+        and sd.input_skill not in skill_id_by_input
+    }
+    for skill_name, meta in new_skill_metas.items():
+        if not meta.category or not meta.skill_nature or not meta.typical_lifespan:
+            logger.warning(
+                "Skipping new skill %r — incomplete enrichment metadata", skill_name
+            )
+            continue
+        try:
+            cat_row = await asyncio.to_thread(
+                repo.find_or_create_category,
+                display_name=meta.category,
+            )
+            cat_id = int(cat_row["id"])
+            sub_cat_id: int | None = None
+            if meta.sub_category:
+                sub_cat_row = await asyncio.to_thread(
+                    repo.find_or_create_category,
+                    display_name=meta.sub_category,
+                )
+                sub_cat_id = int(sub_cat_row["id"])
+            skill_row = await asyncio.to_thread(
+                repo.create_canonical_skill,
+                display_name=skill_name,
+                category_id=cat_id,
+                sub_category_id=sub_cat_id,
+                skill_nature=meta.skill_nature,
+                typical_lifespan=meta.typical_lifespan,
+            )
+            skill_id_by_input[skill_name] = int(skill_row["id"])
+            persistence.new_skills_created += 1
+        except Exception as exc:
+            logger.warning("Failed to create canonical skill %r: %s", skill_name, exc)
 
     # 4) Persist per (skill, dimension):
     # - always attempt skill-dimension for DB-backed skills

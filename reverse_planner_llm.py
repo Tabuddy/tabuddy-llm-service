@@ -104,6 +104,52 @@ Rules:
 - No extra keys. No markdown. No commentary.
 """
 
+_SKILL_ENRICH_SYSTEM_PROMPT = """\
+You are a technical skill metadata classifier for a professional skill library.
+For each input skill, return its canonical metadata.
+
+VALID VALUES
+- skill_nature : TOOL | CONCEPT | PRACTICE | PLATFORM | LANGUAGE | CREDENTIAL
+- typical_lifespan : EVERGREEN | MULTI_YEAR | SHORT_LIVED
+
+GUIDELINES
+- TOOL       : Software tools, frameworks, libraries, databases (Kafka, Redis, Pytest)
+- CONCEPT    : Architectural concepts, paradigms (Microservices, REST, SOLID)
+- PRACTICE   : Methodologies, processes (Agile, TDD, Code Review)
+- PLATFORM   : Full platforms / cloud services (AWS, GCP, Azure)
+- LANGUAGE   : Programming / query / markup languages (Python, SQL, YAML)
+- CREDENTIAL : Certifications and licences (AWS Solutions Architect Cert)
+
+- EVERGREEN  : Foundational, unlikely to become obsolete (Python, SQL, REST)
+- MULTI_YEAR : Stable for years, may eventually be superseded (Kubernetes, React)
+- SHORT_LIVED: Rapidly evolving or niche, high obsolescence risk
+
+- category    : Concise technical label, e.g.:
+  "Programming Languages", "Web Frameworks", "DevOps Tools", "Cloud Platforms",
+  "Databases", "Testing Tools", "Monitoring Tools", "Container Orchestration",
+  "Message Brokers", "Security Tools", "Data Engineering Tools",
+  "Machine Learning Frameworks", "Infrastructure Tools", "Soft Skills"
+- sub_category: Optional finer grouping within the category, or null.
+
+OUTPUT SCHEMA (strict JSON, no markdown fences):
+{
+  "skills": [
+    {
+      "skill": "<original skill name, exactly as provided>",
+      "category": "<category label>",
+      "sub_category": "<sub-category label or null>",
+      "skill_nature": "<one of the valid values>",
+      "typical_lifespan": "<one of the valid values>"
+    }
+  ]
+}
+
+Rules:
+- skill_nature MUST be exactly one of: TOOL, CONCEPT, PRACTICE, PLATFORM, LANGUAGE, CREDENTIAL
+- typical_lifespan MUST be exactly one of: EVERGREEN, MULTI_YEAR, SHORT_LIVED
+- No extra keys. No markdown. No commentary outside the JSON object.
+"""
+
 _PICK_ROLE_SYSTEM_PROMPT = """\
 You pick the SINGLE most appropriate role for a job description given the
 evidence collected by an upstream skill-extraction pipeline.
@@ -430,6 +476,57 @@ class AzureReversePlannerLLM:
             max_completion_tokens=600,
         )
         return self._normalize_role(parsed)
+
+    async def enrich_new_skills(
+        self,
+        skills: list[str],
+    ) -> dict[str, dict[str, str | None]]:
+        """Return {skill -> {category, sub_category, skill_nature, typical_lifespan}}."""
+        if not skills:
+            return {}
+
+        _valid_natures = {"TOOL", "CONCEPT", "PRACTICE", "PLATFORM", "LANGUAGE", "CREDENTIAL"}
+        _valid_lifespans = {"EVERGREEN", "MULTI_YEAR", "SHORT_LIVED"}
+
+        payload = json.dumps({"skills": skills}, ensure_ascii=False)
+        parsed = await self._call(
+            _SKILL_ENRICH_SYSTEM_PROMPT,
+            payload,
+            max_completion_tokens=1200,
+        )
+
+        items = parsed.get("skills") or []
+        if not isinstance(items, list):
+            return {}
+
+        out: dict[str, dict[str, str | None]] = {}
+        skill_lookup = {s.lower(): s for s in skills}
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            raw_skill = (entry.get("skill") or "").strip()
+            if not raw_skill:
+                continue
+            original = skill_lookup.get(raw_skill.lower(), raw_skill)
+
+            nature = (entry.get("skill_nature") or "").strip().upper()
+            if nature not in _valid_natures:
+                nature = "TOOL"
+
+            lifespan = (entry.get("typical_lifespan") or "").strip().upper()
+            if lifespan not in _valid_lifespans:
+                lifespan = "MULTI_YEAR"
+
+            category = (entry.get("category") or "").strip() or None
+            sub_cat = (entry.get("sub_category") or "").strip() or None
+
+            out[original] = {
+                "category": category,
+                "sub_category": sub_cat,
+                "skill_nature": nature,
+                "typical_lifespan": lifespan,
+            }
+        return out
 
     async def pick_role(
         self,

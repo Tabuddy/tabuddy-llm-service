@@ -25,6 +25,20 @@ def _to_lower_unique(values: Iterable[str]) -> list[str]:
     return out
 
 
+def _slugify(text: str) -> str:
+    out: list[str] = []
+    last_dash = False
+    for ch in (text or "").strip().lower():
+        if ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif ch in (" ", "-", "_", "/", ".", ","):
+            if not last_dash and out:
+                out.append("-")
+                last_dash = True
+    return "".join(out).strip("-") or "unknown"
+
+
 def _normalize_entity_source(source: str | None) -> str:
     """Map app-side source tags to DB enum values."""
     s = (source or "").strip().lower()
@@ -489,3 +503,94 @@ class SkillLibraryRepository:
                 inserted = cur.fetchone() is not None
             conn.commit()
         return inserted
+
+    # ── New-skill creation ───────────────────────────────────────────────────
+    def find_or_create_category(self, *, display_name: str) -> dict:
+        """Return existing category row by display_name (case-insensitive) or
+        create and return a new one."""
+        name_lc = display_name.strip().lower()
+        if not name_lc:
+            raise ValueError("category display_name cannot be empty")
+
+        slug = _slugify(display_name)
+        sql_find = f"""
+            SELECT id, slug, display_name
+            FROM {self.schema}.categories
+            WHERE lower(display_name) = %s OR slug = %s
+            LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_find, (name_lc, slug))
+                row = cur.fetchone()
+                if row:
+                    return dict(zip([c[0] for c in cur.description], row))
+
+        sql_insert = f"""
+            INSERT INTO {self.schema}.categories (slug, display_name)
+            VALUES (%s, %s)
+            RETURNING id, slug, display_name
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_insert, (slug, display_name.strip()))
+                row = cur.fetchone()
+                cols = [c[0] for c in cur.description]
+            conn.commit()
+        return dict(zip(cols, row))
+
+    def create_canonical_skill(
+        self,
+        *,
+        display_name: str,
+        category_id: int,
+        sub_category_id: int | None = None,
+        skill_nature: str = "TOOL",
+        typical_lifespan: str = "MULTI_YEAR",
+        source: str = "llm",
+    ) -> dict:
+        """Find or create a canonical skill. Returns the row (id, slug, display_name, ...)."""
+        name_lc = display_name.strip().lower()
+        slug = _slugify(display_name)
+
+        sql_find = f"""
+            SELECT id, slug, display_name, category_id, sub_category_id,
+                   skill_nature::text, typical_lifespan::text
+            FROM {self.schema}.canonical_skills
+            WHERE lower(slug) = %s OR lower(display_name) = %s
+            LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_find, (slug, name_lc))
+                row = cur.fetchone()
+                if row:
+                    return dict(zip([c[0] for c in cur.description], row))
+
+        sql_insert = f"""
+            INSERT INTO {self.schema}.canonical_skills
+                (slug, display_name, category_id, sub_category_id,
+                 skill_nature, typical_lifespan, source, confidence)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, slug, display_name, category_id, sub_category_id,
+                      skill_nature::text, typical_lifespan::text
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql_insert,
+                    (
+                        slug,
+                        display_name.strip(),
+                        int(category_id),
+                        int(sub_category_id) if sub_category_id is not None else None,
+                        skill_nature,
+                        typical_lifespan,
+                        _normalize_entity_source(source),
+                        0.7,
+                    ),
+                )
+                row = cur.fetchone()
+                cols = [c[0] for c in cur.description]
+            conn.commit()
+        return dict(zip(cols, row))
