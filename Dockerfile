@@ -34,8 +34,10 @@ COPY . .
 # Install the project itself
 RUN uv sync --frozen
 
-# Download spacy model
-RUN uv pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+# Download spaCy models used by different pipelines.
+RUN uv pip install \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl
 
 EXPOSE 8000
 

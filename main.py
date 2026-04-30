@@ -145,6 +145,15 @@ class JDSkillPipelineRequest(BaseModel):
     jd_text: str = Field(..., min_length=1)
 
 
+class JdRoleHint(BaseModel):
+    """Umbrella role from API 1 (same LLM call as word classifier); soft prior for API 2."""
+
+    display_name: str
+    slug: str = ""
+    role_archetype: str | None = None
+    rationale: str | None = None
+
+
 class JDSkillPipelineResponse(BaseModel):
     initial_skills: list[str]
     unknown_words: list[str]
@@ -153,12 +162,14 @@ class JDSkillPipelineResponse(BaseModel):
     llm_non_skills: list[str]
     final_skills: list[str]
     final_non_skills: list[str]
+    jd_role_hint: JdRoleHint | None = None
 
 
 # ── Skill Detail / Reverse Planner models ────────────────────────────────────
 class ExtractDetailsRequest(BaseModel):
     final_skills: list[str] = Field(default_factory=list)
     llm_skills: list[str] = Field(default_factory=list)
+    jd_role_hint: JdRoleHint | None = None
 
 
 class CanonicalSkillSummary(BaseModel):
@@ -441,10 +452,13 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
     llm_skills: list[str] = []
     llm_non_skills: list[str] = []
+    jd_role_hint: JdRoleHint | None = None
     if filtered_unknown_words:
         classifier = AzureUnknownWordClassifier()
         try:
-            llm_result = await classifier.classify_words(filtered_unknown_words)
+            llm_result = await classifier.classify_words(
+                filtered_unknown_words, jd_text=jd_text
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=502,
@@ -453,6 +467,19 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
         llm_skills = _clean_strings(llm_result.get("skills"))
         llm_non_skills = _clean_strings(llm_result.get("non_skills"))
+
+        hint_raw = llm_result.get("jd_role_hint")
+        if isinstance(hint_raw, dict) and (hint_raw.get("display_name") or "").strip():
+            _arc = hint_raw.get("role_archetype")
+            _rat = hint_raw.get("rationale")
+            _arc_s = str(_arc).strip() if _arc is not None else ""
+            _rat_s = str(_rat).strip() if _rat is not None else ""
+            jd_role_hint = JdRoleHint(
+                display_name=str(hint_raw["display_name"]).strip(),
+                slug=str(hint_raw.get("slug") or "").strip(),
+                role_archetype=_arc_s or None,
+                rationale=_rat_s or None,
+            )
 
         # Guardrail: deployments is an activity-domain skill for downstream
         # reverse-planning and should never be persisted as non-skill.
@@ -475,6 +502,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         llm_non_skills=llm_non_skills,
         final_skills=final_skills,
         final_non_skills=final_non_skills,
+        jd_role_hint=jd_role_hint,
     )
 
 
@@ -1051,6 +1079,18 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 "llm_role": llm_payload,
             })
 
+        jd_role_hint_ctx = None
+        if req.jd_role_hint is not None and (
+            req.jd_role_hint.display_name or ""
+        ).strip():
+            h = req.jd_role_hint
+            jd_role_hint_ctx = {
+                "display_name": h.display_name.strip(),
+                "slug": (h.slug or "").strip(),
+                "role_archetype": (h.role_archetype or "").strip() or None,
+                "rationale": (h.rationale or "").strip() or None,
+            }
+
         context = {
             "final_skills": final_skills,
             "matched_canonical_skills": [
@@ -1066,6 +1106,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 for dd in dimension_details
             ],
             "skill_dimension_role_map": skill_dimension_role_map,
+            "jd_role_hint": jd_role_hint_ctx,
         }
         try:
             picked = await planner.pick_role(cand_payload, context)

@@ -16,7 +16,10 @@ _AZURE_API_VERSION = "2024-12-01-preview"
 
 _SYSTEM_PROMPT = """\
 You are a strict, evidence-grounded skill classification engine for tokens
-extracted from job descriptions. You receive a JSON object with key "words".
+extracted from job descriptions. You receive a JSON object with key "words"
+(tokens to classify) and optionally key "jd_text" (job description excerpt for
+inferring an umbrella role only — never treat words inside jd_text as items to
+classify; classify ONLY the strings in "words").
 You must place EVERY input word into exactly one of two arrays: "skills" or
 "non_skills". Do not invent words. Do not split or merge words.
 
@@ -210,8 +213,18 @@ HARD OUTPUT REQUIREMENTS
   remove any word from "non_skills" that is also in "skills".
 - Preserve the ORIGINAL casing of each input word.
 - De-duplicate case-insensitively (keep the first occurrence).
-- STRICT JSON only. Allowed keys are exactly: "skills", "non_skills".
-- No prose, no markdown fences, no extra keys.
+- STRICT JSON only. Base keys are always: "skills", "non_skills".
+- When the user JSON includes non-empty "jd_text" (job description text for
+  context only — not a word to classify), you MUST also return key
+  "jd_role_hint" as an object with exactly:
+  {"display_name":"<single umbrella role e.g. DevOps Engineer>",
+   "slug":"<kebab-case of display_name>",
+   "role_archetype":"<one short sentence>",
+   "rationale":"<one short sentence tying choice to the JD title/responsibilities>"}.
+  Infer jd_role_hint from jd_text plus the overall skill mix implied by
+  your "skills" array; it is a hiring-manager role title, not a person name.
+- When "jd_text" is missing or empty, omit "jd_role_hint" entirely (do not
+  use null). No other extra top-level keys.
 
 ==============================================================
 FEW-SHOT EXAMPLES
@@ -241,9 +254,25 @@ Input:
 Output:
 {"skills":["HTML","HTMX","CSS","Sass","Tailwind CSS","Astro","Bun","Honeycomb","Pinecone"],"non_skills":["frontend","skills","Knowledge"]}
 
-Output schema (and ONLY this schema):
-{"skills":[...],"non_skills":[...]}
+Output schema:
+- Always: {"skills":[...],"non_skills":[...]}
+- Additionally, when jd_text is non-empty in the user payload:
+  {"skills":[...],"non_skills":[...],"jd_role_hint":{...}} as specified above.
 """
+
+
+def _slugify_display(text: str) -> str:
+    out: list[str] = []
+    last_dash = False
+    for ch in (text or "").strip().lower():
+        if ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif ch in (" ", "-", "_", "/", ".", ","):
+            if not last_dash and out:
+                out.append("-")
+                last_dash = True
+    return "".join(out).strip("-")
 
 
 def _sanitize_json(content: str) -> str:
@@ -288,7 +317,9 @@ class AzureUnknownWordClassifier:
         )
 
     @staticmethod
-    def _normalize(parsed: dict[str, Any]) -> dict[str, list[str]]:
+    def _normalize(
+        parsed: dict[str, Any], *, include_jd_role_hint: bool
+    ) -> dict[str, Any]:
         skills = parsed.get("skills")
         non_skills = parsed.get("non_skills")
         if not isinstance(skills, list) or not isinstance(non_skills, list):
@@ -324,13 +355,51 @@ class AzureUnknownWordClassifier:
             seen_non.add(key)
             out_non.append(value)
 
-        return {"skills": out_skills, "non_skills": out_non}
+        out: dict[str, Any] = {"skills": out_skills, "non_skills": out_non}
+        if include_jd_role_hint:
+            hint = parsed.get("jd_role_hint")
+            if isinstance(hint, dict):
+                dn = (str(hint.get("display_name") or "")).strip()
+                if dn:
+                    slug = (str(hint.get("slug") or "")).strip().lower()
+                    if not slug:
+                        slug = _slugify_display(dn) or "unknown"
+                    arc = hint.get("role_archetype")
+                    rat = hint.get("rationale")
+                    out["jd_role_hint"] = {
+                        "display_name": dn,
+                        "slug": slug,
+                        "role_archetype": (str(arc).strip() if arc is not None else ""),
+                        "rationale": (str(rat).strip() if rat is not None else ""),
+                    }
+        return out
 
-    async def classify_words(self, words: list[str]) -> dict[str, list[str]]:
+    async def classify_words(
+        self, words: list[str], *, jd_text: str | None = None
+    ) -> dict[str, Any]:
         if not words:
             return {"skills": [], "non_skills": []}
 
-        payload = json.dumps({"words": words}, ensure_ascii=False)
+        raw_jd = (jd_text or "").strip()
+        max_chars = 48_000
+        if len(raw_jd) > max_chars:
+            raw_jd = raw_jd[:max_chars]
+
+        body: dict[str, Any] = {"words": words}
+        if raw_jd:
+            body["jd_text"] = raw_jd
+        payload = json.dumps(body, ensure_ascii=False)
+        include_hint = bool(raw_jd)
+
+        retry_extra = ""
+        if include_hint:
+            retry_extra = (
+                " If the user JSON included non-empty jd_text, also return "
+                "top-level key 'jd_role_hint' as an object with display_name, "
+                "slug, role_archetype, rationale (see system prompt). "
+                "Still only skills and non_skills as the word buckets."
+            )
+
         first = await self.client.chat.completions.create(
             model=self.deployment,
             messages=[
@@ -338,12 +407,12 @@ class AzureUnknownWordClassifier:
                 {"role": "user", "content": payload},
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=1500,
+            max_completion_tokens=2000,
         )
 
         try:
             parsed = _parse_json_object(first.choices[0].message.content or "")
-            return self._normalize(parsed)
+            return self._normalize(parsed, include_jd_role_hint=include_hint)
         except Exception as first_exc:
             retry = await self.client.chat.completions.create(
                 model=self.deployment,
@@ -353,8 +422,8 @@ class AzureUnknownWordClassifier:
                     {
                         "role": "user",
                         "content": (
-                            "Return STRICT JSON with exactly two keys: "
-                            "'skills' and 'non_skills'. Every input word "
+                            "Return STRICT JSON with keys 'skills' and "
+                            "'non_skills' (required). Every input word "
                             "must appear in EXACTLY ONE array — never both. "
                             "If you placed any word in both, REMOVE it from "
                             "'non_skills' and keep it only in 'skills'. "
@@ -377,15 +446,16 @@ class AzureUnknownWordClassifier:
                             "testing, debugging, backup, recovery, "
                             "provisioning, development, observability, "
                             "balancing, load balancing."
+                            + retry_extra
                         ),
                     },
                 ],
                 response_format={"type": "json_object"},
-                max_completion_tokens=1500,
+                max_completion_tokens=2000,
             )
             try:
                 parsed = _parse_json_object(retry.choices[0].message.content or "")
-                return self._normalize(parsed)
+                return self._normalize(parsed, include_jd_role_hint=include_hint)
             except Exception as retry_exc:
                 raise ValueError(
                     "LLM classification failed in both attempts. "

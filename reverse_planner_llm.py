@@ -78,16 +78,38 @@ Rules:
 """
 
 _ROLE_SYSTEM_PROMPT = """\
-You infer the most likely engineering / professional role that owns a given
+You infer the most likely real-world engineering / professional role that owns a given
 (skill, dimension) pair. Output STRICT JSON only. No markdown fences.
 
-Use BOTH the skill token and the dimension's display name AND rationale.
-Library text often names the *competency* (e.g. IaC, CI/CD, observability)
-even when it was historically bucketed under another job family: prefer the
-role a hiring manager would use for that competency today (e.g. IaC /
-CloudFormation / Terraform-heavy work → DevOps Engineer or Platform Engineer —
-not only "Data Engineer" if the rationale clearly describes operations /
-provisioning / infra-as-code).
+Use the skill token, the dimension display name, and its rationale — but also
+infer how this skill is used in modern production systems.
+
+IMPORTANT:
+Many skills belong to multiple domains. Choose the role that would MOST LIKELY
+be responsible for implementing and owning this in a real company.
+
+Guidelines for disambiguation:
+- Backend-related signals (APIs, Node.js, authentication, databases, microservices)
+  → prefer "Backend Engineer"
+- Infrastructure-as-code, CI/CD, cloud provisioning, deployment, scalability
+  → prefer "DevOps Engineer" or "Platform Engineer"
+- If a skill is infra-related but used *within application development context*,
+  prefer Backend Engineer with cloud exposure (NOT pure DevOps)
+- Enterprise integrations (OAuth, SAP, Workday, OData)
+  → prefer Backend Engineer or Integration Engineer depending on context
+- Observability, reliability, SLAs/SLOs
+  → prefer Site Reliability Engineer (SRE)
+- Data pipelines, ETL, warehouses
+  → prefer Data Engineer
+
+Conflict resolution:
+- If both backend AND infrastructure signals exist, prefer:
+  → Backend Engineer (with cloud/devops exposure)
+  UNLESS the skill is purely infra (e.g. Terraform, Kubernetes provisioning)
+
+- Do NOT over-classify everything as DevOps just because cloud tools are present.
+
+Prefer roles that match how hiring managers actually title jobs today.
 
 Schema:
 {
@@ -98,9 +120,10 @@ Schema:
 }
 
 Rules:
-- Use canonical role names (e.g. "DevOps Engineer", "Site Reliability Engineer",
-  "Backend Engineer", "Data Engineer", "Frontend Engineer").
-- slug is lower-kebab-case of display_name.
+- Use canonical role names (e.g. "Backend Engineer", "DevOps Engineer",
+  "Site Reliability Engineer", "Platform Engineer", "Data Engineer").
+- slug must be lower-kebab-case of display_name.
+- Be decisive: output ONE best-fit role.
 - No extra keys. No markdown. No commentary.
 """
 
@@ -169,6 +192,11 @@ INPUTS (user payload)
   the library.
 - context.dimensions: flat list of every dimension that came out of the
   pipeline.
+- context.jd_role_hint: OPTIONAL object from API 1 reading the same JD text:
+  {display_name, slug, role_archetype, rationale}. It is a weak prior — when
+  evidence in skill_dimension_role_map is ambiguous or tied between DB
+  candidates, lean toward agreeing with jd_role_hint. If the map strongly
+  contradicts jd_role_hint, follow the map and candidates instead.
 - context.skill_dimension_role_map: array of rows — one per (skill, dimension)
   pair. Each row has:
     - "skill": input skill string
@@ -202,6 +230,10 @@ Path B — INVENT a brand-new role outside the candidates.
 ==============================================================
 DECISION HEURISTIC
 ==============================================================
+If context.jd_role_hint is present, use it as a tie-breaker: prefer DB
+candidates or Path B outcomes that align with its display_name when two
+choices are otherwise reasonable.
+
 Scan skill_dimension_role_map and count, per DB candidate, how many rows
 include that candidate in `roles_from_db`. Also note `llm_role` per row —
 if many rows agree on one llm_role (e.g. DevOps Engineer) while DB only
