@@ -1202,6 +1202,9 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         src = final_skill_by_lower.get(k)
         if src and rec.get("skill_id") is not None:
             skill_id_by_input[src] = int(rec["skill_id"])
+    skill_id_by_input_lower: dict[str, int] = {
+        s.lower(): sid for s, sid in skill_id_by_input.items()
+    }
 
     # 3.5) Create canonical_skills rows for new LLM-discovered skills that carry
     # enrichment metadata (category, skill_nature, typical_lifespan from API 2).
@@ -1210,7 +1213,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         for sd in req.skills_detail
         if sd.source_tag == "llm"
         and sd.new_skill_meta is not None
-        and sd.input_skill not in skill_id_by_input
+        and sd.input_skill.lower() not in skill_id_by_input_lower
     }
     for skill_name, meta in new_skill_metas.items():
         if not meta.category or not meta.skill_nature or not meta.typical_lifespan:
@@ -1227,7 +1230,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             sub_cat_id: int | None = None
             if meta.sub_category:
                 sub_cat_row = await asyncio.to_thread(
-                    repo.find_or_create_category,
+                    repo.find_or_create_sub_category,
+                    category_id=cat_id,
                     display_name=meta.sub_category,
                 )
                 sub_cat_id = int(sub_cat_row["id"])
@@ -1239,7 +1243,9 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 skill_nature=meta.skill_nature,
                 typical_lifespan=meta.typical_lifespan,
             )
-            skill_id_by_input[skill_name] = int(skill_row["id"])
+            new_skill_id = int(skill_row["id"])
+            skill_id_by_input[skill_name] = new_skill_id
+            skill_id_by_input_lower[skill_name.lower()] = new_skill_id
             persistence.new_skills_created += 1
         except Exception as exc:
             logger.warning("Failed to create canonical skill %r: %s", skill_name, exc)
@@ -1249,13 +1255,13 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     # - persist role-dimension only when row matches chosen role and role exists in DB
     for dd in req.dimensions:
         skill_name = dd.input_skill
-        skill_tag = "in_db" if skill_name in skill_id_by_input else "new"
+        skill_id = skill_id_by_input_lower.get(skill_name.lower())
+        skill_tag = "in_db" if skill_id is not None else "new"
 
         matched = _role_matches_chosen(dd, chosen)
         dim_id = dd.dimension.id
         dim_slug = dd.dimension.slug
         dim_name = dd.dimension.display_name
-        skill_id = skill_id_by_input.get(skill_name)
         item = PersistenceItem(
             input_skill=skill_name,
             skill_tag=skill_tag,
@@ -1272,7 +1278,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             matched_chosen_role=matched,
         )
 
-        if skill_name not in skill_id_by_input:
+        if skill_id is None:
             item.skipped_reason = "skill_not_in_db"
             persistence.skipped += 1
             persistence.items.append(item)
@@ -1294,7 +1300,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
 
             sd_inserted = await asyncio.to_thread(
                 repo.upsert_dimension_skill_link,
-                skill_id=skill_id_by_input[skill_name],
+                skill_id=skill_id,
                 dimension_id=dim_id,
             )
             if sd_inserted:

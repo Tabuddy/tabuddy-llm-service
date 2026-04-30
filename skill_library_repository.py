@@ -539,6 +539,40 @@ class SkillLibraryRepository:
             conn.commit()
         return dict(zip(cols, row))
 
+    def find_or_create_sub_category(self, *, category_id: int, display_name: str) -> dict:
+        """Return existing sub-category row under a category, else create it."""
+        name_lc = display_name.strip().lower()
+        if not name_lc:
+            raise ValueError("sub-category display_name cannot be empty")
+
+        slug = _slugify(display_name)
+        sql_find = f"""
+            SELECT id, category_id, slug, display_name
+            FROM {self.schema}.sub_categories
+            WHERE category_id = %s
+              AND (lower(display_name) = %s OR slug = %s)
+            LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_find, (int(category_id), name_lc, slug))
+                row = cur.fetchone()
+                if row:
+                    return dict(zip([c[0] for c in cur.description], row))
+
+        sql_insert = f"""
+            INSERT INTO {self.schema}.sub_categories (category_id, slug, display_name)
+            VALUES (%s, %s, %s)
+            RETURNING id, category_id, slug, display_name
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_insert, (int(category_id), slug, display_name.strip()))
+                row = cur.fetchone()
+                cols = [c[0] for c in cur.description]
+            conn.commit()
+        return dict(zip(cols, row))
+
     def create_canonical_skill(
         self,
         *,
