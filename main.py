@@ -41,6 +41,7 @@ from skill_library_v2.agents.planner import PlannerAgent
 from pathlib import Path
 import tempfile
 import time
+from datetime import datetime
 import logging
 import asyncio
 from typing import Any
@@ -696,11 +697,31 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     dimensions_by_skill: dict[str, list[dict]] = {}
     skill_enrichment: dict[str, dict] = {}
 
+    # Drop plain English dictionary words before paying for LLM calls.
+    # Real tech skills always have at least one of: uppercase, digit, hyphen,
+    # dot, slash, or are >1 word. Single all-lowercase words like "codes",
+    # "releases", "functionality" are noise from the JD extractor.
+    def _looks_like_skill(s: str) -> bool:
+        if any(ch in s for ch in ("-", ".", "/", "+")):
+            return True
+        if any(ch.isdigit() for ch in s):
+            return True
+        parts = s.split()
+        if len(parts) > 1:
+            return True
+        # Single token: require at least one uppercase letter
+        return any(ch.isupper() for ch in s)
+
+    unmatched_llm_skills = [s for s in unmatched_llm_skills if _looks_like_skill(s)]
+
     if unmatched_llm_skills:
         try:
             dimension_catalogue = await asyncio.to_thread(
                 repo.fetch_dimension_catalogue
             )
+            if len(dimension_catalogue) > 100:
+                step = len(dimension_catalogue) // 100
+                dimension_catalogue = dimension_catalogue[::step][:100]
         except Exception as exc:
             logger.warning(
                 "fetch_dimension_catalogue failed; LLM will run ungrounded: %s",
@@ -788,64 +809,15 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 dim_for_infer["difficulty_hint"] = str(dh)
         pending_llm_roles.append((idx, skill, dim_for_infer))
 
-    # Also infer per-dimension roles for canonical DB-matched skills (stage 4a)
-    # so llm_role is not empty for rows like Loki/GCP/CloudFormation.
-    pending_db_roles: list[tuple[tuple[str, int], str, dict]] = []
-    for term, info in matched_per_final.items():
-        canonical: CanonicalSkillSummary = info["canonical"]
-        sid = int(canonical.id)
-        for d_row in dims_by_skill.get(sid, []) or []:
-            dim_id = int(d_row["id"])
-            pending_db_roles.append((
-                (term, dim_id),
-                term,
-                {
-                    "display_name": str(d_row.get("display_name") or ""),
-                    "slug": str(d_row.get("slug") or ""),
-                    "rationale": d_row.get("rationale"),
-                    "difficulty_hint": (
-                        str(d_row.get("difficulty_hint") or "") or None
-                    ),
-                },
-            ))
-
+    # ── Role inference: ONE batched LLM call for unmatched LLM skill pairs only ─
+    # DB-matched skills already have roles_from_db populated from Stage 2 —
+    # no LLM inference needed for them.
     llm_roles_by_idx: dict[int, dict | None] = {}
-    if pending_llm_roles:
-        async def _one(idx: int, skill: str, dim: dict):
-            try:
-                return idx, await planner.infer_role_for_skill(skill, dim)
-            except Exception as exc:
-                logger.warning(
-                    "infer_role_for_skill failed for skill=%r dim=%r: %s",
-                    skill, dim.get("display_name"), exc,
-                )
-                return idx, None
-
-        results = await asyncio.gather(*[
-            _one(i, s, d) for (i, s, d) in pending_llm_roles
-        ])
-        for idx, role in results:
-            llm_roles_by_idx[idx] = role
-
-    llm_roles_for_db_dims: dict[tuple[str, int], dict | None] = {}
-    if pending_db_roles:
-        async def _one_db(
-            key: tuple[str, int], skill: str, dim: dict
-        ) -> tuple[tuple[str, int], dict | None]:
-            try:
-                return key, await planner.infer_role_for_skill(skill, dim)
-            except Exception as exc:
-                logger.warning(
-                    "infer_role_for_skill failed for DB skill=%r dim=%r: %s",
-                    skill, dim.get("display_name"), exc,
-                )
-                return key, None
-
-        db_results = await asyncio.gather(*[
-            _one_db(k, s, d) for (k, s, d) in pending_db_roles
-        ])
-        for key, role in db_results:
-            llm_roles_for_db_dims[key] = role
+    llm_batch_pairs = [(s, d) for (_, s, d) in pending_llm_roles]
+    if llm_batch_pairs:
+        batch_roles = await planner.infer_roles_for_pairs(llm_batch_pairs)
+        for list_idx, (idx, skill, dim) in enumerate(pending_llm_roles):
+            llm_roles_by_idx[idx] = batch_roles[list_idx]
 
     # ── Stage 4: aggregate dimensions per skill + candidate roles ───────────
     dimension_details: list[DimensionDetail] = []
@@ -880,17 +852,11 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             ]
             for r in db_role_summaries:
                 _add_candidate_role(r)
-            llm_role = llm_roles_for_db_dims.get((term, int(d_row["id"])))
-            llm_role_summary = (
-                _role_summary_from_llm(llm_role) if llm_role else None
-            )
-            if llm_role_summary:
-                _add_candidate_role(llm_role_summary)
             detail = DimensionDetail(
                 input_skill=term,
                 dimension=dim_summary,
                 roles_from_db=db_role_summaries,
-                llm_role=llm_role_summary,
+                llm_role=None,
             )
             details_for_term.append(detail)
             dimension_details.append(detail)
@@ -1030,7 +996,9 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             rationale=c.rationale,
         )
     elif len(candidate_roles) > 1:
-        cand_payload = []
+        # Build raw payload, then deduplicate by normalised slug (backend_engineer
+        # and backend-engineer are the same role), preferring DB candidates.
+        _raw_payload: list[dict] = []
         for c in candidate_roles:
             payload = {
                 "source": c.source,
@@ -1040,7 +1008,24 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             }
             if c.id is not None:
                 payload["id"] = c.id
-            cand_payload.append(payload)
+            _raw_payload.append(payload)
+
+        _seen_norm: dict[str, int] = {}
+        _deduped: list[dict] = []
+        for p in _raw_payload:
+            norm = p["slug"].lower().replace("_", "-")
+            if norm in _seen_norm:
+                # Upgrade to DB candidate if the existing slot is LLM
+                if p.get("id") is not None and _deduped[_seen_norm[norm]].get("id") is None:
+                    _deduped[_seen_norm[norm]] = p
+            else:
+                _seen_norm[norm] = len(_deduped)
+                _deduped.append(p)
+
+        # Keep DB-sourced first, then LLM; cap total at 25
+        _db_cands = [p for p in _deduped if p.get("id") is not None]
+        _llm_cands = [p for p in _deduped if p.get("id") is None]
+        cand_payload = (_db_cands + _llm_cands)[:25]
 
         # Per (skill, dimension): DB-linked roles + separate per-pair LLM role.
         skill_dimension_role_map: list[dict] = []

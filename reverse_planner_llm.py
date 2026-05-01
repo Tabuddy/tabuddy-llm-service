@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -125,6 +126,34 @@ Rules:
 - slug must be lower-kebab-case of display_name.
 - Be decisive: output ONE best-fit role.
 - No extra keys. No markdown. No commentary.
+"""
+
+_ROLE_BATCH_SYSTEM_PROMPT = """\
+You infer the most likely real-world engineering / professional role for EACH of several
+(skill, dimension) pairs. Output STRICT JSON only. No markdown fences.
+
+Apply the same reasoning for each pair independently:
+- Backend signals (APIs, Node.js, authentication, databases, microservices) → "Backend Engineer"
+- IaC, CI/CD, cloud provisioning, deployment → "DevOps Engineer" or "Platform Engineer"
+- Infra used within app dev context → Backend Engineer with cloud exposure
+- Enterprise integrations (OAuth, SAP, OData) → Backend Engineer or Integration Engineer
+- Observability, reliability, SLAs/SLOs → "Site Reliability Engineer"
+- Data pipelines, ETL, warehouses → "Data Engineer"
+- When backend AND infra signals conflict: prefer Backend Engineer UNLESS purely infra
+
+Use canonical role names. Be decisive per pair. No extra keys. No markdown.
+
+Output schema (array index MUST match input array index exactly):
+{
+  "pairs": [
+    {
+      "display_name": "<Role Display Name>",
+      "slug": "<kebab-case-of-display-name>",
+      "role_archetype": "<short 1-2 sentence description>",
+      "rationale": "<one short sentence why this role owns this skill+dimension>"
+    }
+  ]
+}
 """
 
 _SKILL_ENRICH_SYSTEM_PROMPT = """\
@@ -508,6 +537,45 @@ class AzureReversePlannerLLM:
             max_completion_tokens=600,
         )
         return self._normalize_role(parsed)
+
+    async def infer_roles_for_pairs(
+        self,
+        pairs: list[tuple[str, dict[str, Any]]],
+    ) -> list[dict[str, str] | None]:
+        """Batch version of infer_role_for_skill — one LLM call for all pairs.
+
+        Returns a list parallel to `pairs`; failed/missing entries are None.
+        Falls back to individual calls if the batch response is malformed.
+        """
+        if not pairs:
+            return []
+
+        payload = json.dumps(
+            {"pairs": [{"skill": s, "dimension": d} for s, d in pairs]},
+            ensure_ascii=False,
+        )
+        # Budget: ~150 tokens per pair (role is small) + overhead
+        budget = min(200 + len(pairs) * 150, 4000)
+        try:
+            parsed = await self._call(
+                _ROLE_BATCH_SYSTEM_PROMPT,
+                payload,
+                max_completion_tokens=budget,
+            )
+            items = parsed.get("pairs") or []
+            if not isinstance(items, list) or len(items) != len(pairs):
+                raise ValueError(
+                    f"Batch response length mismatch: got {len(items)}, expected {len(pairs)}"
+                )
+            return [self._normalize_role(item) for item in items]
+        except Exception as exc:
+            logger.warning(
+                "infer_roles_for_pairs batch failed (%s); falling back to individual calls",
+                exc,
+            )
+            return list(await asyncio.gather(*[
+                self.infer_role_for_skill(s, d) for s, d in pairs
+            ]))
 
     async def enrich_new_skills(
         self,
