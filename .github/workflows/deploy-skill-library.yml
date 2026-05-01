@@ -47,11 +47,11 @@ jobs:
               tabuddy-llm-temp
 
             echo "[Deploy] Waiting for health checks..."
-            for i in {1..10}; do
+            for i in {1..30}; do
               if curl -fs http://localhost:7778 > /dev/null; then
                 break
               fi
-              echo "Waiting... (\$i/10)"
+              echo "Waiting... (\$i/45)"
               sleep 2
             done
 
