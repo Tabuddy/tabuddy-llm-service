@@ -51,8 +51,8 @@ jobs:
               if curl -fs http://localhost:7778 > /dev/null; then
                 break
               fi
-              echo "Waiting... (\$i/45)"
-              sleep 2
+              echo "Waiting... (\$i/30)"
+              sleep 10
             done
 
             if ! curl -f http://localhost:7778; then
