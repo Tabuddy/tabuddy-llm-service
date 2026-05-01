@@ -1,0 +1,98 @@
+name: Deploy to Prod on skill-library Push
+
+on:
+  push:
+    branches:
+      - skill-library
+  pull_request:
+    branches:
+      - skill-library
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PROD_SSH_KEY }}
+
+      - name: Deploy to Production
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }} << 'EOF'
+            set -e
+            mkdir -p /srv/tabuddy-llm-service
+            cd /srv/tabuddy-llm-service
+
+            echo "[Deploy] Pre-run cleanup of any leftover temp artifacts..."
+            docker rm -f tabuddy-llm-cont-temp 2>/dev/null || true
+            docker image rm -f tabuddy-llm-temp 2>/dev/null || true
+
+            echo "[Deploy] Cloning repo..."
+            rm -rf temp-tabuddy-llm-service || true
+            git clone --quiet --branch skill-library https://${{ secrets.GH_PAT }}@github.com/Tabuddy/tabuddy-llm-service.git temp-tabuddy-llm-service
+            cd temp-tabuddy-llm-service
+
+            echo "[Deploy] Building temp image..."
+            docker build -t tabuddy-llm-temp .
+
+            echo "[Deploy] Running temp container on port 7778..."
+            docker run -d --name tabuddy-llm-cont-temp \
+              --env-file /srv/tabuddy-llm-service/.env.production \
+              -p 7778:8000 \
+              tabuddy-llm-temp
+
+            echo "[Deploy] Waiting for health checks..."
+            for i in {1..30}; do
+              if curl -fs http://localhost:7778 > /dev/null; then
+                break
+              fi
+              echo "Waiting... (\$i/30)"
+              sleep 10
+            done
+
+            if ! curl -f http://localhost:7778; then
+              echo "❌ App health check failed. Cleaning up temp container and image..."
+              docker rm -f tabuddy-llm-cont-temp 2>/dev/null || true
+              docker image rm -f tabuddy-llm-temp 2>/dev/null || true
+              cd /srv/tabuddy-llm-service && rm -rf temp-tabuddy-llm-service || true
+              docker image prune -f || true
+              exit 1
+            fi
+
+            echo "✅ Health check passed. Swapping tabuddy-llm-cont..."
+
+            # Stop and remove old tabuddy-llm-cont (only this one — other services untouched)
+            docker stop tabuddy-llm-cont 2>/dev/null || true
+            docker rm tabuddy-llm-cont 2>/dev/null || true
+
+            # Retag temp image as the live image
+            docker tag tabuddy-llm-temp tabuddy-llm
+
+            # Start new container on the same port (7777 -> 8000) with the original name
+            docker run -d --name tabuddy-llm-cont \
+              --env-file /srv/tabuddy-llm-service/.env.production \
+              -p 7777:8000 \
+              tabuddy-llm
+
+            echo "🧹 Cleaning up temp container, temp image tag, and clone dir..."
+            docker rm -f tabuddy-llm-cont-temp 2>/dev/null || true
+            docker image rm -f tabuddy-llm-temp 2>/dev/null || true
+            cd /srv/tabuddy-llm-service && rm -rf temp-tabuddy-llm-service || true
+
+            echo "🧹 Removing any stray tabuddy-llm-temp tags (defensive)..."
+            for img in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^tabuddy-llm-temp' || true); do
+              docker image rm -f "$img" || true
+            done
+
+            echo "🧹 Pruning dangling images and build cache..."
+            docker image prune -f || true
+            docker builder prune -f || true
+
+            echo "✅ Production deployment successful!"
+            echo "🚀 tabuddy-llm-cont running on port 7777"
+          EOF
