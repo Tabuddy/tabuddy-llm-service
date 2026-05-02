@@ -1357,7 +1357,10 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         persistence.items.append(item)
 
     # 5) Planner output when chosen role was missing in DB initially.
-    if role_missing_initially:
+    # PlannerAgent is off by default. Set ENABLE_PLANNER_FOR_MISSING_ROLE=1 to re-enable.
+    if role_missing_initially and os.getenv(
+        "ENABLE_PLANNER_FOR_MISSING_ROLE", ""
+    ).strip().lower() in ("1", "true", "yes"):
         planner_output = PlannerGeneratedOutput(
             generated=True,
             role_id=(chosen.slug or "").replace("-", "_"),
