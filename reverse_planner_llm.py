@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,15 @@ from openai import AsyncAzureOpenAI
 from llm_client import REASONING_MODEL
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+
+logger = logging.getLogger(__name__)
+
+# OpenAI json_object mode requires the word "json" to appear in `messages`;
+# user payloads are often raw JSON without that substring.
+_JSON_OBJECT_USER_SUFFIX = (
+    "\n\nRespond with a single JSON object matching the schema above "
+    "(no markdown fences)."
+)
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 # Same default as PlannerAgent / skill_library_v2 reasoning tier (o4-mini).
@@ -370,9 +380,10 @@ class AzureReversePlannerLLM:
         *,
         max_completion_tokens: int = 1500,
     ) -> dict[str, Any]:
+        user_with_json_hint = user_payload + _JSON_OBJECT_USER_SUFFIX
         msgs_first: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_payload},
+            {"role": "user", "content": user_with_json_hint},
         ]
         kwargs_first: dict[str, Any] = {
             "model": self.deployment,
@@ -388,7 +399,7 @@ class AzureReversePlannerLLM:
         except Exception as first_exc:
             msgs_retry: list[dict[str, str]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_payload},
+                {"role": "user", "content": user_with_json_hint},
                 {
                     "role": "user",
                     "content": (
