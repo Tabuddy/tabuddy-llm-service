@@ -53,6 +53,7 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from model_azure import download_models_from_azure, upload_models_to_azure
 from model_pipeline import router as model_pipeline_router
+from canonical_skill_api import canonical_skill_router
 
 # Suppress noisy third-party progress bars BEFORE any imports that pull in tqdm
 import os
@@ -116,13 +117,14 @@ app = FastAPI(
 
 app.include_router(docling_router)
 app.include_router(model_pipeline_router)
+app.include_router(canonical_skill_router)
 
 templates = Jinja2Templates(directory="templates")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html", {})
 
 
 # ── Skill Normalization models (existing) ──
@@ -2006,9 +2008,9 @@ async def classify_text_endpoint(req: ClassifyTextRequest):
 async def resume_ranking_ui(request: Request):
     """Jinja2 test page for the resume ranking system."""
     return templates.TemplateResponse(
+        request,
         "resume_ranking.html",
         {
-            "request": request,
             "setfit_loaded": False,
             "loaded_tiers": [],
         },
@@ -2026,7 +2028,7 @@ class AdminSkillPayload(BaseModel):
 @app.get("/skill-library", response_class=HTMLResponse)
 async def skill_library_ui(request: Request):
     """Jinja2 panel for viewing and managing the skill library."""
-    return templates.TemplateResponse("skill_library.html", {"request": request})
+    return templates.TemplateResponse(request, "skill_library.html", {})
 
 
 @app.get("/api/skill-library")

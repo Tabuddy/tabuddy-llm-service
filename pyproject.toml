@@ -39,6 +39,16 @@ dependencies = [
     "asyncpg>=0.29.0",
     "pgvector>=0.3.0",
     "tenacity>=9.0.0",
+    # ── ORM + migrations for the relational skill catalog ────────────────────
+    "sqlalchemy[asyncio]>=2.0.30,<3.0",
+    "alembic>=1.13",
+    "greenlet>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
 ]
 
 [[tool.uv.index]]

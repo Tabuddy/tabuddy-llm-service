@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 from skill_library_v2.agents.base import BaseLLMAgent
 from skill_library_v2.prompts.planner import (
@@ -24,13 +25,78 @@ from skill_library_v2.prompts.planner import (
     PLANNER_SYSTEM_PROMPT,
     PLANNER_USER_TEMPLATE,
     format_enum_block,
+    format_page_extracts_block,
     format_web_hints_block,
 )
-from skill_library_v2.schemas.role import PlannerOutput, WebHint
+from skill_library_v2.schemas.role import PageExtract, PlannerOutput, WebHint
 from skill_library_v2.state import PlanGraphState, ReviewItem
-from skill_library_v2.tools.web_search import BraveResult, search as web_search
+from skill_library_v2.tools.web_search import (
+    BraveResult,
+    fetch_extracts,
+    search as web_search,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# Aggregators, opinion forums, and content farms that dominate SEO for
+# career-advice queries but carry almost no signal for a skill Planner.
+_BLOCKED_DOMAINS: frozenset[str] = frozenset({
+    "indeed.com",
+    "ziprecruiter.com",
+    "glassdoor.com",
+    "simplyhired.com",
+    "monster.com",
+    "reddit.com",
+    "quora.com",
+    "medium.com",
+    "substack.com",
+    "coursera.org",
+    "udemy.com",
+    "linkedin.com",
+})
+
+# Authoritative technical sources — hits here get sorted to the top of the
+# hint list so the LLM sees them first within its attention window.
+_PREFERRED_DOMAIN_SUBSTRINGS: tuple[str, ...] = (
+    "roadmap.sh",
+    "stackoverflow.blog",
+    "github.com",
+    "github.io",
+    "developers.google.com",
+    "learn.microsoft.com",
+    "aws.amazon.com",
+    "engineering.",
+    ".dev/blog",
+    "onetonline.org",
+    "levels.fyi",
+    "lever.co",
+    "greenhouse.io",
+    "workable.com",
+)
+
+
+def _host(url: str) -> str:
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def _is_blocked(url: str) -> bool:
+    host = _host(url)
+    if not host:
+        return True
+    return any(host == d or host.endswith("." + d) for d in _BLOCKED_DOMAINS)
+
+
+def _preference_rank(url: str) -> int:
+    host = _host(url)
+    for i, sub in enumerate(_PREFERRED_DOMAIN_SUBSTRINGS):
+        if sub in host or sub in url.lower():
+            return i
+    return len(_PREFERRED_DOMAIN_SUBSTRINGS)
 
 
 class PlannerAgent(BaseLLMAgent):
@@ -43,44 +109,62 @@ class PlannerAgent(BaseLLMAgent):
         )
 
     async def gather_web_hints(self, role_display: str) -> list[WebHint]:
-        """Best-effort web grounding. Returns [] if no search provider is configured."""
+        """Best-effort web grounding. Returns [] if no search provider is configured.
+
+        Queries target *technical* sources (roadmaps, engineering blogs, real job
+        postings) rather than career-advice aggregators; results from aggregator
+        and opinion-forum domains are filtered out before ranking.
+        """
         queries = [
-            f'"{role_display}" responsibilities required skills',
-            f'"{role_display}" job description hiring 2026',
+            f'"{role_display}" roadmap technical skills tech stack',
+            f'"{role_display}" engineering blog required technologies',
+            f'"{role_display}" job posting requirements technologies framework',
         ]
         results_per_query: list[list[BraveResult]] = await asyncio.gather(
-            *(web_search(q, count=5) for q in queries),
+            *(web_search(q, count=10) for q in queries),
             return_exceptions=False,
         )
 
         seen: set[str] = set()
-        hints: list[WebHint] = []
+        candidates: list[BraveResult] = []
+        raw_total = 0
         for results in results_per_query:
+            raw_total += len(results)
             for r in results:
-                if r.url in seen:
+                if r.url in seen or _is_blocked(r.url):
                     continue
                 seen.add(r.url)
-                hints.append(
-                    WebHint(
-                        title=r.title,
-                        url=r.url,
-                        description=r.description,
-                    )
-                )
-                if len(hints) >= 6:
-                    break
-            if len(hints) >= 6:
-                break
-        return hints
+                candidates.append(r)
 
-    async def run(self, role_id: str, role_display: str) -> tuple[PlannerOutput, list[WebHint]]:
+        candidates.sort(key=lambda r: _preference_rank(r.url))
+        top = candidates[:6]
+
+        logger.info(
+            "[planner] web hints: %d raw → %d after dedupe+blocklist → %d after cap",
+            raw_total, len(candidates), len(top),
+        )
+        for r in top:
+            logger.debug("[planner] hint: %s (%s)", r.url, _host(r.url))
+
+        return [
+            WebHint(title=r.title, url=r.url, description=r.description)
+            for r in top
+        ]
+
+    async def run(
+        self, role_id: str, role_display: str,
+    ) -> tuple[PlannerOutput, list[WebHint], list[PageExtract]]:
         hints = await self.gather_web_hints(role_display)
+        extracts = await fetch_extracts(hints) if hints else []
+        hint_dicts = [h.model_dump() for h in hints]
         user_prompt = PLANNER_USER_TEMPLATE.format(
             role_id=role_id,
             role_display=role_display,
             enum_block=format_enum_block(),
-            web_hints_block=format_web_hints_block(
-                [h.model_dump() for h in hints]
+            web_hints_block=format_web_hints_block(hint_dicts),
+            page_extracts_block=format_page_extracts_block(
+                [e.model_dump() for e in extracts],
+                hints=hint_dicts,
             ),
         )
         output = await self.call_json(
@@ -88,7 +172,7 @@ class PlannerAgent(BaseLLMAgent):
             user_prompt=user_prompt,
             schema=PlannerOutput,
         )
-        return output, hints
+        return output, hints, extracts
 
 
 _planner_singleton: PlannerAgent | None = None
@@ -115,7 +199,9 @@ async def plan_role(state: PlanGraphState) -> dict[str, Any]:
     agent = _get_planner()
     logger.info("[planner] planning role %r (%s)", role_display, role_id)
 
-    output, hints = await agent.run(role_id=role_id, role_display=role_display)
+    output, hints, extracts = await agent.run(
+        role_id=role_id, role_display=role_display,
+    )
 
     review_additions: list[ReviewItem] = [
         {
@@ -141,5 +227,7 @@ async def plan_role(state: PlanGraphState) -> dict[str, Any]:
         "dimensions": output.dimensions,
         "planner_reasoning": output.reasoning,
         "planner_web_hints": hints,
-        "review_queue": (state.get("review_queue") or []) + review_additions,
+        "planner_page_extracts": extracts,
+        # The `review_queue` reducer appends — return only the new additions.
+        "review_queue": review_additions,
     }

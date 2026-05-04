@@ -25,6 +25,11 @@ from tenacity import (
 
 from skill_library_v2.config import get_settings
 from skill_library_v2.tools.brave_search import BraveResult
+from skill_library_v2.tools.exceptions import (
+    FirecrawlCreditsExhausted,
+    firecrawl_credits_tripped,
+    trip_firecrawl_credits,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +127,12 @@ async def search(query: str, count: int = 10) -> list[BraveResult]:
         logger.warning("FIRECRAWL_API_KEY not set; skipping Firecrawl search for %r.", query)
         return []
 
+    if firecrawl_credits_tripped():
+        raise FirecrawlCreditsExhausted(
+            "Firecrawl quota exhausted earlier in this run; aborting search to "
+            "preserve a clean checkpoint stop."
+        )
+
     count = max(1, min(int(count), 20))
     key = _cache_key(query, count)
     cached = _cache_get(key)
@@ -148,6 +159,12 @@ async def search(query: str, count: int = 10) -> list[BraveResult]:
                 if resp.status_code == 429:
                     logger.warning("Firecrawl rate-limited; backing off.")
                     raise httpx.RemoteProtocolError("rate limited")
+                if resp.status_code == 402:
+                    body = resp.text[:200]
+                    trip_firecrawl_credits(body)
+                    raise FirecrawlCreditsExhausted(
+                        f"Firecrawl quota exhausted (HTTP 402): {body}"
+                    )
                 if resp.status_code >= 400:
                     logger.warning(
                         "Firecrawl returned HTTP %s for %r: %s",
@@ -161,6 +178,8 @@ async def search(query: str, count: int = 10) -> list[BraveResult]:
                 results = _parse_results(payload, count)
                 _cache_put(key, results)
                 return results
+    except FirecrawlCreditsExhausted:
+        raise  # propagate to the batch runner for a clean checkpoint stop
     except Exception as exc:
         logger.exception("Firecrawl search failed for %r: %s", query, exc)
         return []

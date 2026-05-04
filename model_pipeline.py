@@ -303,9 +303,7 @@ _templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
 @router.get("/models-pipeline", response_class=HTMLResponse)
 async def pipeline_page(request: Request):
-    return _templates.TemplateResponse("pipeline.html", {
-        "request": request,
-    })
+    return _templates.TemplateResponse(request, "pipeline.html", {})
 
 
 # ── API: Training Status ──────────────────────────────────────────────────────

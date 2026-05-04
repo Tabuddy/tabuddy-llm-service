@@ -26,6 +26,7 @@ class V2Settings(BaseSettings):
     pg_dsn: str = "postgresql://postgres:postgres@localhost:5432/tabuddy"
     reasoning_deployment: str = "o4-mini"
     fast_deployment: str = "gpt-4o-mini"
+    generation_deployment: str = "gpt-5.4"
 
 
 @lru_cache(maxsize=1)

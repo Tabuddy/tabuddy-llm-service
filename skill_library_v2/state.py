@@ -12,10 +12,47 @@ Critics, and Edge pipeline drop in.
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from operator import add
+from typing import Annotated, Any, Literal, TypedDict
 
-from skill_library_v2.schemas.role import DimensionSlice, WebHint
-from skill_library_v2.schemas.skill import SkillDraft
+from skill_library_v2.schemas.category import CategorizerOutput
+from skill_library_v2.schemas.role import DimensionSlice, PageExtract, WebHint
+from skill_library_v2.schemas.skill import Correction, SkillDraft
+
+
+# ─── Reducers ───────────────────────────────────────────────────────────────
+# LangGraph applies these when multiple parallel Sends write to the same
+# state key. Right-hand side wins on per-key conflict; this matches the
+# "each dim worker owns its own dim_id entry" mental model.
+
+def merge_dim_lists(
+    left: dict[str, list[SkillDraft]] | None,
+    right: dict[str, list[SkillDraft]] | None,
+) -> dict[str, list[SkillDraft]]:
+    merged: dict[str, list[SkillDraft]] = dict(left or {})
+    for k, v in (right or {}).items():
+        merged[k] = v
+    return merged
+
+
+def merge_by_key(left: dict | None, right: dict | None) -> dict:
+    merged: dict = dict(left or {})
+    if right:
+        merged.update(right)
+    return merged
+
+
+def merge_correction_lists(
+    left: dict[str, list[Correction]] | None,
+    right: dict[str, list[Correction]] | None,
+) -> dict[str, list[Correction]]:
+    merged: dict[str, list[Correction]] = dict(left or {})
+    for k, v in (right or {}).items():
+        merged[k] = v
+    return merged
+
+
+DimStatus = Literal["pending", "generating", "criticizing", "done", "failed"]
 
 
 class ErrorRecord(TypedDict, total=False):
@@ -43,9 +80,24 @@ class PlanGraphState(TypedDict, total=False):
     dimensions: list[DimensionSlice]
     planner_reasoning: str
     planner_web_hints: list[WebHint]
+    planner_page_extracts: list[PageExtract]
 
-    # ── Filled by later phases (declared for shape stability) ──
-    retrieval_packs: dict[str, Any]       # keyed by dimension_id
-    generated: dict[str, list[SkillDraft]]
-    review_queue: list[ReviewItem]
-    errors: list[ErrorRecord]
+    # ── Filled by Generator/Critic/Validator (Phase 2) ──
+    # All three dicts are keyed by dimension_id. The reducers merge
+    # per-key writes from parallel Send workers.
+    generated: Annotated[dict[str, list[SkillDraft]], merge_dim_lists]
+    dim_status: Annotated[dict[str, DimStatus], merge_by_key]
+    dim_categories: Annotated[dict[str, CategorizerOutput], merge_by_key]
+    dim_retry_count: Annotated[dict[str, int], merge_by_key]
+    dim_critic_corrections: Annotated[
+        dict[str, list[Correction]], merge_correction_lists
+    ]
+    dim_critic_verdict: Annotated[
+        dict[str, Literal["approve", "revise", "reject"]], merge_by_key
+    ]
+    dim_generator_notes: Annotated[dict[str, str], merge_by_key]
+
+    # ── Reserved for later phases (retrieval/grounding not used in v1 loop) ──
+    retrieval_packs: dict[str, Any]
+    review_queue: Annotated[list[ReviewItem], add]
+    errors: Annotated[list[ErrorRecord], add]

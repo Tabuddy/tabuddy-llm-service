@@ -44,6 +44,24 @@ class WebHint(BaseModel):
     description: str
 
 
+class PageExtract(BaseModel):
+    """Filtered signal from a scraped page (headings + bullets + trigger paragraphs).
+
+    Produced by ``tools.web_search.fetch_extracts`` and fed into the Planner
+    prompt as a second reference block below the snippet citation index.
+    ``content`` is never empty — callers drop empty extracts before building
+    this model.
+    """
+
+    title: str
+    url: str
+    content: str = Field(
+        ...,
+        description="Filtered markdown: headings, bullets, and trigger-word "
+                    "paragraphs from the scraped page, truncated to a budget.",
+    )
+
+
 class DimensionSlice(BaseModel):
     """One orthogonal competency axis for the role.
 
@@ -102,8 +120,12 @@ class PlannerOutput(BaseModel):
     dimensions: list[DimensionSlice] = Field(
         ...,
         min_length=3,
-        max_length=15,
-        description="3-15 orthogonal dimensions. 5-10 typical.",
+        max_length=30,
+        description="3-30 orthogonal dimensions. 12-20 typical for single-family "
+                    "backend / SRE / platform roles (must-include checklist has "
+                    "~25 anchors); 16-25 for broad/cross-family roles. Upper "
+                    "bound is a guard against egregious over-emission, not a "
+                    "target.",
     )
     reasoning: str = Field(
         ...,
