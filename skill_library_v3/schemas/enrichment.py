@@ -80,7 +80,7 @@ class Maturity(BaseModel):
     """Output of agent 7b. The four levels mirror the blueprint exactly."""
 
     maturity: MaturityLevel
-    reasoning: str = Field(min_length=20, max_length=400)
+    reasoning: str = Field(min_length=20, max_length=600)
     confidence: float = Field(ge=0.0, le=1.0)
 
 
@@ -92,7 +92,7 @@ class ContextKeywords(BaseModel):
     skill's lexical neighborhood, useful for downstream extraction
     boosting and for surfacing related skills the LLM might miss."""
 
-    context_keywords: list[str] = Field(min_length=8, max_length=15)
+    context_keywords: list[str] = Field(min_length=5, max_length=18)
 
     @model_validator(mode="after")
     def _no_empty_strings(self) -> "ContextKeywords":
@@ -114,7 +114,7 @@ class Ambiguity(BaseModel):
 
     ambiguity_flag: bool
     confused_with: list[str] = Field(default_factory=list)
-    reasoning: str = Field(min_length=20, max_length=400)
+    reasoning: str = Field(min_length=20, max_length=600)
 
     @model_validator(mode="after")
     def _flag_implies_confused_with(self) -> "Ambiguity":

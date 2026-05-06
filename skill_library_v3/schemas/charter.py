@@ -22,7 +22,7 @@ class CharterOutput(BaseModel):
     role_id: str
     role_name: str
     definition: str = Field(min_length=20, max_length=600)
-    in_scope: list[str] = Field(min_length=8, max_length=12)
+    in_scope: list[str] = Field(min_length=6, max_length=15)
     out_of_scope: list[OutOfScopeItem] = Field(default_factory=list)
     adjacent_roles: list[AdjacentRole] = Field(default_factory=list)
     always_load_skills: list[str] = Field(default_factory=list)

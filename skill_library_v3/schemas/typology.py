@@ -95,7 +95,7 @@ class TypedSkill(BaseModel):
     type: SkillType
     subtype: str = Field(min_length=2, max_length=60, pattern=_SUBTYPE_PATTERN)
     confidence: float = Field(ge=0.0, le=1.0)
-    reasoning: str = Field(min_length=20, max_length=400)
+    reasoning: str = Field(min_length=20, max_length=600)
     alternatives_considered: list[str] = Field(default_factory=list, max_length=8)
 
 

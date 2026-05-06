@@ -28,8 +28,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen
 
 # spaCy models. Install into the venv directly (uv pip is venv-aware here).
+# IMPORTANT: do NOT pass ``--no-cache`` — it tells uv to bypass the package
+# cache for both reads and writes, which makes the ``--mount=type=cache``
+# above useless. Each cold build would re-download ~394 MB. With the cache
+# mount, subsequent builds reuse the downloaded wheels.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-cache \
+    uv pip install \
         https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl \
         https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl
 
@@ -49,8 +53,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         nvidia-cuda-runtime-cu11 nvidia-cudnn-cu11 nvidia-cufft-cu11 \
         nvidia-curand-cu11 nvidia-cusolver-cu11 nvidia-cusparse-cu11 \
         nvidia-nccl-cu11 nvidia-nvtx-cu11 triton 2>/dev/null || true
+# Same caveat as the spaCy install above: keep ``--no-cache`` OFF so the
+# torch CPU wheel (~181 MB) is reused from the cache mount on warm builds.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-cache \
+    uv pip install \
         --index-url https://download.pytorch.org/whl/cpu \
         torch torchvision
 

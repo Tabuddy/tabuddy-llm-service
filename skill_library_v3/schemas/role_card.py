@@ -41,10 +41,10 @@ RoleFamily = Literal[
 
 
 class SeniorityBand(BaseModel):
-    junior: str = Field(min_length=10, max_length=300)
-    mid: str = Field(min_length=10, max_length=300)
-    senior: str = Field(min_length=10, max_length=300)
-    staff: str = Field(min_length=10, max_length=300)
+    junior: str = Field(min_length=10, max_length=600)
+    mid: str = Field(min_length=10, max_length=600)
+    senior: str = Field(min_length=10, max_length=600)
+    staff: str = Field(min_length=10, max_length=600)
 
 
 class RoleCard(BaseModel):
@@ -60,9 +60,9 @@ class RoleCard(BaseModel):
 
     role_id: str
     canonical_name: str = Field(min_length=2, max_length=80)
-    aliases: list[str] = Field(default_factory=list, max_length=7)
+    aliases: list[str] = Field(default_factory=list, max_length=10)
     family: RoleFamily
-    definition: str = Field(min_length=20, max_length=200)
+    definition: str = Field(min_length=20, max_length=400)
     primary_responsibilities: str = Field(min_length=30, max_length=1200)
     common_artifacts: str = Field(min_length=20, max_length=1200)
     distinguishing_tasks: str = Field(min_length=20, max_length=600)

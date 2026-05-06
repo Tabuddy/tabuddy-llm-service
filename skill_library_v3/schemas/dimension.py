@@ -26,7 +26,7 @@ class OverlapFlag(BaseModel):
     with_dim_id: str | None = None
     with_dim_name: str | None = None
     with_role: str | None = None
-    reason: str = Field(min_length=10, max_length=300)
+    reason: str = Field(min_length=10, max_length=500)
 
 
 class CandidateDimension(BaseModel):
@@ -34,9 +34,9 @@ class CandidateDimension(BaseModel):
 
     tentative_id: str = Field(pattern=r"^d_init_\d{2,3}$")
     name: str = Field(min_length=3, max_length=80)
-    description: str = Field(min_length=20, max_length=400)
-    in_scope: str = Field(min_length=10, max_length=400)
-    out_of_scope: str = Field(min_length=10, max_length=400)
+    description: str = Field(min_length=20, max_length=600)
+    in_scope: str = Field(min_length=10, max_length=600)
+    out_of_scope: str = Field(min_length=10, max_length=600)
     exemplar_skills: list[str] = Field(min_length=3, max_length=15)
     overlap_flags: list[OverlapFlag] = Field(default_factory=list)
 
@@ -51,4 +51,4 @@ class DimensionList(BaseModel):
     """
 
     role_id: str = ""
-    candidate_dimensions: list[CandidateDimension] = Field(min_length=12, max_length=20)
+    candidate_dimensions: list[CandidateDimension] = Field(min_length=10, max_length=22)
