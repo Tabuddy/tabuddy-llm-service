@@ -22,6 +22,12 @@ class V3Settings(BaseSettings):
     skill_library_pg_dsn: str = (
         "postgresql://postgres:postgres@localhost:5432/skill-library"
     )
+    # Optional non-default Postgres schema to put on search_path for v3 queries.
+    # Local dev: leave empty — local DB is itself named ``skill-library`` with
+    # tables in ``public``. Prod: set to ``skill-library`` so the unqualified
+    # table refs in repository.py resolve to the prod ``skill-library`` schema
+    # of the shared ``postgres`` database.
+    skill_library_schema: str = ""
     kaggle_username: str | None = None
     kaggle_key: str | None = None
 

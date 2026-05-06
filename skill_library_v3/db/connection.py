@@ -13,17 +13,23 @@ is set. Locally the env var is unset, the v3 DB is itself named
 
 from __future__ import annotations
 
-import os
+import logging
 
 import psycopg2
 
 from skill_library_v3.config import get_settings
 
+logger = logging.getLogger(__name__)
+
+_LOGGED_ONCE = False
+
 
 def connect():
     """Open a fresh psycopg2 connection to the v3 (skill-library) database."""
-    conn = psycopg2.connect(get_settings().skill_library_pg_dsn)
-    schema = os.getenv("SKILL_LIBRARY_SCHEMA", "").strip()
+    global _LOGGED_ONCE
+    settings = get_settings()
+    conn = psycopg2.connect(settings.skill_library_pg_dsn)
+    schema = (settings.skill_library_schema or "").strip()
     if schema:
         with conn.cursor() as cur:
             cur.execute(
@@ -32,4 +38,10 @@ def connect():
                 )
             )
         conn.commit()
+    if not _LOGGED_ONCE:
+        logger.info(
+            "[v3-db] connected; search_path schema=%r (empty = default public)",
+            schema,
+        )
+        _LOGGED_ONCE = True
     return conn
