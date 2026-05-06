@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from cost_tracker import CostAccumulator
 
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
@@ -11,7 +17,7 @@ from openai import AsyncAzureOpenAI
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
-_AZURE_DEPLOYMENT = "gpt-4o-mini"
+_AZURE_DEPLOYMENT = "gpt-5.4-mini"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 _SYSTEM_PROMPT = """\
@@ -260,6 +266,86 @@ Output schema:
   {"skills":[...],"non_skills":[...],"jd_role_hint":{...}} as specified above.
 """
 
+_CONTEXT_CLASSIFY_SYSTEM_PROMPT = """\
+You are a job-description skill classifier. Be STRICT — precision matters more than recall.
+
+Each input item has a "word" (a candidate skill) and a "sentence" from the JD.
+Use BOTH the word AND sentence to decide. When "sentence" is empty, be very conservative.
+
+==============================================================
+ACCEPT as skill
+==============================================================
+- Named tool / framework / library  (Docker, React, Kafka, Terraform, mdadm)
+- Programming / query / markup language  (Python, SQL, YAML, Java, Bash)
+- Cloud platform or managed service  (AWS, Azure GCP, Kubernetes, ECS)
+- Named enterprise platform or product module used as a skill requirement
+  e.g. "Workday Studio Java" in "build integrations in Workday Studio Java" → skill
+- Named methodology, standard, or certification  (Agile, OWASP, CI/CD, REST API)
+- Engineering activity domain used as a job requirement
+  (Microservices Architecture, Message Queues, Continuous Integration, Integration Testing)
+
+==============================================================
+REJECT as non_skill — even if it sounds technical
+==============================================================
+1. SQL / programming language SYNTAX ELEMENTS — the language is the skill, not its pieces.
+   WHERE Clause, HAVING Clause, GROUP BY, ORDER BY, WHILE Loop, FOR Loop,
+   IF/ELSE, Try/Catch, Switch Statement, Primitive Types, JSON Data Type,
+   Window.open, Array Methods, String Methods  →  non_skill
+
+2. Web browser / OS names used in a compatibility or testing context.
+   Microsoft Edge, Internet Explorer, Chrome, Firefox, Safari, Windows, macOS
+   →  "Ensure compatibility with Microsoft Edge" does NOT make Edge a skill.
+
+3. Generic ITSM / project nouns without a named framework behind them.
+   Problem Management, Change Management, Incident Management, Ticket Management
+   →  non_skill. (Exception: "ITIL Problem Management" with ITIL named = skill.)
+
+4. Section headings, labels, and HR boilerplate.
+   Job Level, Diploma, BCA, ISMS, certifications (bare word), Requirements
+
+5. Generic qualifiers or document/process labels.
+   basics, documents, completion, tickets, resolutions, policies, internet,
+   connectivity, installations, Diploma, Degree, certifications (bare)
+
+6. Support / job-level tiers used as tier labels.
+   L1, L2, L3  (when sentence shows support tier, not a technology level)
+
+==============================================================
+EMPTY SENTENCE RULE
+==============================================================
+If "sentence" is empty or less than 5 characters:
+  ACCEPT only if the word is an unambiguous, widely-known named technology
+  (Python, Docker, AWS, Kubernetes, React, etc.).
+  REJECT everything else — multi-word phrases, SQL syntax, generic management nouns.
+
+==============================================================
+OUTPUT — strict JSON, no markdown fences
+==============================================================
+{
+  "skills": ["<word value exactly as given>", ...],
+  "non_skills": ["<word value exactly as given>", ...]
+}
+When payload includes non-empty "role_hint_excerpt", also add:
+  "jd_role_hint": {"display_name":"<role>","slug":"<kebab>",
+                   "role_archetype":"<1 sentence>","rationale":"<1 sentence>"}
+
+Rules: output WORD VALUE exactly as given. Every item in exactly ONE array. No omissions.
+
+Examples:
+{"word":"WHERE Clause","sentence":"Filter records using WHERE clause"} → non_skill
+{"word":"Microsoft Edge","sentence":"Ensure compatibility with Microsoft Edge"} → non_skill
+{"word":"WHILE Loop","sentence":"Use WHILE loop for batch processing"} → non_skill
+{"word":"Primitive Types","sentence":"Understand Primitive Types in Java"} → non_skill
+{"word":"Problem Management","sentence":"Handle Problem Management process"} → non_skill
+{"word":"Docker","sentence":"Deploy services using Docker containers"} → skill
+{"word":"REST API","sentence":"Design and consume REST APIs"} → skill
+{"word":"Workday Studio Java","sentence":"Build integrations using Workday Studio Java"} → skill
+{"word":"Kubernetes","sentence":"Manage workloads on Kubernetes clusters"} → skill
+{"word":"mdadm","sentence":"RAID management using mdadm on Linux"} → skill
+{"word":"L1","sentence":"Handle L1/L2 support tickets"} → non_skill
+{"word":"basics","sentence":"strong basics in networking"} → non_skill
+"""
+
 
 def _slugify_display(text: str) -> str:
     out: list[str] = []
@@ -375,13 +461,17 @@ class AzureUnknownWordClassifier:
         return out
 
     async def classify_words(
-        self, words: list[str], *, jd_text: str | None = None
+        self,
+        words: list[str],
+        *,
+        jd_text: str | None = None,
+        accumulator: "CostAccumulator | None" = None,
     ) -> dict[str, Any]:
         if not words:
             return {"skills": [], "non_skills": []}
 
         raw_jd = (jd_text or "").strip()
-        max_chars = 48_000
+        max_chars = 12_000  # ~3,000 tokens; covers even long JDs, typical JDs are 3-8k chars
         if len(raw_jd) > max_chars:
             raw_jd = raw_jd[:max_chars]
 
@@ -400,6 +490,8 @@ class AzureUnknownWordClassifier:
                 "Still only skills and non_skills as the word buckets."
             )
 
+        # logger.info("[LLM INPUT] model=%s | words_count=%d | jd_text_chars=%d",
+        #             self.deployment, len(words), len(raw_jd))
         first = await self.client.chat.completions.create(
             model=self.deployment,
             messages=[
@@ -409,9 +501,12 @@ class AzureUnknownWordClassifier:
             response_format={"type": "json_object"},
             max_completion_tokens=2000,
         )
-
+        if accumulator is not None and first.usage is not None:
+            accumulator.add(self.deployment, first.usage.prompt_tokens, first.usage.completion_tokens)
+        _out = first.choices[0].message.content or ""
+        # logger.info("[LLM OUTPUT] model=%s | response=%s", self.deployment, _out[:1000])
         try:
-            parsed = _parse_json_object(first.choices[0].message.content or "")
+            parsed = _parse_json_object(_out)
             return self._normalize(parsed, include_jd_role_hint=include_hint)
         except Exception as first_exc:
             retry = await self.client.chat.completions.create(
@@ -453,6 +548,8 @@ class AzureUnknownWordClassifier:
                 response_format={"type": "json_object"},
                 max_completion_tokens=2000,
             )
+            if accumulator is not None and retry.usage is not None:
+                accumulator.add(self.deployment, retry.usage.prompt_tokens, retry.usage.completion_tokens)
             try:
                 parsed = _parse_json_object(retry.choices[0].message.content or "")
                 return self._normalize(parsed, include_jd_role_hint=include_hint)
@@ -461,3 +558,50 @@ class AzureUnknownWordClassifier:
                     "LLM classification failed in both attempts. "
                     f"first={first_exc!r}; retry={retry_exc!r}"
                 ) from retry_exc
+
+    async def classify_with_context(
+        self,
+        items: list[dict],
+        *,
+        role_hint_excerpt: str | None = None,
+        accumulator: "CostAccumulator | None" = None,
+    ) -> dict[str, Any]:
+        """Classify skill candidates using per-word JD sentence context.
+
+        items: [{"word": str, "sentence": str}, ...]
+        No full JD is sent — only short sentence snippets per word.
+        Returns {"skills": [...], "non_skills": [...], optional "jd_role_hint": {...}}.
+        """
+        if not items:
+            return {"skills": [], "non_skills": []}
+
+        excerpt = (role_hint_excerpt or "").strip()[:600]
+        body: dict[str, Any] = {"items": items}
+        if excerpt:
+            body["role_hint_excerpt"] = excerpt
+        payload = json.dumps(body, ensure_ascii=False)
+        include_hint = bool(excerpt)
+
+        # logger.info(
+        #     "[LLM INPUT] model=%s | classify_with_context items=%d role_hint=%s",
+        #     self.deployment, len(items), include_hint,
+        # )
+        resp = await self.client.chat.completions.create(
+            model=self.deployment,
+            messages=[
+                {"role": "system", "content": _CONTEXT_CLASSIFY_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            response_format={"type": "json_object"},
+            max_completion_tokens=len(items) * 20 + 400,
+        )
+        if accumulator is not None and resp.usage is not None:
+            accumulator.add(self.deployment, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+        _out = resp.choices[0].message.content or ""
+        # logger.info("[LLM OUTPUT] model=%s | response=%s", self.deployment, _out[:1000])
+        try:
+            parsed = _parse_json_object(_out)
+            return self._normalize(parsed, include_jd_role_hint=include_hint)
+        except Exception:
+            # logger.warning("classify_with_context parse failed: %s — falling back to empty", exc)
+            return {"skills": [], "non_skills": [w["word"] for w in items]}

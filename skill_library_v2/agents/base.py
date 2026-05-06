@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cost_tracker import CostAccumulator
 
 from openai import APIError, APITimeoutError, AsyncAzureOpenAI, RateLimitError
 from pydantic import BaseModel, ValidationError
@@ -73,6 +76,7 @@ class BaseLLMAgent:
     def __init__(self, *, agent_name: str, prompt_version: str) -> None:
         self.agent_name = agent_name
         self.prompt_version = prompt_version
+        self._accumulator: "CostAccumulator | None" = None
 
     # ── Client + model name ──────────────────────────────────────────────
     def get_client(self) -> AsyncAzureOpenAI:
@@ -152,8 +156,16 @@ class BaseLLMAgent:
                             kwargs["temperature"] = temperature
                             if max_output_tokens is not None:
                                 kwargs["max_tokens"] = max_output_tokens
+                        logger.info("[LLM INPUT] agent=%s model=%s | system=%s | user=%s",
+                                    self.agent_name, self.model_name,
+                                    system_prompt[:300].replace("\n", " "),
+                                    user_prompt[:500])
                         resp = await client.chat.completions.create(**kwargs)
                         last_raw = resp.choices[0].message.content or ""
+                        logger.info("[LLM OUTPUT] agent=%s model=%s | response=%s",
+                                    self.agent_name, self.model_name, last_raw[:1000])
+                        if self._accumulator is not None and resp.usage is not None:
+                            self._accumulator.add(self.model_name, resp.usage.prompt_tokens, resp.usage.completion_tokens)
 
                 return parse_llm_json(last_raw, schema)
 

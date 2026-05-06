@@ -5,12 +5,17 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from cost_tracker import CostAccumulator
 
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
 
-from llm_client import REASONING_MODEL
+from llm_client import FAST_MODEL
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
@@ -24,8 +29,7 @@ _JSON_OBJECT_USER_SUFFIX = (
 )
 
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
-# Same default as PlannerAgent / skill_library_v2 reasoning tier (o4-mini).
-_AZURE_DEPLOYMENT = REASONING_MODEL
+_AZURE_DEPLOYMENT = FAST_MODEL
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 _DIFFICULTY_HINTS = {"well_known", "evolving", "niche", "frontier"}
@@ -58,7 +62,7 @@ the catalogue's exact slug (e.g. `ci_cd`, `monitoring_tools`,
 `infrastructure_as_code`) — NOT a re-slugified version of the display_name.
 
 ==============================================================
-OUTPUT SCHEMA (strict — no extra keys, no markdown)
+OUTPUT SCHEMA (strict JSON — no extra keys, no markdown)
 ==============================================================
 {
   "skills": [
@@ -85,7 +89,7 @@ Rules:
   for slug (or lower-snake_case if you want to align with existing catalogue
   conventions).
 - difficulty_hint must be one of: well_known, evolving, niche, frontier.
-- Keep rationale short (<= 120 chars). No markdown. No extra keys.
+- Keep rationale short (<= 80 chars). No markdown. No extra keys.
 """
 
 _ROLE_SYSTEM_PROMPT = """\
@@ -212,6 +216,58 @@ Rules:
 - No extra keys. No markdown. No commentary outside the JSON object.
 """
 
+_DIMENSIONS_AND_ENRICH_SYSTEM_PROMPT = """\
+You are a reverse skill planner and metadata classifier. For each input skill
+return BOTH its dimensions AND its metadata in one response.
+
+==============================================================
+PART 1 — DIMENSIONS (reuse catalogue first)
+==============================================================
+The user payload includes a `catalogue` array of EXISTING dimensions.
+Each entry has {slug, display_name, difficulty_hint}.
+- If ANY catalogue entry fits, reuse its slug and display_name VERBATIM.
+- Only invent a new dimension when NO catalogue entry fits.
+- Prefer 1 catalogue dimension over inventing 2 new ones.
+- For `source: "catalogue"`: copy display_name + slug exactly.
+- For `source: "new"`: Title Case display_name, lower-kebab-case slug.
+
+==============================================================
+PART 2 — METADATA
+==============================================================
+- skill_nature  : TOOL | CONCEPT | PRACTICE | PLATFORM | LANGUAGE | CREDENTIAL
+- typical_lifespan: EVERGREEN | MULTI_YEAR | SHORT_LIVED
+- category: concise label e.g. "Programming Languages", "DevOps Tools",
+  "Cloud Platforms", "Databases", "Container Orchestration", "Soft Skills"
+- sub_category: optional finer grouping, or null
+
+==============================================================
+OUTPUT SCHEMA (strict JSON — no extra keys, no markdown)
+==============================================================
+{
+  "skills": [
+    {
+      "skill": "<original skill name exactly as provided>",
+      "dimensions": [
+        {
+          "display_name": "<dimension display_name>",
+          "slug": "<dimension slug>",
+          "source": "catalogue" | "new",
+          "rationale": "<one short sentence, <= 80 chars>",
+          "difficulty_hint": "well_known | evolving | niche | frontier"
+        }
+      ],
+      "category": "<category label>",
+      "sub_category": "<sub-category or null>",
+      "skill_nature": "<TOOL|CONCEPT|PRACTICE|PLATFORM|LANGUAGE|CREDENTIAL>",
+      "typical_lifespan": "<EVERGREEN|MULTI_YEAR|SHORT_LIVED>"
+    }
+  ]
+}
+
+Rules: difficulty_hint must be one of: well_known, evolving, niche, frontier.
+No extra keys. No markdown. No commentary outside the JSON object.
+"""
+
 _PICK_ROLE_SYSTEM_PROMPT = """\
 You pick the SINGLE most appropriate role for a job description given the
 evidence collected by an upstream skill-extraction pipeline.
@@ -219,94 +275,54 @@ evidence collected by an upstream skill-extraction pipeline.
 ==============================================================
 INPUTS (user payload)
 ==============================================================
-- candidates: a list of role candidates already aggregated from the
-  pipeline. Each candidate has {source, slug, display_name, role_archetype}
-  and OPTIONALLY an "id" field. A candidate with an "id" comes from the
-  skill library (DB); a candidate without an "id" was invented by an
-  earlier per-skill LLM call. Candidates may be empty.
+- candidates: role candidates from the pipeline. Each has {source, slug,
+  display_name} and OPTIONALLY an "id" (DB-sourced when present).
 - context.final_skills: every skill the pipeline kept for this JD.
-- context.matched_canonical_skills: skills that already exist in the
-  skill library.
-- context.unmatched_llm_skills: skills classified by an LLM but not yet in
-  the library.
-- context.dimensions: flat list of every dimension that came out of the
-  pipeline.
-- context.jd_role_hint: OPTIONAL object from API 1 reading the same JD text:
-  {display_name, slug, role_archetype, rationale}. It is a weak prior — when
-  evidence in skill_dimension_role_map is ambiguous or tied between DB
-  candidates, lean toward agreeing with jd_role_hint. If the map strongly
-  contradicts jd_role_hint, follow the map and candidates instead.
-- context.skill_dimension_role_map: array of rows — one per (skill, dimension)
-  pair. Each row has:
-    - "skill": input skill string
-    - "dimension": { source, id, slug, display_name }
-    - "roles_from_db": 0+ roles linked in the skill library for that dimension
-      (may be incomplete or historically biased — e.g. only "Data Engineer").
-    - "llm_role": a single role the per-pair inference model suggests from
-      the skill + dimension rationale (may disagree with roles_from_db).
-  You MUST read both roles_from_db AND llm_role on every row. When they
-  conflict, weight the dimension rationale + overall JD; do not blindly
-  count DB rows if llm_role consistently describes a better umbrella.
+- context.jd_role_hint: OPTIONAL weak prior from the JD text:
+  {display_name, slug}. Use as tie-breaker only.
+- context.dimension_role_map: one entry PER UNIQUE DIMENSION. Each entry:
+    - "dimension": { slug, display_name }
+    - "skills": all input skills that map to this dimension
+    - "roles_from_db": list of up to 3 role display_names linked to this dimension
+    - "llm_roles": per-skill LLM-inferred roles [{skill, slug, display_name}]
+  Use roles_from_db + llm_roles together — if llm_roles consistently name
+  a role the DB doesn't list, prefer the LLM signal.
 
 ==============================================================
-TWO ALLOWED PATHS — choose the one that better describes the JD
+TWO ALLOWED PATHS
 ==============================================================
-Path A — REUSE a DB candidate (preferred when applicable).
-  - Pick the candidate whose "id" is set AND whose role best summarises
-    the mix in skill_dimension_role_map.
-  - Set source_role_id to that candidate's id.
-  - Use the candidate's display_name verbatim. (The wrapper will overwrite
-    slug + display_name from the DB row anyway, but stay consistent.)
+Path A — REUSE a DB candidate (preferred).
+  Pick the candidate with "id" set that best summarises the dimension_role_map.
+  Set source_role_id to that candidate's id.
 
-Path B — INVENT a brand-new role outside the candidates.
-  - You are NOT restricted to the candidate list. If no candidate cleanly
-    summarises the JD, invent a canonical role name (e.g. "DevOps Engineer",
-    "Site Reliability Engineer", "Backend Engineer", "Platform Engineer",
-    "ML Engineer", "Network Engineer", "Security Engineer").
-  - Set source_role_id to null.
-  - Use a slug that is lower-kebab-case of display_name.
+Path B — INVENT a role not in the candidate list.
+  Use when no candidate cleanly fits. Pick a canonical name (e.g.
+  "DevOps Engineer", "Backend Engineer", "Platform Engineer", "SRE",
+  "Data Engineer", "ML Engineer"). Set source_role_id to null.
 
 ==============================================================
 DECISION HEURISTIC
 ==============================================================
-If context.jd_role_hint is present, use it as a tie-breaker: prefer DB
-candidates or Path B outcomes that align with its display_name when two
-choices are otherwise reasonable.
-
-Scan skill_dimension_role_map and count, per DB candidate, how many rows
-include that candidate in `roles_from_db`. Also note `llm_role` per row —
-if many rows agree on one llm_role (e.g. DevOps Engineer) while DB only
-lists Data Engineer, weight the dimension rationales toward the LLM vote.
-
-Then:
-  - If ONE candidate covers >= 60% of entries, choose Path A with that
-    candidate.
-  - If TWO candidates split the evidence roughly evenly AND a single
-    canonical role describes the overall JD better than either, choose
-    Path B (e.g. lots of CI/CD + IaC + containers + monitoring => the
-    JD is DevOps even if your DB only has Data Engineer + Frontend
-    Developer).
-  - When ties remain, prefer Path A so the chosen role keeps a stable
-    DB id.
+Count, per DB candidate, how many dimensions include it in roles_from_db
+(weight by skills array length). Also tally llm_roles votes across dimensions.
+- ONE candidate covers >= 60% → Path A with that candidate.
+- Split evidence + a cleaner canonical umbrella exists → Path B.
+- Tie → prefer Path A for stable DB id.
+Use jd_role_hint only to break remaining ties.
 
 ==============================================================
 OUTPUT — STRICT JSON only, no markdown fences
 ==============================================================
-Schema:
 {
   "display_name": "<Chosen Role Display Name>",
   "slug": "<kebab-case-of-display-name>",
   "role_archetype": "<short 1-2 sentence description>",
-  "rationale": "<one short sentence grounded in skill_dimension_role_map>",
+  "rationale": "<one short sentence grounded in dimension_role_map>",
   "source_role_id": <integer or null>
 }
 
-Rules:
-- Pick exactly ONE role.
-- source_role_id MUST be the integer id of a candidate (Path A) or null
-  (Path B). Never invent an id.
-- Prefer canonical role names. No extra keys. No markdown. No prose
-  outside the JSON object.
+Rules: ONE role. source_role_id = candidate id (Path A) or null (Path B).
+No extra keys. No markdown. No prose outside the JSON object.
 """
 
 
@@ -358,7 +374,11 @@ def _is_o_series_deployment(name: str) -> bool:
 
 
 class AzureReversePlannerLLM:
-    def __init__(self, deployment: str | None = None) -> None:
+    def __init__(
+        self,
+        deployment: str | None = None,
+        accumulator: "CostAccumulator | None" = None,
+    ) -> None:
         api_key = os.getenv("AZURE_OPEN_AI_KEY")
         if not api_key:
             raise ValueError("AZURE_OPEN_AI_KEY is required.")
@@ -367,11 +387,11 @@ class AzureReversePlannerLLM:
             azure_endpoint=os.getenv("AZURE_OPEN_AI_ENDPOINT", _AZURE_ENDPOINT),
             api_version=os.getenv("AZURE_OPEN_AI_API_VERSION", _AZURE_API_VERSION),
         )
-        # Align with PlannerAgent: REASONING_DEPLOYMENT / o4-mini.
         self.deployment = deployment or os.getenv(
-            "REASONING_DEPLOYMENT",
+            "FAST_DEPLOYMENT",
             _AZURE_DEPLOYMENT,
         )
+        self._accumulator = accumulator
 
     async def _call(
         self,
@@ -393,9 +413,17 @@ class AzureReversePlannerLLM:
         if not _is_o_series_deployment(self.deployment):
             kwargs_first["max_completion_tokens"] = max_completion_tokens
 
+        # logger.info("[LLM INPUT] model=%s | system=%s | user=%s",
+        #             self.deployment,
+        #             system_prompt[:300].replace("\n", " "),
+        #             user_payload[:500])
         first = await self.client.chat.completions.create(**kwargs_first)
+        if self._accumulator is not None and first.usage is not None:
+            self._accumulator.add(self.deployment, first.usage.prompt_tokens, first.usage.completion_tokens)
+        _out = first.choices[0].message.content or ""
+        # logger.info("[LLM OUTPUT] model=%s | response=%s", self.deployment, _out[:1000])
         try:
-            return _parse_json_object(first.choices[0].message.content or "")
+            return _parse_json_object(_out)
         except Exception as first_exc:
             msgs_retry: list[dict[str, str]] = [
                 {"role": "system", "content": system_prompt},
@@ -416,6 +444,8 @@ class AzureReversePlannerLLM:
             if not _is_o_series_deployment(self.deployment):
                 kwargs_retry["max_completion_tokens"] = max_completion_tokens
             retry = await self.client.chat.completions.create(**kwargs_retry)
+            if self._accumulator is not None and retry.usage is not None:
+                self._accumulator.add(self.deployment, retry.usage.prompt_tokens, retry.usage.completion_tokens)
             try:
                 return _parse_json_object(retry.choices[0].message.content or "")
             except Exception as retry_exc:
@@ -486,7 +516,6 @@ class AzureReversePlannerLLM:
             catalogue_payload.append({
                 "slug": slug,
                 "display_name": display,
-                "rationale": (entry.get("rationale") or "").strip()[:240],
                 "difficulty_hint": (
                     entry.get("difficulty_hint") or "well_known"
                 ),
@@ -579,11 +608,11 @@ class AzureReversePlannerLLM:
                     f"Batch response length mismatch: got {len(items)}, expected {len(pairs)}"
                 )
             return [self._normalize_role(item) for item in items]
-        except Exception as exc:
-            logger.warning(
-                "infer_roles_for_pairs batch failed (%s); falling back to individual calls",
-                exc,
-            )
+        except Exception:
+            # logger.warning(
+            #     "infer_roles_for_pairs batch failed (%s); falling back to individual calls",
+            #     exc,
+            # )
             return list(await asyncio.gather(*[
                 self.infer_role_for_skill(s, d) for s, d in pairs
             ]))
@@ -663,3 +692,83 @@ class AzureReversePlannerLLM:
         else:
             norm["source_role_id"] = None
         return norm
+
+    async def infer_dimensions_and_enrich(
+        self,
+        skills: list[str],
+        *,
+        dimension_catalogue: list[dict] | None = None,
+    ) -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[str, str | None]]]:
+        """Single LLM call replacing infer_dimensions + enrich_new_skills."""
+        if not skills:
+            return {}, {}
+
+        _valid_natures = {"TOOL", "CONCEPT", "PRACTICE", "PLATFORM", "LANGUAGE", "CREDENTIAL"}
+        _valid_lifespans = {"EVERGREEN", "MULTI_YEAR", "SHORT_LIVED"}
+
+        catalogue_payload: list[dict] = []
+        for entry in dimension_catalogue or []:
+            slug = (entry.get("slug") or "").strip()
+            display = (entry.get("display_name") or "").strip()
+            if not slug or not display:
+                continue
+            catalogue_payload.append({
+                "slug": slug,
+                "display_name": display,
+                "difficulty_hint": (entry.get("difficulty_hint") or "well_known"),
+            })
+
+        budget = min(500 + len(skills) * 200, 4000)
+        payload = json.dumps(
+            {"skills": skills, "catalogue": catalogue_payload},
+            ensure_ascii=False,
+        )
+        parsed = await self._call(
+            _DIMENSIONS_AND_ENRICH_SYSTEM_PROMPT,
+            payload,
+            max_completion_tokens=budget,
+        )
+
+        items = parsed.get("skills") or []
+        if not isinstance(items, list):
+            raise ValueError("Response missing 'skills' list.")
+
+        skill_lookup = {s.lower(): s for s in skills}
+        dims_out: dict[str, list[dict[str, str]]] = {s: [] for s in skills}
+        enrich_out: dict[str, dict[str, str | None]] = {}
+
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            raw_skill = (entry.get("skill") or "").strip()
+            if not raw_skill:
+                continue
+            original = skill_lookup.get(raw_skill.lower(), raw_skill)
+
+            dims_raw = entry.get("dimensions") or []
+            if isinstance(dims_raw, list):
+                seen_slugs: set[str] = set()
+                collected: list[dict[str, str]] = []
+                for d in dims_raw:
+                    norm = self._normalize_dimension(d)
+                    if not norm or norm["slug"] in seen_slugs:
+                        continue
+                    seen_slugs.add(norm["slug"])
+                    collected.append(norm)
+                if collected:
+                    dims_out[original] = collected
+
+            nature = (entry.get("skill_nature") or "").strip().upper()
+            if nature not in _valid_natures:
+                nature = "TOOL"
+            lifespan = (entry.get("typical_lifespan") or "").strip().upper()
+            if lifespan not in _valid_lifespans:
+                lifespan = "MULTI_YEAR"
+            enrich_out[original] = {
+                "category": (entry.get("category") or "").strip() or None,
+                "sub_category": (entry.get("sub_category") or "").strip() or None,
+                "skill_nature": nature,
+                "typical_lifespan": lifespan,
+            }
+
+        return dims_out, enrich_out
