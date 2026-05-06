@@ -31,16 +31,22 @@ def connect():
     conn = psycopg2.connect(settings.skill_library_pg_dsn)
     schema = (settings.skill_library_schema or "").strip()
     if schema:
+        # Include ``dev`` after the user schema and before ``public``: prod
+        # has the pgvector extension installed in ``dev``, so without ``dev``
+        # on the path ``'...'::vector`` casts fail with "type 'vector' does
+        # not exist". Postgres silently ignores nonexistent schemas in
+        # search_path, so this is a no-op on local.
         with conn.cursor() as cur:
             cur.execute(
-                'SET search_path TO "{schema}", public'.format(
+                'SET search_path TO "{schema}", dev, public'.format(
                     schema=schema.replace('"', '""')
                 )
             )
         conn.commit()
     if not _LOGGED_ONCE:
         logger.info(
-            "[v3-db] connected; search_path schema=%r (empty = default public)",
+            "[v3-db] connected; search_path schema=%r "
+            "(empty = default public; otherwise '<schema>, dev, public')",
             schema,
         )
         _LOGGED_ONCE = True

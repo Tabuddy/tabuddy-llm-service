@@ -10,7 +10,9 @@ What this does:
   4. Apply ``db/schema.sql`` (with the two CREATE EXTENSION lines stripped —
      extensions are already installed on prod by an admin).
   5. Apply ``db/schema_v2_additions.sql``.
-  6. Verify the expected table set.
+  6. Apply ``skill_library_v3/db/v3_additions.sql`` (jd_samples + two run-log
+     partial indexes used by Stage 0 / Stage 1 lookups).
+  7. Verify the expected table set.
 
 Safe to re-run: every statement is idempotent (CREATE TABLE IF NOT EXISTS,
 CREATE TYPE wrapped in DO blocks for the new ones, ON CONFLICT helpers).
@@ -41,6 +43,7 @@ EXPECTED_TABLES = {
     "roles", "dimensions", "role_dimensions", "dimension_skills",
     "dimension_categories", "skill_tags", "skill_relationships",
     "v2_run_log", "v2_review_queue", "role_aliases",
+    "jd_samples",
 }
 EXPECTED_TYPES = {
     "skill_nature", "skill_volatility", "skill_lifespan", "version_strategy",
@@ -94,6 +97,10 @@ def main() -> None:
 
     sql_main = _read_sql("db/schema.sql", strip_extensions=True)
     sql_addn = _read_sql("db/schema_v2_additions.sql", strip_extensions=True)
+    sql_v3 = _read_sql(
+        "skill_library_v3/db/v3_additions.sql",
+        strip_extensions=True,
+    )
 
     with psycopg2.connect(dsn) as conn:
         with conn.cursor() as cur:
@@ -130,6 +137,8 @@ def main() -> None:
             cur.execute(sql_main)
             logger.info("applying db/schema_v2_additions.sql ...")
             cur.execute(sql_addn)
+            logger.info("applying skill_library_v3/db/v3_additions.sql ...")
+            cur.execute(sql_v3)
 
             tables = _table_set(cur, SCHEMA_NAME)
             types = _type_set(cur, SCHEMA_NAME)
