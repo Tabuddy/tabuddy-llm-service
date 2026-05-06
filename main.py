@@ -38,6 +38,7 @@ from unknown_word_classifier import AzureUnknownWordClassifier
 from reverse_planner_llm import AzureReversePlannerLLM
 from skill_library_repository import SkillLibraryRepository
 from skill_library_v2.agents.planner import PlannerAgent
+from cost_tracker import CostAccumulator
 from pathlib import Path
 import tempfile
 import time
@@ -370,6 +371,19 @@ def _dedupe_case_insensitive(values: list[str]) -> list[str]:
     return out
 
 
+def _extract_jd_sentence(jd_text: str, word: str, max_chars: int = 180) -> str:
+    """Return the first JD sentence containing word (case-insensitive, up to max_chars)."""
+    import re as _re
+    for sent in _re.split(r"[.!\?\n;]+", jd_text):
+        if _re.search(r"\b" + _re.escape(word) + r"\b", sent, _re.IGNORECASE):
+            return sent.strip()[:max_chars]
+    # fallback: find any occurrence ignoring word boundaries (handles C++, .NET etc.)
+    for sent in _re.split(r"[.!\?\n;]+", jd_text):
+        if word.lower() in sent.lower():
+            return sent.strip()[:max_chars]
+    return ""
+
+
 def _norm_token(v: str | None) -> str:
     return (v or "").strip().lower().replace("_", "-")
 
@@ -445,7 +459,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
     stage1 = await asyncio.to_thread(process_jd, jd_text)
-    initial_skills = _clean_strings(stage1.get("skills"))
+    initial_skills_raw = _clean_strings(stage1.get("skills"))
     unknown_words = _clean_strings(stage1.get("unknown_words"))
 
     repo = NonSkillRepository()
@@ -453,14 +467,31 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         repo.filter_non_skills, unknown_words
     )
 
+    # ── Stage 2: LLM verification of ALL candidates with sentence context ────
+    # All candidates (DB-matched initial skills + spaCy unknowns) are verified
+    # together. Each word is paired with its JD sentence — no full JD is sent.
+    # This catches noise in initial_skills (e.g. "Job Level", "Form Routines")
+    # and context-dependent unknowns (e.g. "L1" as a support tier = non-skill).
+    cost_acc = CostAccumulator()
+    initial_skills: list[str] = []
     llm_skills: list[str] = []
     llm_non_skills: list[str] = []
     jd_role_hint: JdRoleHint | None = None
-    if filtered_unknown_words:
+
+    all_candidates = _dedupe_case_insensitive(initial_skills_raw + filtered_unknown_words)
+    if all_candidates:
         classifier = AzureUnknownWordClassifier()
+        items_with_context = [
+            {"word": w, "sentence": _extract_jd_sentence(jd_text, w)}
+            for w in all_candidates
+        ]
+        # Short JD excerpt for role hint inference only (first 600 chars)
+        role_excerpt = jd_text[:600]
         try:
-            llm_result = await classifier.classify_words(
-                filtered_unknown_words, jd_text=jd_text
+            llm_result = await classifier.classify_with_context(
+                items_with_context,
+                role_hint_excerpt=role_excerpt,
+                accumulator=cost_acc,
             )
         except Exception as exc:
             raise HTTPException(
@@ -468,35 +499,47 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 detail=f"Stage-2 LLM classification failed: {exc}",
             ) from exc
 
-        llm_skills = _clean_strings(llm_result.get("skills"))
-        llm_non_skills = _clean_strings(llm_result.get("non_skills"))
+        verified_set = {w.lower() for w in _clean_strings(llm_result.get("skills"))}
+        non_skill_set = {w.lower() for w in _clean_strings(llm_result.get("non_skills"))}
+
+        # Split verified back: initial vs newly-discovered
+        initial_skills = [w for w in initial_skills_raw if w.lower() in verified_set]
+        llm_skills = [w for w in filtered_unknown_words if w.lower() in verified_set]
+
+        # Non-skills: only persist words from unknown_words (not DB canonical names)
+        unknown_lower = {w.lower() for w in filtered_unknown_words}
+        llm_non_skills = [
+            w for w in all_candidates
+            if w.lower() in non_skill_set and w.lower() in unknown_lower
+        ]
 
         hint_raw = llm_result.get("jd_role_hint")
         if isinstance(hint_raw, dict) and (hint_raw.get("display_name") or "").strip():
             _arc = hint_raw.get("role_archetype")
             _rat = hint_raw.get("rationale")
-            _arc_s = str(_arc).strip() if _arc is not None else ""
-            _rat_s = str(_rat).strip() if _rat is not None else ""
             jd_role_hint = JdRoleHint(
                 display_name=str(hint_raw["display_name"]).strip(),
                 slug=str(hint_raw.get("slug") or "").strip(),
-                role_archetype=_arc_s or None,
-                rationale=_rat_s or None,
+                role_archetype=(str(_arc).strip() if _arc is not None else "") or None,
+                rationale=(str(_rat).strip() if _rat is not None else "") or None,
             )
 
-        # Guardrail: deployments is an activity-domain skill for downstream
-        # reverse-planning and should never be persisted as non-skill.
+        # Guardrail: deployments is an activity-domain skill and must never be
+        # persisted as non-skill.
         if "deployments" in {w.lower() for w in filtered_unknown_words}:
-            skills_lc = {w.lower() for w in llm_skills}
             llm_non_skills = [w for w in llm_non_skills if w.lower() != "deployments"]
-            if "deployments" not in skills_lc:
+            if "deployments" not in {w.lower() for w in llm_skills}:
                 llm_skills.append("deployments")
 
-        await asyncio.to_thread(repo.add_non_skills, llm_non_skills)
+        if llm_non_skills:
+            await asyncio.to_thread(repo.add_non_skills, llm_non_skills)
+    else:
+        initial_skills = initial_skills_raw
 
     final_skills = _dedupe_case_insensitive(initial_skills + llm_skills)
     final_non_skills = _dedupe_case_insensitive(llm_non_skills)
 
+    # cost_acc.log_summary("skills/extract-from-jd", logger)
     return JDSkillPipelineResponse(
         initial_skills=initial_skills,
         unknown_words=unknown_words,
@@ -571,8 +614,9 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     llm_skills = _dedupe_case_insensitive(_clean_strings(req.llm_skills))
     llm_skills_lower = {s.lower() for s in llm_skills}
 
+    cost_acc = CostAccumulator()
     repo = SkillLibraryRepository()
-    planner = AzureReversePlannerLLM()
+    planner = AzureReversePlannerLLM(accumulator=cost_acc)
 
     # ── Stage 1: alias resolution for ALL final_skills ──────────────────────
     # We resolve every final_skill (not just llm_skills) so initial_skills
@@ -721,9 +765,9 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             dimension_catalogue = await asyncio.to_thread(
                 repo.fetch_dimension_catalogue
             )
-            if len(dimension_catalogue) > 100:
-                step = len(dimension_catalogue) // 100
-                dimension_catalogue = dimension_catalogue[::step][:100]
+            if len(dimension_catalogue) > 40:
+                step = len(dimension_catalogue) // 40
+                dimension_catalogue = dimension_catalogue[::step][:40]
         except Exception as exc:
             logger.warning(
                 "fetch_dimension_catalogue failed; LLM will run ungrounded: %s",
@@ -731,24 +775,16 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             )
             dimension_catalogue = []
 
-        dims_result, enrich_result = await asyncio.gather(
-            planner.infer_dimensions(
+        try:
+            dimensions_by_skill, skill_enrichment = await planner.infer_dimensions_and_enrich(
                 unmatched_llm_skills,
                 dimension_catalogue=dimension_catalogue,
-            ),
-            planner.enrich_new_skills(unmatched_llm_skills),
-            return_exceptions=True,
-        )
-        if isinstance(dims_result, Exception):
+            )
+        except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"Reverse planner LLM (infer_dimensions) failed: {dims_result}",
-            ) from dims_result
-        dimensions_by_skill = dims_result
-        if isinstance(enrich_result, Exception):
-            logger.warning("enrich_new_skills failed: %s", enrich_result)
-        else:
-            skill_enrichment = enrich_result
+                detail=f"Reverse planner LLM (infer_dimensions_and_enrich) failed: {exc}",
+            ) from exc
 
     # Collect every (skill, llm_dim) pair for DB lookup and possible LLM role.
     llm_pairs: list[tuple[str, dict]] = []
@@ -780,9 +816,6 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             )
             roles_by_dim_id.update(extra_roles)
 
-    # Per (skill, dimension) pair: infer an LLM role even when the dimension
-    # is catalogue-grounded in the DB, so the picker can reconcile DB
-    # role_dimensions vs semantic fit (e.g. IaC / monitoring → DevOps).
     pending_llm_roles: list[tuple[int, str, dict]] = []
     pending_llm_pair_meta: list[tuple[str, dict, dict | None]] = []
 
@@ -795,7 +828,19 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         )
         pending_llm_pair_meta.append((skill, d, db_row))
         idx = len(pending_llm_pair_meta) - 1
-        dim_for_infer = {**d}
+
+        # Skip LLM role inference when the dimension is in the DB and already
+        # has roles linked to it — the picker uses roles_from_db for those.
+        db_dim_id = int(db_row["id"]) if db_row and db_row.get("id") is not None else None
+        if db_dim_id is not None and roles_by_dim_id.get(db_dim_id):
+            continue
+
+        # Only send what the LLM needs: display_name + rationale (+ slug for identity).
+        dim_for_infer: dict = {
+            "display_name": d.get("display_name") or "",
+            "slug": d.get("slug") or "",
+            "rationale": d.get("rationale") or "",
+        }
         if db_row is not None:
             if db_row.get("display_name"):
                 dim_for_infer["display_name"] = str(db_row["display_name"])
@@ -804,11 +849,6 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             rat = db_row.get("rationale") or dim_for_infer.get("rationale")
             if rat:
                 dim_for_infer["rationale"] = str(rat)
-            dh = db_row.get("difficulty_hint") or dim_for_infer.get(
-                "difficulty_hint"
-            )
-            if dh:
-                dim_for_infer["difficulty_hint"] = str(dh)
         pending_llm_roles.append((idx, skill, dim_for_infer))
 
     # ── Role inference: ONE batched LLM call for unmatched LLM skill pairs only ─
@@ -1006,7 +1046,6 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 "source": c.source,
                 "slug": c.slug,
                 "display_name": c.display_name,
-                "role_archetype": c.role_archetype,
             }
             if c.id is not None:
                 payload["id"] = c.id
@@ -1029,42 +1068,27 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         _llm_cands = [p for p in _deduped if p.get("id") is None]
         cand_payload = (_db_cands + _llm_cands)[:25]
 
-        # Per (skill, dimension): DB-linked roles + separate per-pair LLM role.
-        skill_dimension_role_map: list[dict] = []
+        # Pivot to dimension-centric map: roles_from_db sent once per unique
+        # dimension instead of once per (skill × dimension) pair.
+        _dim_groups: dict[str, dict] = {}
         for dd in dimension_details:
-            roles_from_db_payload = [
-                {
-                    "source": "db",
-                    "id": r.id,
-                    "slug": r.slug,
-                    "display_name": r.display_name,
-                    "role_archetype": r.role_archetype,
+            slug = dd.dimension.slug
+            if slug not in _dim_groups:
+                _dim_groups[slug] = {
+                    "dimension": {"slug": slug, "display_name": dd.dimension.display_name},
+                    "skills": [],
+                    "roles_from_db": [r.display_name for r in dd.roles_from_db[:3]],
+                    "llm_roles": [],
                 }
-                for r in dd.roles_from_db
-            ]
-            llm_payload = None
+            _dim_groups[slug]["skills"].append(dd.input_skill)
             if dd.llm_role is not None:
                 lr = dd.llm_role
-                llm_payload = {
-                    "source": "llm",
-                    "id": lr.id,
+                _dim_groups[slug]["llm_roles"].append({
+                    "skill": dd.input_skill,
                     "slug": lr.slug,
                     "display_name": lr.display_name,
-                    "role_archetype": lr.role_archetype,
-                }
-                if lr.rationale:
-                    llm_payload["rationale"] = lr.rationale
-            skill_dimension_role_map.append({
-                "skill": dd.input_skill,
-                "dimension": {
-                    "source": dd.dimension.source,
-                    "id": dd.dimension.id,
-                    "slug": dd.dimension.slug,
-                    "display_name": dd.dimension.display_name,
-                },
-                "roles_from_db": roles_from_db_payload,
-                "llm_role": llm_payload,
-            })
+                })
+        dimension_role_map = list(_dim_groups.values())
 
         jd_role_hint_ctx = None
         if req.jd_role_hint is not None and (
@@ -1080,20 +1104,8 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
         context = {
             "final_skills": final_skills,
-            "matched_canonical_skills": [
-                info["canonical"].display_name
-                for info in matched_per_final.values()
-                if info["canonical"].display_name
-            ],
-            "unmatched_llm_skills": unmatched_llm_skills,
-            "dimensions": [
-                {"display_name": dd.dimension.display_name,
-                 "slug": dd.dimension.slug,
-                 "source": dd.dimension.source}
-                for dd in dimension_details
-            ],
-            "skill_dimension_role_map": skill_dimension_role_map,
             "jd_role_hint": jd_role_hint_ctx,
+            "dimension_role_map": dimension_role_map,
         }
         try:
             picked = await planner.pick_role(cand_payload, context)
@@ -1142,6 +1154,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 rationale=c.rationale,
             )
 
+    # cost_acc.log_summary("skills/extract-details", logger)
     return ExtractDetailsResponse(
         input_final_skills=final_skills,
         input_llm_skills=llm_skills,
@@ -1157,6 +1170,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
 @app.post("/skills/final-role-output", response_model=FinalRoleOutputResponse)
 async def final_role_output_endpoint(req: FinalRoleOutputRequest):
+    cost_acc = CostAccumulator()
     repo = SkillLibraryRepository()
 
     # 1) Build final input skills with in_db/new tags.
@@ -1371,6 +1385,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
         try:
             planner = PlannerAgent()
+            planner._accumulator = cost_acc
             plan, hints = await planner.run(
                 role_id=planner_output.role_id or "unknown_role",
                 role_display=planner_output.role_display or chosen.slug,
@@ -1417,6 +1432,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             logger.warning("planner generation failed for missing role=%r: %s", chosen.slug, exc)
             planner_output.payload = {"error": str(exc)}
 
+    # cost_acc.log_summary("skills/final-role-output", logger)
     return FinalRoleOutputResponse(
         chosen_role=chosen_role_out,
         final_input_skills=final_input_skills,

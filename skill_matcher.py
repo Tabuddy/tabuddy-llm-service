@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -9,6 +10,8 @@ from urllib.parse import urlparse
 import psycopg2
 import psycopg2.pool
 from opensearchpy import OpenSearch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,13 +60,175 @@ class SkillMatch:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HYBRID NGRAM SCAN — helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# These tokens look like common words but are always tech skills — skip LLM check.
+_ALWAYS_SKILL_TOKENS = frozenset({"c++", "c#", ".net", "f#", "objective-c", "c++17", "c++20"})
+
+
+def _tokenize_jd_words(jd_text: str) -> list[str]:
+    """Split JD into word tokens, preserving skill punctuation (+, #)."""
+    parts = re.split(r'[\s,;:|/\\()\[\]{}<>"\']+', jd_text)
+    tokens = []
+    for tok in parts:
+        tok = tok.strip(".!?-")
+        if tok and len(tok) >= 1:
+            tokens.append(tok)
+    return tokens
+
+
+def _build_ngrams(tokens: list[str], max_n: int = 3) -> list[str]:
+    """Generate 1-, 2-, and 3-gram phrases from a token list."""
+    ngrams: list[str] = []
+    n_tokens = len(tokens)
+    for n in range(1, max_n + 1):
+        for i in range(n_tokens - n + 1):
+            ngrams.append(" ".join(tokens[i : i + n]))
+    return ngrams
+
+
+def _extract_sentence_context(jd_text: str, word: str, max_chars: int = 200) -> str:
+    """Return the first sentence in jd_text that contains word (case-insensitive)."""
+    for sent in re.split(r"[.!?\n]+", jd_text):
+        if re.search(r"\b" + re.escape(word) + r"\b", sent, re.IGNORECASE):
+            return sent.strip()[:max_chars]
+    return word
+
+
+def _is_ambiguous_token(ngram_lower: str) -> bool:
+    """Return True if the matched n-gram needs LLM context to confirm it is a skill.
+
+    Multi-word phrases and tokens longer than 3 chars are specific enough to
+    accept directly.  Short single words ("Go", "R", "C", "SQL", "AWS" …)
+    share spelling with common English words and need a sentence-level check.
+    """
+    if ngram_lower in _ALWAYS_SKILL_TOKENS:
+        return False
+    if len(ngram_lower.split()) >= 2:
+        return False  # multi-word → unambiguous
+    return len(ngram_lower) <= 3
+
+
+def _llm_disambiguate(items: list[tuple[str, str]]) -> list[str]:
+    """Ask gpt-5.4-mini whether each short token is a tech skill in context.
+
+    items: [(canonical_name, sentence_snippet), ...]
+    Returns the subset of canonical_names confirmed as skills.
+    Falls back to [] if the LLM client is unavailable or the call fails.
+    """
+    if not items:
+        return []
+
+    from llm_client import get_fast_sync_client, FAST_MODEL
+
+    client = get_fast_sync_client()
+    if client is None:
+        # logger.warning("[ngram_scan] No LLM client available — skipping disambiguation of %d tokens", len(items))
+        return []
+
+    pairs = [{"skill": name, "sentence": sent} for name, sent in items]
+    prompt = (
+        "For each item decide if the skill name is used as a technical skill "
+        "in the given job-description sentence. "
+        'Return JSON: {"results": [{"skill": "...", "is_skill": true/false}]}\n\n'
+        f"Items: {json.dumps(pairs)}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=FAST_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You classify whether short tokens in job-description sentences "
+                        "are technical skills. Return valid JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_completion_tokens=len(items) * 30 + 100,
+            temperature=0,
+        )
+        out = json.loads(resp.choices[0].message.content or "{}")
+        confirmed = [r["skill"] for r in out.get("results", []) if r.get("is_skill")]
+        # logger.info("[ngram_scan] LLM disambiguated %d/%d as skills", len(confirmed), len(items))
+        return confirmed
+    except Exception as exc:
+        # logger.warning("[ngram_scan] LLM disambiguation failed: %s", exc)
+        return []
+
+
+def _ngram_skill_scan(jd_text: str, matcher: "SkillMatcher") -> list[str]:
+    """High-recall skill extraction via n-gram scanning against skill_aliases.
+
+    Tokenises jd_text into 1-, 2-, 3-grams, exact-matches them against the
+    canonical skill alias table, then:
+      - Multi-word / long tokens (>3 chars): accepted directly.
+      - Short single tokens (≤3 chars, e.g. "Go", "R", "SQL"): sent to LLM
+        with their sentence context for disambiguation.
+
+    Returns a list of confirmed canonical_name strings.
+    """
+    tokens = _tokenize_jd_words(jd_text)
+    raw_ngrams = _build_ngrams(tokens, max_n=3)
+
+    # Deduplicate, keeping first occurrence order
+    seen: set[str] = set()
+    unique_ngrams: list[str] = []
+    for ng in raw_ngrams:
+        k = ng.lower()
+        if k not in seen:
+            seen.add(k)
+            unique_ngrams.append(ng)
+
+    # Single SQL round-trip for all n-grams
+    exact_matches = matcher._batch_exact(unique_ngrams)
+
+    if not exact_matches:
+        return []
+
+    unambiguous: list[str] = []
+    ambiguous_items: list[tuple[str, str]] = []  # (canonical_name, sentence)
+
+    for ngram_lower, skill_match in exact_matches.items():
+        if _is_ambiguous_token(ngram_lower):
+            sentence = _extract_sentence_context(jd_text, ngram_lower)
+            ambiguous_items.append((skill_match.canonical_name, sentence))
+        else:
+            unambiguous.append(skill_match.canonical_name)
+
+    llm_confirmed = _llm_disambiguate(ambiguous_items)
+
+    all_confirmed = list(dict.fromkeys(unambiguous + llm_confirmed))
+    # logger.info(
+    #     "[ngram_scan] ngrams=%d exact_hits=%d unambiguous=%d ambiguous=%d llm_confirmed=%d total=%d",
+    #     len(unique_ngrams),
+    #     len(exact_matches),
+    #     len(unambiguous),
+    #     len(ambiguous_items),
+    #     len(llm_confirmed),
+    #     len(all_confirmed),
+    # )
+    return all_confirmed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_jd(jd_text: str, config: Config = None) -> dict:
     """
-    Full pipeline: JD text → SkillNer extraction → canonical DB matching (exact/fuzzy/vector)
+    Full pipeline: JD text → SkillNer extraction + OpenSearch n-gram scan
+                   → canonical DB matching (exact/fuzzy/vector)
                    + spaCy noun/propn/OOV extraction with unknown-word filtering.
+
+    Two complementary extraction passes are merged:
+      1. SkillNer (context-aware NLP) — high precision for known skill phrases.
+      2. N-gram scan (exhaustive alias lookup) — high recall; catches multi-word
+         skills and exact alias spellings that SkillNer misses.  Short ambiguous
+         tokens (≤3 chars) go through an LLM sentence-context check.
 
     Returns:
         {
@@ -72,20 +237,29 @@ def process_jd(jd_text: str, config: Config = None) -> dict:
         }
     """
     _load_skillner()
-    spacy_words = _extract_spacy_words(jd_text)
-    extracted   = _extract_skills_from_jd(jd_text)
+    config = config or Config()
+
+    spacy_words        = _extract_spacy_words(jd_text)
+    skillner_extracted = _extract_skills_from_jd(jd_text)
 
     with SkillMatcher(config) as matcher:
-        results       = matcher.match_many(extracted)
-        db_known      = matcher.known_terms()
+        # Pass 1 — SkillNer results through full exact → fuzzy → vector pipeline
+        skillner_results = matcher.match_many(skillner_extracted)
+        db_known         = matcher.known_terms()
 
-    skills = list(dict.fromkeys(
+        # Pass 2 — n-gram exact scan; returns canonical names directly
+        ngram_canonical = _ngram_skill_scan(jd_text, matcher)
+
+    skillner_skills = [
         r.canonical_name
-        for r in results
+        for r in skillner_results
         if r.matched() and r.confidence >= 0.60
-    ))
+    ]
 
-    extracted_lower = {s.lower() for s in extracted}
+    # Union both passes, preserving SkillNer order first
+    skills = list(dict.fromkeys(skillner_skills + ngram_canonical))
+
+    extracted_lower = {s.lower() for s in skillner_extracted}
     unknown_words = [
         w for w in spacy_words
         if w.lower() not in db_known and w.lower() not in extracted_lower
@@ -164,14 +338,19 @@ def _recover_ambiguous(jd_text: str) -> set[str]:
 
 
 def _extract_skills_from_jd(jd_text: str) -> list[str]:
-    extractor   = _load_skillner()
-    annotations = extractor.annotate(jd_text)
+    extractor = _load_skillner()
     skills: set[str] = set()
-    for m in annotations["results"]["full_matches"]:
-        skills.add(m["doc_node_value"].strip().title())
-    for m in annotations["results"]["ngram_scored"]:
-        if m["score"] >= 1:
+    try:
+        annotations = extractor.annotate(jd_text)
+        for m in annotations["results"]["full_matches"]:
             skills.add(m["doc_node_value"].strip().title())
+        for m in annotations["results"]["ngram_scored"]:
+            if m["score"] >= 1:
+                skills.add(m["doc_node_value"].strip().title())
+    except (IndexError, KeyError):
+        # SkillNer has a known IndexError bug on certain JD texts.
+        # Fall back to ambiguous-pattern recovery only.
+        pass
     skills.update(_recover_ambiguous(jd_text))
     return list(skills)
 
@@ -443,4 +622,4 @@ if __name__ == "__main__":
     """
 
     result = process_jd(jd)
-    print(json.dumps(result, indent=2))
+    # print(json.dumps(result, indent=2))

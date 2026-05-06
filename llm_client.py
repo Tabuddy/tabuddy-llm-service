@@ -1,7 +1,7 @@
 """Centralized Azure OpenAI client factory.
 
 Provides three client tiers:
-  - **fast** (gpt-4o-mini): block tagging, skill normalization, categorization
+  - **fast** (gpt-5.4-mini): block tagging, skill normalization, categorization
   - **reasoning** (o4-mini): JD atom extraction, role-fit scoring, section scoring
   - **generation** (gpt-5.4): skill Generator — needs current-world knowledge
 """
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
-FAST_MODEL = os.getenv("FAST_DEPLOYMENT", "gpt-4o-mini")
+FAST_MODEL = os.getenv("FAST_DEPLOYMENT", "gpt-5.4-mini")
 REASONING_MODEL = os.getenv("REASONING_DEPLOYMENT", "o4-mini")
 GENERATION_MODEL = os.getenv("GENERATION_DEPLOYMENT", "gpt-5-mini")
 EMBEDDING_MODEL = os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
@@ -45,7 +45,7 @@ def _api_key() -> str | None:
 # ── Async clients ─────────────────────────────────────────────────────────────
 
 def get_fast_client() -> AsyncAzureOpenAI | None:
-    """Return async client for gpt-4o-mini (fast extraction tasks)."""
+    """Return async client for gpt-5.4-mini (fast extraction tasks)."""
     global _fast_async
     if _fast_async is not None:
         return _fast_async
@@ -111,7 +111,7 @@ def get_embedding_client() -> AsyncAzureOpenAI | None:
 # ── Sync client (for blocking contexts like _match_skill_llm) ────────────────
 
 def get_fast_sync_client() -> AzureOpenAI | None:
-    """Return sync client for gpt-4o-mini."""
+    """Return sync client for gpt-5.4-mini."""
     global _fast_sync
     if _fast_sync is not None:
         return _fast_sync

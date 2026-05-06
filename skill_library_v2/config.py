@@ -25,7 +25,7 @@ class V2Settings(BaseSettings):
     firecrawl_api_key: str | None = None
     pg_dsn: str = "postgresql://postgres:postgres@localhost:5432/tabuddy"
     reasoning_deployment: str = "o4-mini"
-    fast_deployment: str = "gpt-4o-mini"
+    fast_deployment: str = "gpt-5.4-mini"
     generation_deployment: str = "gpt-5.4"
 
 
