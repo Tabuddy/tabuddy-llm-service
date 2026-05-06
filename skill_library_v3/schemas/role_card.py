@@ -65,7 +65,7 @@ class RoleCard(BaseModel):
     definition: str = Field(min_length=20, max_length=200)
     primary_responsibilities: str = Field(min_length=30, max_length=1200)
     common_artifacts: str = Field(min_length=20, max_length=1200)
-    distinguishing_tasks: str = Field(min_length=20, max_length=300)
+    distinguishing_tasks: str = Field(min_length=20, max_length=600)
     seniority_signals: SeniorityBand
     adjacent_roles: list[str] = Field(default_factory=list, min_length=0, max_length=15)
     always_load_skills: list[str] = Field(default_factory=list, min_length=0, max_length=10)
