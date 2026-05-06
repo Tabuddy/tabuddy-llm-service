@@ -1,0 +1,1805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TABuddy — Generate Skills (v3 admin)</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #23273a;
+      --border: #2e3348;
+      --primary: #6c5ce7;
+      --primary-light: #a29bfe;
+      --accent: #00cec9;
+      --accent2: #fdcb6e;
+      --text: #dfe6e9;
+      --text-dim: #8395a7;
+      --success: #00b894;
+      --warn: #fdcb6e;
+      --danger: #e17055;
+      --tag-bg: rgba(108, 92, 231, 0.15);
+      --tag-border: rgba(108, 92, 231, 0.3);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+    .page { padding: 1.25rem 1.5rem 2rem; }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .header h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--primary-light), var(--accent));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .header .sub { color: var(--text-dim); font-size: 0.85rem; margin-top: 0.15rem; }
+    .pill {
+      padding: 0.35rem 0.7rem;
+      border-radius: 999px;
+      background: rgba(0, 206, 201, 0.10);
+      border: 1px solid rgba(0, 206, 201, 0.3);
+      color: var(--accent);
+      font-size: 0.75rem;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      white-space: nowrap;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 320px 380px 1fr;
+      gap: 0.75rem;
+      height: calc(100vh - 130px);
+      min-height: 540px;
+    }
+    @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; height: auto; } }
+
+    .lane {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .lane-header {
+      padding: 0.7rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface2);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+    .lane-title {
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+    .lane-body { padding: 0.85rem; overflow: auto; flex: 1; }
+
+    label.field {
+      display: block;
+      margin-bottom: 0.85rem;
+      color: var(--text-dim);
+      font-size: 0.8rem;
+    }
+    label.field input,
+    label.field select,
+    label.field textarea {
+      width: 100%;
+      margin-top: 0.3rem;
+      padding: 0.55rem 0.7rem;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+    }
+    label.field textarea { resize: vertical; min-height: 60px; }
+    label.field input:focus,
+    label.field select:focus,
+    label.field textarea:focus {
+      outline: none;
+      border-color: var(--primary-light);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      padding: 0.55rem 0.95rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .btn:hover:not(:disabled) { background: var(--surface); border-color: var(--primary-light); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn.primary {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+    }
+    .btn.primary:hover:not(:disabled) { background: #5848d6; border-color: #5848d6; }
+    .btn.success {
+      background: var(--success);
+      border-color: var(--success);
+      color: #00231b;
+      font-weight: 600;
+    }
+    .btn.danger {
+      background: transparent;
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+    .btn.danger:hover:not(:disabled) { background: var(--danger); color: #fff; }
+
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+    /* status panel */
+    .status-card {
+      padding: 0.85rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 0.85rem;
+      font-size: 0.85rem;
+    }
+    .status-card .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.3rem; }
+    .status-card .run-id { color: var(--text-dim); font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; }
+    .badge {
+      display: inline-block;
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .badge.pending { background: rgba(131,149,167,0.18); color: var(--text-dim); }
+    .badge.running { background: rgba(108,92,231,0.18); color: var(--primary-light); }
+    .badge.awaiting_review { background: rgba(253,203,110,0.18); color: var(--accent2); }
+    .badge.approved { background: rgba(0,184,148,0.18); color: var(--success); }
+    .badge.rejected { background: rgba(225,112,85,0.18); color: var(--danger); }
+    .badge.failed { background: rgba(225,112,85,0.18); color: var(--danger); }
+
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--primary-light);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .validator-block { margin-top: 0.5rem; }
+    .validator-empty { color: var(--text-dim); font-size: 0.75rem; }
+    .validator-finding {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.4rem 0.55rem;
+      margin-top: 0.35rem;
+      background: var(--surface2);
+      border-left: 3px solid var(--warn);
+      border-radius: 4px;
+      font-size: 0.78rem;
+    }
+    .validator-finding.error { border-left-color: var(--danger); }
+    .validator-finding .loc { color: var(--text-dim); font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; }
+
+    /* recent runs table */
+    table.runs { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    table.runs th,
+    table.runs td {
+      padding: 0.4rem 0.5rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    table.runs th { color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.65rem; font-weight: 600; }
+    table.runs tr.clickable { cursor: pointer; }
+    table.runs tr.clickable:hover td { background: var(--surface2); }
+
+    /* review pane */
+    .review-pane { display: flex; flex-direction: column; gap: 0.85rem; }
+    .review-empty { color: var(--text-dim); font-style: italic; padding: 2rem 1rem; text-align: center; }
+    .charter-section h3 {
+      font-size: 0.78rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 0.4rem;
+      padding-bottom: 0.3rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .charter-section .definition {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.7rem 0.85rem;
+      font-size: 0.92rem;
+      line-height: 1.55;
+    }
+    .charter-section ul { list-style: none; padding-left: 0; }
+    .charter-section li {
+      padding: 0.4rem 0.6rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 0.3rem;
+      font-size: 0.85rem;
+    }
+    .charter-section li .meta {
+      color: var(--text-dim);
+      font-size: 0.74rem;
+      margin-top: 0.2rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .tags { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+    .tag {
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      background: var(--tag-bg);
+      border: 1px solid var(--tag-border);
+      color: var(--primary-light);
+      font-size: 0.72rem;
+    }
+
+    .review-actions {
+      display: flex;
+      gap: 0.5rem;
+      padding-top: 0.85rem;
+      border-top: 1px solid var(--border);
+    }
+    .review-actions .spacer { flex: 1; }
+
+    .toast {
+      position: fixed;
+      bottom: 1rem;
+      right: 1rem;
+      padding: 0.65rem 1rem;
+      border-radius: 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.85rem;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      transform: translateY(120%);
+      transition: transform 0.25s ease-out;
+    }
+    .toast.show { transform: translateY(0); }
+    .toast.error { border-color: var(--danger); color: var(--danger); }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <h1>Generate Skills · v3</h1>
+        <div class="sub">Stage 0 — charter design with human review</div>
+      </div>
+      <div class="pill" id="dbPill">db: skill-library</div>
+    </div>
+
+    <div class="layout">
+      <!-- LANE 1: input + reviewer ------------------------------------------- -->
+      <section class="lane">
+        <div class="lane-header"><div class="lane-title">Role input</div></div>
+        <div class="lane-body">
+          <label class="field">
+            Existing role
+            <select id="roleSelect">
+              <option value="">— pick from catalog —</option>
+            </select>
+          </label>
+          <label class="field">
+            Or new role
+            <input id="roleNameInput" type="text" placeholder="e.g. MLOps Engineer" autocomplete="off" />
+          </label>
+
+          <div class="row">
+            <button id="generateBtn" class="btn primary">Generate Charter ▸</button>
+          </div>
+
+          <hr style="margin: 1rem 0; border: 0; border-top: 1px solid var(--border);" />
+
+          <label class="field">
+            Reviewed by (your name)
+            <input id="reviewerInput" type="text" placeholder="alice" autocomplete="off" />
+          </label>
+          <label class="field">
+            Notes (optional, attached to pass/regenerate)
+            <textarea id="notesInput" placeholder="why you approved or what to change"></textarea>
+          </label>
+        </div>
+      </section>
+
+      <!-- LANE 2: status + recent runs -------------------------------------- -->
+      <section class="lane">
+        <div class="lane-header"><div class="lane-title">Status</div></div>
+        <div class="lane-body">
+          <div id="statusCard" class="status-card" style="display:none"></div>
+
+          <div class="lane-title" style="margin-top: 0.85rem;">Recent runs (last 20)</div>
+          <table class="runs">
+            <thead><tr><th>Role</th><th>Status</th><th>When</th></tr></thead>
+            <tbody id="recentRunsBody">
+              <tr><td colspan="3" style="color:var(--text-dim)">loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- LANE 3: review pane ----------------------------------------------- -->
+      <section class="lane">
+        <div class="lane-header"><div class="lane-title">Charter review</div></div>
+        <div class="lane-body" id="reviewPane">
+          <div class="review-empty">No charter selected. Generate one or pick a recent run.</div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const TERMINAL = new Set(["approved", "rejected", "failed"]);
+    const POLLABLE = new Set(["pending", "running"]);
+
+    let activeRunId = null;
+    let activeRoleCardRunId = null;     // Stage 1 run id
+    let activeDimensionsRunId = null;   // Stage 2 run id
+    let activeReconRunId = null;        // Stage 3 reconciliation run id
+    let activeTypingRunId = null;       // Stage 4 typing run id
+    let activePlacementRunId = null;    // Stage 5 placement run id
+    let activeContainmentRunId = null;  // Stage 6 containment run id
+    let activeEnrichmentRunId = null;   // Stage 7 enrichment run id
+    let activeLoadRunId = null;         // Stage 8 catalog-load run id
+    let pollTimer = null;
+    let activeRun = null;  // last fetched run detail
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+    async function jget(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json();
+    }
+    async function jpost(url, body) {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(data.detail || `${r.status} ${r.statusText}`);
+      }
+      return data;
+    }
+    function toast(msg, isError) {
+      const t = $("toast");
+      t.textContent = msg;
+      t.classList.toggle("error", !!isError);
+      t.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => t.classList.remove("show"), 3500);
+    }
+    function fmtTime(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      const now = new Date();
+      const sameDay = d.toDateString() === now.toDateString();
+      const fmt = sameDay
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      return fmt;
+    }
+    function escape(s) {
+      return String(s || "").replace(/[&<>"]/g, (c) => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]
+      ));
+    }
+
+    // ── role catalog dropdown + recent runs ────────────────────────────────
+    async function loadRoles() {
+      try {
+        const data = await jget("/api/generate-skills/roles");
+        const sel = $("roleSelect");
+        sel.innerHTML = '<option value="">— pick from catalog —</option>';
+        for (const r of data.items) {
+          const opt = document.createElement("option");
+          opt.value = r.display_name;
+          const tick = r.has_approved_charter ? " ✓" : "";
+          opt.textContent = `${r.display_name}${tick}`;
+          sel.appendChild(opt);
+        }
+      } catch (e) {
+        toast("could not load roles: " + e.message, true);
+      }
+    }
+
+    async function loadRecentRuns() {
+      try {
+        const data = await jget("/api/generate-skills/runs?limit=20");
+        const tbody = $("recentRunsBody");
+        if (!data.items.length) {
+          tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-dim)">no runs yet</td></tr>';
+          return;
+        }
+        tbody.innerHTML = "";
+        for (const r of data.items) {
+          const tr = document.createElement("tr");
+          tr.classList.add("clickable");
+          tr.dataset.runId = r.run_id;
+          tr.innerHTML = `
+            <td>${escape(r.role_display)}</td>
+            <td><span class="badge ${escape(r.status)}">${escape(r.status)}</span></td>
+            <td style="color:var(--text-dim)">${fmtTime(r.started_at)}</td>
+          `;
+          tr.addEventListener("click", () => selectRun(r.run_id));
+          tbody.appendChild(tr);
+        }
+      } catch (e) {
+        // non-fatal — no toast spam
+      }
+    }
+
+    // ── generate / poll / render ───────────────────────────────────────────
+    async function onGenerate() {
+      const select = $("roleSelect").value.trim();
+      const typed = $("roleNameInput").value.trim();
+      const roleName = typed || select;
+      if (!roleName) {
+        toast("type a role name or pick one from the catalog", true);
+        return;
+      }
+      $("generateBtn").disabled = true;
+      try {
+        const r = await jpost("/api/generate-skills/runs", { role_name: roleName });
+        $("roleNameInput").value = "";
+        $("roleSelect").value = "";
+        await selectRun(r.run_id);
+        await loadRecentRuns();
+        await loadRoles();
+      } catch (e) {
+        toast("generate failed: " + e.message, true);
+      } finally {
+        $("generateBtn").disabled = false;
+      }
+    }
+
+    async function selectRun(runId) {
+      activeRunId = runId;
+      stopPolling();
+      await pollOnce();
+    }
+
+    async function pollOnce() {
+      if (!activeRunId) return;
+      try {
+        const run = await jget(`/api/generate-skills/runs/${activeRunId}`);
+        activeRun = run;
+        renderStatus(run);
+        renderReview(run);
+        const charterInFlight = POLLABLE.has(run.status);
+        const roleCardInFlight = run.role_card_run && POLLABLE.has(run.role_card_run.status);
+        const dimensionsInFlight = run.dimensions_run && POLLABLE.has(run.dimensions_run.status);
+        const reconInFlight = run.reconciliation_run && POLLABLE.has(run.reconciliation_run.status);
+        const typingInFlight = run.typing_run && POLLABLE.has(run.typing_run.status);
+        const placementInFlight = run.placement_run && POLLABLE.has(run.placement_run.status);
+        const containmentInFlight = run.containment_run && POLLABLE.has(run.containment_run.status);
+        const enrichmentInFlight = run.enrichment_run && POLLABLE.has(run.enrichment_run.status);
+        const loadInFlight = run.load_run && POLLABLE.has(run.load_run.status);
+        if (charterInFlight || roleCardInFlight || dimensionsInFlight || reconInFlight || typingInFlight || placementInFlight || containmentInFlight || enrichmentInFlight || loadInFlight) {
+          schedulePoll();
+        } else {
+          stopPolling();
+          loadRecentRuns();
+          loadRoles();
+        }
+      } catch (e) {
+        toast("poll error: " + e.message, true);
+      }
+    }
+    function schedulePoll() {
+      if (pollTimer) return;
+      pollTimer = setTimeout(() => {
+        pollTimer = null;
+        pollOnce();
+      }, 2000);
+    }
+    function stopPolling() {
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function renderStatus(run) {
+      const card = $("statusCard");
+      card.style.display = "block";
+      const polling = POLLABLE.has(run.status);
+      const log = run.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.location || "")}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : '<div class="validator-empty">no validator findings</div>';
+
+      const errorBlock = run.error_message
+        ? `<div class="validator-finding error" style="margin-top:0.5rem">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(run.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      card.innerHTML = `
+        <div class="top">
+          <div>
+            <strong>${escape(run.role_display || "?")}</strong>
+            ${polling ? '<span class="spinner" style="margin-left:0.5rem"></span>' : ""}
+          </div>
+          <span class="badge ${escape(run.status)}">${escape(run.status)}</span>
+        </div>
+        <div class="run-id">run ${escape(run.run_id)} · model ${escape(run.model_snapshot || "?")}</div>
+        <div style="color:var(--text-dim); font-size:0.78rem; margin-top:0.3rem">
+          started ${fmtTime(run.started_at)}${run.completed_at ? ` · finished ${fmtTime(run.completed_at)}` : ""}
+        </div>
+        <div class="validator-block">${findingsHtml}${errorBlock}</div>
+      `;
+    }
+
+    function renderReview(run) {
+      const pane = $("reviewPane");
+      const c = run.charter;
+      const isReviewable = run.status === "awaiting_review";
+      if (!c) {
+        if (run.status === "failed") {
+          pane.innerHTML = `<div class="review-empty">Run failed before producing a charter — see status panel for the error.</div>`;
+        } else if (POLLABLE.has(run.status)) {
+          pane.innerHTML = `<div class="review-empty">LLM is generating the charter… (this usually takes 10–60s)</div>`;
+        } else {
+          pane.innerHTML = `<div class="review-empty">No charter on this run.</div>`;
+        }
+        return;
+      }
+
+      const inScope = (c.in_scope || []).map(s => `<li>${escape(s)}</li>`).join("");
+      const outScope = (c.out_of_scope || []).map(o => `
+        <li>${escape(o.task)}<div class="meta">→ owned by ${escape(o.owned_by)}</div></li>
+      `).join("");
+      const adjacent = (c.adjacent_roles || []).map(a => `
+        <li>${escape(a.role)}<div class="meta">${escape(a.boundary_note)}</div></li>
+      `).join("");
+      const alwaysLoad = (c.always_load_skills || []).map(s => `<span class="tag">${escape(s)}</span>`).join("");
+      const reviewedLine = run.reviewed_by
+        ? `<div style="color:var(--text-dim); font-size:0.78rem">reviewed by ${escape(run.reviewed_by)} on ${fmtTime(run.reviewed_at)}</div>`
+        : "";
+      // Pass is gated to awaiting_review (no need to re-pass an approved run).
+      // Regenerate is enabled on awaiting_review AND approved — the
+      // approved variant is "supersede": old run goes to rejected, new
+      // run starts and re-fires Stage 1 on its eventual approval.
+      const canApprove = isReviewable;
+      const canRegenerate = run.status === "awaiting_review"
+        || run.status === "approved"
+        || run.status === "failed";
+      const regenLabel = run.status === "approved"
+        ? "↻ Supersede & regenerate"
+        : run.status === "failed"
+          ? "↻ Retry"
+          : "✕ Regenerate";
+
+      pane.innerHTML = `
+        <div class="review-pane">
+          <div class="charter-section">
+            <h3>Definition</h3>
+            <div class="definition">${escape(c.definition || "")}</div>
+          </div>
+          <div class="charter-section">
+            <h3>In scope (${(c.in_scope || []).length})</h3>
+            <ul>${inScope || '<li style="color:var(--text-dim)">empty</li>'}</ul>
+          </div>
+          <div class="charter-section">
+            <h3>Out of scope (${(c.out_of_scope || []).length})</h3>
+            <ul>${outScope || '<li style="color:var(--text-dim)">empty</li>'}</ul>
+          </div>
+          <div class="charter-section">
+            <h3>Adjacent roles (${(c.adjacent_roles || []).length})</h3>
+            <ul>${adjacent || '<li style="color:var(--text-dim)">empty</li>'}</ul>
+          </div>
+          <div class="charter-section">
+            <h3>Always-load skills</h3>
+            <div class="tags">${alwaysLoad || '<span style="color:var(--text-dim)">none</span>'}</div>
+          </div>
+          ${reviewedLine}
+          <div class="review-actions">
+            <button class="btn danger" id="regenerateBtn" ${canRegenerate ? "" : "disabled"}>${regenLabel}</button>
+            <div class="spacer"></div>
+            <button class="btn success" id="approveBtn" ${canApprove ? "" : "disabled"}>✓ Pass</button>
+          </div>
+          ${renderRoleCardBlock(run.role_card_run)}
+          ${renderDimensionsBlock(run.dimensions_run)}
+          ${renderReconciliationBlock(run.reconciliation_run)}
+          ${renderTypingBlock(run.typing_run)}
+          ${renderPlacementBlock(run.placement_run)}
+          ${renderContainmentBlock(run.containment_run)}
+          ${renderEnrichmentBlock(run.enrichment_run)}
+          ${renderLoadBlock(run.load_run)}
+        </div>
+      `;
+      const a = $("approveBtn");
+      const r = $("regenerateBtn");
+      if (a) a.addEventListener("click", onApprove);
+      if (r) r.addEventListener("click", onRegenerate);
+
+      const ra = $("approveRoleCardBtn");
+      const rr = $("regenerateRoleCardBtn");
+      if (ra) ra.addEventListener("click", onApproveRoleCard);
+      if (rr) rr.addEventListener("click", onRegenerateRoleCard);
+      activeRoleCardRunId = run.role_card_run ? run.role_card_run.run_id : null;
+      activeDimensionsRunId = run.dimensions_run ? run.dimensions_run.run_id : null;
+      activeReconRunId = run.reconciliation_run ? run.reconciliation_run.run_id : null;
+      activeTypingRunId = run.typing_run ? run.typing_run.run_id : null;
+      activePlacementRunId = run.placement_run ? run.placement_run.run_id : null;
+      activeContainmentRunId = run.containment_run ? run.containment_run.run_id : null;
+      activeEnrichmentRunId = run.enrichment_run ? run.enrichment_run.run_id : null;
+      activeLoadRunId = run.load_run ? run.load_run.run_id : null;
+      const containApproveBtn = $("approveContainmentBtn");
+      const containRegenBtn = $("regenerateContainmentBtn");
+      if (containApproveBtn) containApproveBtn.addEventListener("click", onApproveContainment);
+      if (containRegenBtn) containRegenBtn.addEventListener("click", onRegenerateContainment);
+      const enrichApproveBtn = $("approveEnrichmentBtn");
+      const enrichRegenBtn = $("regenerateEnrichmentBtn");
+      if (enrichApproveBtn) enrichApproveBtn.addEventListener("click", onApproveEnrichment);
+      if (enrichRegenBtn) enrichRegenBtn.addEventListener("click", onRegenerateEnrichment);
+      const loadRegenBtn = $("regenerateLoadBtn");
+      if (loadRegenBtn) loadRegenBtn.addEventListener("click", onRegenerateLoad);
+      const dimRegenBtn = $("regenerateDimensionsBtn");
+      if (dimRegenBtn) dimRegenBtn.addEventListener("click", onRegenerateDimensions);
+      const reconApproveBtn = $("approveReconBtn");
+      const reconRegenBtn = $("regenerateReconBtn");
+      if (reconApproveBtn) reconApproveBtn.addEventListener("click", onApproveRecon);
+      if (reconRegenBtn) reconRegenBtn.addEventListener("click", onRegenerateRecon);
+    }
+
+    function renderRoleCardBlock(rc) {
+      if (!rc) return "";
+      activeRoleCardRunId = rc.run_id;
+      const card = rc.role_card;
+      const polling = POLLABLE.has(rc.status);
+      const isReviewable = rc.status === "awaiting_review";
+      const canRegenerateCard = rc.status === "awaiting_review"
+        || rc.status === "approved"
+        || rc.status === "failed";
+      const regenCardLabel = rc.status === "approved"
+        ? "↻ Supersede & regenerate role card"
+        : rc.status === "failed"
+          ? "↻ Retry role card"
+          : "✕ Regenerate role card";
+      const log = rc.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.location || "")}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : '<div class="validator-empty">no validator findings</div>';
+
+      const errorBlock = rc.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(rc.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      // Spinner / placeholder copy when no card body yet.
+      if (!card) {
+        const msg = polling
+          ? "Stage 1 generating role card…"
+          : (rc.status === "failed" ? "Stage 1 failed — see error below." : "Role card pending.");
+        return `
+          <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+            <h3 style="display:flex;align-items:center;gap:0.5rem">
+              Role Card
+              <span class="badge ${escape(rc.status)}">${escape(rc.status)}</span>
+              ${polling ? '<span class="spinner"></span>' : ""}
+            </h3>
+            <div class="review-empty">${escape(msg)}</div>
+            <div class="validator-block">${errorBlock}</div>
+          </div>
+        `;
+      }
+
+      // v1.2: primary_responsibilities and common_artifacts are now
+      // semicolon-delimited STRINGS (denser for Stage 2's prompt budget).
+      // Older role cards may still have them as arrays — handle both.
+      const splitSemis = (val) => {
+        if (Array.isArray(val)) return val;
+        if (typeof val !== "string") return [];
+        return val.split(";").map(s => s.trim()).filter(Boolean);
+      };
+      const aliases = (card.aliases || []).map(a => `<span class="tag">${escape(a)}</span>`).join("");
+      const responsibilities = splitSemis(card.primary_responsibilities)
+        .map(s => `<li>${escape(s)}</li>`).join("");
+      const artifacts = splitSemis(card.common_artifacts)
+        .map(s => `<li>${escape(s)}</li>`).join("");
+      const adjacentRoles = (card.adjacent_roles || [])
+        .map(r => `<span class="tag">${escape(r)}</span>`).join("");
+      const alwaysLoadSkills = (card.always_load_skills || [])
+        .map(s => `<span class="tag">${escape(s)}</span>`).join("");
+      const sen = card.seniority_signals || {};
+      const isAuto = rc.status === "approved" && rc.reviewed_by === "auto";
+      const reviewerLine = isAuto
+        ? `<div style="color:var(--success); font-size:0.78rem">auto-approved (validators passed)</div>`
+        : (rc.reviewed_by
+            ? `<div style="color:var(--text-dim); font-size:0.78rem">reviewed by ${escape(rc.reviewed_by)} on ${fmtTime(rc.reviewed_at)}</div>`
+            : "");
+
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          <h3 style="display:flex;align-items:center;gap:0.5rem">
+            Role Card
+            <span class="badge ${escape(rc.status)}">${escape(rc.status)}</span>
+          </h3>
+          <div style="font-size:0.85rem; padding: 0.5rem 0; display:grid; grid-template-columns: max-content 1fr; gap: 0.4rem 0.85rem;">
+            <div style="color:var(--text-dim)">canonical_name</div><div>${escape(card.canonical_name || "")}</div>
+            <div style="color:var(--text-dim)">family</div><div>${escape(card.family || "")}</div>
+            <div style="color:var(--text-dim)">aliases</div><div class="tags">${aliases || '<span style="color:var(--text-dim)">none</span>'}</div>
+            <div style="color:var(--text-dim)">definition</div><div>${escape(card.definition || "")}</div>
+            <div style="color:var(--text-dim)">distinguishing</div><div>${escape(card.distinguishing_tasks || "")}</div>
+          </div>
+          <h3 style="margin-top:0.6rem">Primary responsibilities (${splitSemis(card.primary_responsibilities).length})</h3>
+          <ul>${responsibilities || '<li style="color:var(--text-dim)">empty</li>'}</ul>
+          <h3 style="margin-top:0.6rem">Common artifacts (${splitSemis(card.common_artifacts).length})</h3>
+          <ul>${artifacts || '<li style="color:var(--text-dim)">empty</li>'}</ul>
+          <h3 style="margin-top:0.6rem">Adjacent roles (${(card.adjacent_roles || []).length})</h3>
+          <div class="tags">${adjacentRoles || '<span style="color:var(--text-dim)">none</span>'}</div>
+          <h3 style="margin-top:0.6rem">Always-load skills (${(card.always_load_skills || []).length})</h3>
+          <div class="tags">${alwaysLoadSkills || '<span style="color:var(--text-dim)">none</span>'}</div>
+          <h3 style="margin-top:0.6rem">Seniority signals</h3>
+          <table style="width:100%; font-size:0.83rem; border-collapse:collapse">
+            <tr><td style="color:var(--text-dim); padding:0.3rem 0.4rem; border-bottom:1px solid var(--border); width:80px">junior</td><td style="padding:0.3rem 0.4rem; border-bottom:1px solid var(--border)">${escape(sen.junior || "")}</td></tr>
+            <tr><td style="color:var(--text-dim); padding:0.3rem 0.4rem; border-bottom:1px solid var(--border)">mid</td><td style="padding:0.3rem 0.4rem; border-bottom:1px solid var(--border)">${escape(sen.mid || "")}</td></tr>
+            <tr><td style="color:var(--text-dim); padding:0.3rem 0.4rem; border-bottom:1px solid var(--border)">senior</td><td style="padding:0.3rem 0.4rem; border-bottom:1px solid var(--border)">${escape(sen.senior || "")}</td></tr>
+            <tr><td style="color:var(--text-dim); padding:0.3rem 0.4rem">staff</td><td style="padding:0.3rem 0.4rem">${escape(sen.staff || "")}</td></tr>
+          </table>
+          <div class="validator-block" style="margin-top:0.6rem">${findingsHtml}${errorBlock}</div>
+          ${reviewerLine}
+          ${(isReviewable || canRegenerateCard) ? `
+            <div class="review-actions">
+              <button class="btn danger" id="regenerateRoleCardBtn" ${canRegenerateCard ? "" : "disabled"}>${regenCardLabel}</button>
+              <div class="spacer"></div>
+              <button class="btn success" id="approveRoleCardBtn" ${isReviewable ? "" : "disabled"}>✓ Pass role card</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    function renderDimensionsBlock(dr) {
+      if (!dr) return "";
+      activeDimensionsRunId = dr.run_id;
+      const polling = POLLABLE.has(dr.status);
+      const dims = dr.candidate_dimensions || [];
+      const log = dr.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.location || "")}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = dr.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(dr.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      // Header with badge + spinner while running
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 2 — Candidate Dimensions ${dims.length ? `(${dims.length})` : ""}
+          <span class="badge ${escape(dr.status)}">${escape(dr.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      if (!dims.length) {
+        const msg = polling
+          ? "Stage 2 generating candidate dimensions…"
+          : (dr.status === "failed"
+              ? "Stage 2 failed — see error below. Click Regenerate to retry."
+              : "No candidate dimensions yet.");
+        return `
+          <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+            ${header}
+            <div class="review-empty">${escape(msg)}</div>
+            <div class="validator-block">${findingsHtml}${errorBlock}</div>
+            ${(dr.status === "failed" || dr.status === "approved") ? `
+              <div class="review-actions" style="margin-top:0.6rem">
+                <button class="btn danger" id="regenerateDimensionsBtn">↻ Regenerate dimensions</button>
+              </div>
+            ` : ""}
+          </div>
+        `;
+      }
+
+      // Render the dimension list — compact for browsability, click to expand.
+      const dimListHtml = dims.map((d, i) => {
+        const tid = d.tentative_id || `d_${i + 1}`;
+        const name = d.name || "?";
+        const exCount = (d.exemplar_skills || []).length;
+        const ofCount = (d.overlap_flags || []).length;
+        const desc = d.description || "";
+        const inScope = d.in_scope || "";
+        const outScope = d.out_of_scope || "";
+        const exemplars = (d.exemplar_skills || [])
+          .map(s => `<span class="tag">${escape(s)}</span>`).join("");
+        const flagsHtml = (d.overlap_flags || []).map(f => {
+          const ref = f.with_dim_id || f.with_dim_name || f.with_role || "?";
+          return `<div class="meta">⚠ overlap with ${escape(ref)}: ${escape(f.reason || "")}</div>`;
+        }).join("");
+        return `
+          <details style="background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:0.55rem 0.7rem; margin-bottom:0.4rem">
+            <summary style="cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:0.5rem">
+              <span><span style="color:var(--text-dim); font-family:'JetBrains Mono', monospace; font-size:0.72rem">${escape(tid)}</span> &nbsp; <strong>${escape(name)}</strong></span>
+              <span style="color:var(--text-dim); font-size:0.72rem">${exCount} exemplars${ofCount ? ` · ${ofCount} overlap` : ""}</span>
+            </summary>
+            <div style="margin-top:0.45rem; font-size:0.82rem; line-height:1.5">
+              ${desc ? `<div style="color:var(--text-dim)">${escape(desc)}</div>` : ""}
+              ${inScope ? `<div style="margin-top:0.35rem"><strong>In scope:</strong> ${escape(inScope)}</div>` : ""}
+              ${outScope ? `<div style="margin-top:0.2rem"><strong>Out of scope:</strong> ${escape(outScope)}</div>` : ""}
+              ${exemplars ? `<div class="tags" style="margin-top:0.4rem">${exemplars}</div>` : ""}
+              ${flagsHtml}
+            </div>
+          </details>
+        `;
+      }).join("");
+
+      const isAuto = dr.status === "approved";
+      const isFailed = dr.status === "failed";
+
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${isAuto ? '<div style="color:var(--success); font-size:0.78rem">auto-approved (validators passed)</div>' : ""}
+          ${dimListHtml}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+          ${(isAuto || isFailed) ? `
+            <div class="review-actions" style="margin-top:0.6rem">
+              <button class="btn danger" id="regenerateDimensionsBtn">↻ Regenerate dimensions</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    function renderReconciliationBlock(rr) {
+      if (!rr) return "";
+      activeReconRunId = rr.run_id;
+      const polling = POLLABLE.has(rr.status);
+      const isReviewable = rr.status === "awaiting_review";
+      const isFailed = rr.status === "failed";
+      const isApproved = rr.status === "approved";
+      const decisions = rr.decisions || [];
+      const locked = rr.locked_dimensions || [];
+      const log = rr.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.code || "")}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = rr.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(rr.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 3 — Reconciliation
+          <span class="badge ${escape(rr.status)}">${escape(rr.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      const summary = `
+        <div style="font-size:0.83rem; color:var(--text-dim); margin: 0.3rem 0">
+          ${decisions.length} flagged pair(s) ·
+          ${(rr.merge_log || []).length} MERGE ·
+          ${(rr.split_log || []).length} SPLIT ·
+          ${locked.length} locked dim(s)${(rr.unassigned_exemplars || []).length ? ` · ${(rr.unassigned_exemplars || []).length} unassigned exemplar(s)` : ""}
+        </div>
+      `;
+
+      // Per-pair decision list (collapsible).
+      const decisionsHtml = decisions.length === 0
+        ? '<div class="validator-empty">no overlap pairs flagged — all candidate dims are sufficiently distinct</div>'
+        : decisions.map((entry, i) => {
+            const pair = entry.pair || {};
+            const dec = entry.decision || {};
+            const kind = pair.kind || "";
+            const sim = (pair.similarity != null) ? pair.similarity.toFixed(3) : "?";
+            const decBadgeColor = (
+              dec.decision === "MERGE" ? "approved" :
+              dec.decision === "SPLIT" ? "awaiting_review" :
+              "pending"  // KEEP_SEPARATE
+            );
+            let mergeOrSplit = "";
+            if (dec.decision === "MERGE") {
+              mergeOrSplit = `
+                <div style="margin-top:0.3rem">
+                  <strong>Merge into:</strong> ${escape(dec.merge_into_name || "")}
+                  <div class="meta">${escape(dec.merge_into_description || "")}</div>
+                </div>
+              `;
+            } else if (dec.decision === "SPLIT") {
+              const items = (dec.split_into || []).map(s => `
+                <li><strong>${escape(s.name || "")}</strong>
+                  <div class="meta">${escape(s.description || "")}</div></li>
+              `).join("");
+              mergeOrSplit = `
+                <div style="margin-top:0.3rem">
+                  <strong>Split into:</strong>
+                  <ul style="margin-top:0.25rem">${items}</ul>
+                </div>
+              `;
+            }
+            return `
+              <details style="background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:0.55rem 0.7rem; margin-bottom:0.4rem">
+                <summary style="cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:0.5rem">
+                  <span>
+                    <span style="color:var(--text-dim); font-family:'JetBrains Mono', monospace; font-size:0.72rem">${escape(kind)} · sim ${escape(sim)}</span>
+                    &nbsp; <strong>${escape(pair.a_name || "")}</strong>
+                    <span style="color:var(--text-dim)"> ↔ </span>
+                    <strong>${escape(pair.b_name || "")}</strong>
+                  </span>
+                  <span class="badge ${decBadgeColor}">${escape(dec.decision || "?")}</span>
+                </summary>
+                <div style="margin-top:0.45rem; font-size:0.82rem; line-height:1.5">
+                  <div class="meta">A: ${escape(pair.a_role || "")} · ${escape(pair.a_tentative_id || "")}</div>
+                  <div class="meta">B: ${escape(pair.b_role || "")} · ${escape(pair.b_tentative_id || "")}</div>
+                  <div style="margin-top:0.3rem"><em>${escape(dec.reasoning || "")}</em></div>
+                  ${mergeOrSplit}
+                </div>
+              </details>
+            `;
+          }).join("");
+
+      // Locked dims preview (small, since the full list lives in DB).
+      const lockedPreviewHtml = locked.length === 0
+        ? ""
+        : `<details style="margin-top:0.6rem">
+            <summary style="cursor:pointer; color:var(--text-dim); font-size:0.78rem">
+              Locked dimensions (${locked.length}) — click to expand
+            </summary>
+            <ul style="margin-top:0.4rem">${
+              locked.map(d => `<li>${escape(d.name || "")}</li>`).join("")
+            }</ul>
+          </details>`;
+
+      const reviewerLine = isApproved && rr.reviewed_by
+        ? `<div style="color:var(--text-dim); font-size:0.78rem">reviewed by ${escape(rr.reviewed_by)} on ${fmtTime(rr.reviewed_at)}</div>`
+        : "";
+
+      const showActions = isReviewable || isApproved || isFailed;
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${summary}
+          ${decisionsHtml}
+          ${lockedPreviewHtml}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+          ${reviewerLine}
+          ${showActions ? `
+            <div class="review-actions" style="margin-top:0.6rem">
+              <button class="btn danger" id="regenerateReconBtn">↻ Regenerate reconciliation</button>
+              <div class="spacer"></div>
+              <button class="btn success" id="approveReconBtn" ${isReviewable ? "" : "disabled"}>✓ Pass reconciliation</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    function renderContainmentBlock(cr) {
+      if (!cr) return "";
+      activeContainmentRunId = cr.run_id;
+      const polling = POLLABLE.has(cr.status);
+      const isReviewable = cr.status === "awaiting_review";
+      const isApproved = cr.status === "approved";
+      const isFailed = cr.status === "failed";
+      const rels = cr.relationships || [];
+      const log = cr.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.code || "")}${f.skill_id ? " · " + escape(f.skill_id) : ""}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = cr.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(cr.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 6 — Containment
+          <span class="badge ${escape(cr.status)}">${escape(cr.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      const summary = `
+        <div style="font-size:0.83rem; color:var(--text-dim); margin: 0.3rem 0">
+          ${rels.length} skill(s) with relationships
+          ${findings.length ? ` · <span style="color:var(--accent2)">${findings.length} finding(s)</span>` : ""}
+        </div>
+      `;
+
+      // Relationship blocks per skill — collapsible, showing all 5 buckets
+      // when populated.
+      const renderBucket = (label, ids, color) => {
+        if (!ids || ids.length === 0) return "";
+        const tags = ids.map(id => `<span class="tag" style="background:${color}; border-color:${color}">${escape(id)}</span>`).join("");
+        return `
+          <div class="meta" style="margin-top:0.2rem">
+            <strong>${label}:</strong>
+            <div class="tags" style="display:inline-flex; flex-wrap:wrap; gap:0.2rem; vertical-align:middle">${tags}</div>
+          </div>
+        `;
+      };
+      const relsHtml = rels.length === 0
+        ? '<div class="validator-empty">no relationships resolved</div>'
+        : rels.map(r => {
+            const totalLinks = (r.parent_skills || []).length +
+                                (r.child_skills || []).length +
+                                (r.suppress_on_match || []).length +
+                                (r.requires || []).length +
+                                (r.related_to || []).length;
+            return `
+              <details style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:0.4rem 0.55rem; margin-bottom:0.3rem">
+                <summary style="cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:0.5rem">
+                  <strong>${escape(r.skill_id)}</strong>
+                  <span style="color:var(--text-dim); font-size:0.72rem">${totalLinks} link(s)</span>
+                </summary>
+                <div style="margin-top:0.4rem; font-size:0.8rem; line-height:1.4">
+                  ${renderBucket("parent_skills", r.parent_skills, "rgba(108,92,231,0.18)")}
+                  ${renderBucket("child_skills", r.child_skills, "rgba(0,206,201,0.15)")}
+                  ${renderBucket("suppress_on_match", r.suppress_on_match, "rgba(225,112,85,0.18)")}
+                  ${renderBucket("requires", r.requires, "rgba(253,203,110,0.15)")}
+                  ${renderBucket("related_to", r.related_to, "rgba(131,149,167,0.18)")}
+                </div>
+              </details>
+            `;
+          }).join("");
+
+      const reviewerLine = isApproved && cr.reviewed_by
+        ? `<div style="color:var(--text-dim); font-size:0.78rem">reviewed by ${escape(cr.reviewed_by)} on ${fmtTime(cr.reviewed_at)}</div>`
+        : "";
+
+      const showActions = isReviewable || isApproved || isFailed;
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${summary}
+          ${relsHtml}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+          ${reviewerLine}
+          ${showActions ? `
+            <div class="review-actions" style="margin-top:0.6rem">
+              <button class="btn danger" id="regenerateContainmentBtn">↻ Regenerate containment</button>
+              <div class="spacer"></div>
+              <button class="btn success" id="approveContainmentBtn" ${isReviewable ? "" : "disabled"}>✓ Pass containment</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    async function onApproveContainment() {
+      if (!activeContainmentRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveContainmentBtn"); const r = $("regenerateContainmentBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeContainmentRunId}/approve`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("containment approved");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("approve containment failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    async function onRegenerateContainment() {
+      if (!activeContainmentRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveContainmentBtn"); const r = $("regenerateContainmentBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeContainmentRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("regenerating containment…");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("regenerate containment failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    function renderEnrichmentBlock(er) {
+      if (!er) return "";
+      activeEnrichmentRunId = er.run_id;
+      const polling = POLLABLE.has(er.status);
+      const isReviewable = er.status === "awaiting_review";
+      const isApproved = er.status === "approved";
+      const isFailed = er.status === "failed";
+      const enrichments = er.enrichments || [];
+      const log = er.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.code || "")}${f.skill_id ? " · " + escape(f.skill_id) : ""}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = er.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(er.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      const ambiguousCount = enrichments.filter(e => (e.ambiguity || {}).ambiguity_flag).length;
+      const deprecatedCount = enrichments.filter(e => (e.maturity || {}).maturity === "deprecated").length;
+
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 7 — Enrichment
+          <span class="badge ${escape(er.status)}">${escape(er.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      const summary = `
+        <div style="font-size:0.83rem; color:var(--text-dim); margin: 0.3rem 0">
+          ${enrichments.length} skill(s) enriched
+          ${ambiguousCount ? ` · <span style="color:#e17055">${ambiguousCount} ambiguous</span>` : ""}
+          ${deprecatedCount ? ` · <span style="color:#d63031">${deprecatedCount} deprecated</span>` : ""}
+          ${findings.length ? ` · <span style="color:var(--accent2)">${findings.length} finding(s)</span>` : ""}
+        </div>
+      `;
+
+      const maturityColor = (m) => ({
+        well_known: "rgba(0,184,148,0.20)",
+        emerging:   "rgba(0,206,201,0.20)",
+        niche:      "rgba(253,203,110,0.20)",
+        deprecated: "rgba(214,48,49,0.25)",
+      })[m] || "rgba(131,149,167,0.18)";
+
+      const enrichmentsHtml = enrichments.length === 0
+        ? '<div class="validator-empty">no enrichments produced</div>'
+        : enrichments.map(e => {
+            const vl = e.vendor_license || {};
+            const m = e.maturity || {};
+            const ck = e.context_keywords || {};
+            const amb = e.ambiguity || {};
+            const ver = e.versioning || {};
+            const kwTags = (ck.context_keywords || [])
+              .map(k => `<span class="tag">${escape(k)}</span>`).join("");
+            const ambBlock = amb.ambiguity_flag
+              ? `<div class="meta" style="color:#e17055; margin-top:0.25rem">
+                   <strong>⚠ ambiguous:</strong>
+                   ${(amb.confused_with || []).map(c =>
+                     `<span class="tag" style="background:rgba(225,112,85,0.18); border-color:rgba(225,112,85,0.5)">${escape(c)}</span>`
+                   ).join("")}
+                   <div style="font-size:0.72rem; color:var(--text-dim)">${escape(amb.reasoning || "")}</div>
+                 </div>`
+              : "";
+            const verBlock = ver.versioned
+              ? `<div class="meta" style="margin-top:0.2rem">
+                   <strong>version:</strong> ${escape(ver.current_version || "?")}
+                   ${Object.keys(ver.version_aliases || {}).length
+                     ? ` · aliases: ${Object.entries(ver.version_aliases).map(([k, v]) => `${escape(k)}→${escape(v)}`).join(", ")}`
+                     : ""}
+                 </div>`
+              : "";
+            const vendorLine = (vl.vendor || vl.license || vl.year_introduced)
+              ? `<div class="meta" style="margin-top:0.2rem">
+                   ${vl.vendor ? `<strong>vendor:</strong> ${escape(vl.vendor)}` : ""}
+                   ${vl.license ? ` · <strong>license:</strong> ${escape(vl.license)}` : ""}
+                   ${vl.year_introduced ? ` · <strong>year:</strong> ${vl.year_introduced}` : ""}
+                 </div>`
+              : "";
+            return `
+              <details style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:0.4rem 0.55rem; margin-bottom:0.3rem">
+                <summary style="cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:0.5rem">
+                  <strong>${escape(e.skill_id)}</strong>
+                  <span class="tag" style="background:${maturityColor(m.maturity)}; border-color:${maturityColor(m.maturity)}">
+                    ${escape(m.maturity || "?")}
+                  </span>
+                </summary>
+                <div style="margin-top:0.4rem; font-size:0.8rem; line-height:1.4">
+                  <div class="meta" style="font-size:0.75rem; color:var(--text-dim)">${escape(m.reasoning || "")}</div>
+                  ${vendorLine}
+                  ${verBlock}
+                  ${ambBlock}
+                  ${kwTags ? `<div class="meta" style="margin-top:0.3rem"><strong>context:</strong>
+                    <div class="tags" style="display:inline-flex; flex-wrap:wrap; gap:0.2rem; vertical-align:middle">${kwTags}</div></div>` : ""}
+                </div>
+              </details>
+            `;
+          }).join("");
+
+      const reviewerLine = isApproved && er.reviewed_by
+        ? `<div style="color:var(--text-dim); font-size:0.78rem">reviewed by ${escape(er.reviewed_by)} on ${fmtTime(er.reviewed_at)}</div>`
+        : "";
+
+      const showActions = isReviewable || isApproved || isFailed;
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${summary}
+          ${enrichmentsHtml}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+          ${reviewerLine}
+          ${showActions ? `
+            <div class="review-actions" style="margin-top:0.6rem">
+              <button class="btn danger" id="regenerateEnrichmentBtn">↻ Regenerate enrichment</button>
+              <div class="spacer"></div>
+              <button class="btn success" id="approveEnrichmentBtn" ${isReviewable ? "" : "disabled"}>✓ Pass enrichment</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    async function onApproveEnrichment() {
+      if (!activeEnrichmentRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveEnrichmentBtn"); const r = $("regenerateEnrichmentBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeEnrichmentRunId}/approve`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("enrichment approved");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("approve enrichment failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    async function onRegenerateEnrichment() {
+      if (!activeEnrichmentRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveEnrichmentBtn"); const r = $("regenerateEnrichmentBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeEnrichmentRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("regenerating enrichment…");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("regenerate enrichment failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    function renderLoadBlock(lr) {
+      if (!lr) return "";
+      activeLoadRunId = lr.run_id;
+      const polling = POLLABLE.has(lr.status);
+      const isApproved = lr.status === "approved";
+      const isFailed = lr.status === "failed";
+      const summary = lr.load_summary || {};
+      const log = lr.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.code || "")}</span>
+              <span>${escape(f.message || (typeof f === "string" ? f : ""))}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = lr.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(lr.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 8 — Catalog Load
+          <span class="badge ${escape(lr.status)}">${escape(lr.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      const counts = `
+        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+                    gap:0.4rem; margin: 0.5rem 0; font-size:0.8rem">
+          ${[
+            ["categories", summary.categories_written],
+            ["sub_categories", summary.sub_categories_written],
+            ["dimensions", summary.dimensions_written],
+            ["skills", summary.skills_written],
+            ["aliases", summary.aliases_written],
+            ["role↔dim", summary.role_dimensions_written],
+            ["dim↔skill", summary.dimension_skills_written],
+            ["dim↔cat", summary.dimension_categories_written],
+            ["relationships", summary.relationships_written],
+            ["tags", summary.tags_written],
+          ].map(([label, val]) => `
+            <div style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:0.4rem 0.55rem">
+              <div style="color:var(--text-dim); font-size:0.7rem">${escape(label)}</div>
+              <div style="font-size:1.05rem; font-weight:600">${val ?? 0}</div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+
+      const showActions = isApproved || isFailed;
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${counts}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+          ${showActions ? `
+            <div class="review-actions" style="margin-top:0.6rem">
+              <button class="btn danger" id="regenerateLoadBtn">↻ Reload catalog</button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    async function onRegenerateLoad() {
+      if (!activeLoadRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const r = $("regenerateLoadBtn");
+      if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeLoadRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("reloading catalog…");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("reload failed: " + e.message, true);
+        if (r) r.disabled = false;
+      }
+    }
+
+    function renderPlacementBlock(pr) {
+      if (!pr) return "";
+      activePlacementRunId = pr.run_id;
+      const polling = POLLABLE.has(pr.status);
+      const skills = pr.placed_skills || [];
+      const routing = pr.routing || { auto_approved: [], sample_review: [], full_review: [] };
+      const log = pr.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.code || "")}${f.skill_id ? " · " + escape(f.skill_id) : ""}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = pr.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(pr.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 5 — Skill Placement
+          <span class="badge ${escape(pr.status)}">${escape(pr.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      const summary = `
+        <div style="font-size:0.83rem; color:var(--text-dim); margin: 0.3rem 0">
+          ${skills.length} placed skill(s) ·
+          <span style="color:var(--success)">${(routing.auto_approved || []).length} auto</span> ·
+          <span style="color:var(--accent2)">${(routing.sample_review || []).length} sample</span> ·
+          <span style="color:var(--danger)">${(routing.full_review || []).length} full review</span>
+          ${findings.length ? ` · <span style="color:var(--accent2)">${findings.length} finding(s)</span>` : ""}
+        </div>
+      `;
+
+      // Group placed skills by primary_dimension for browsability.
+      const byDim = {};
+      for (const s of skills) {
+        const dim = s.primary_dimension || "(unknown)";
+        if (!byDim[dim]) byDim[dim] = [];
+        byDim[dim].push(s);
+      }
+      const dimOrder = Object.keys(byDim).sort();
+      const skillsHtml = dimOrder.length === 0
+        ? '<div class="validator-empty">no skills placed yet</div>'
+        : dimOrder.map(dim => {
+            const items = byDim[dim].map(s => {
+              const confColor = (
+                s.placement_confidence > 0.9 ? "var(--success)" :
+                s.placement_confidence < 0.7 ? "var(--danger)" :
+                "var(--accent2)"
+              );
+              const secs = (s.secondary_dimensions || []);
+              const secondaryHtml = secs.length
+                ? `<div class="meta">secondary: ${secs.map(escape).join(" · ")}</div>`
+                : "";
+              return `
+                <details style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:0.4rem 0.55rem; margin-bottom:0.3rem">
+                  <summary style="cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:0.5rem">
+                    <strong>${escape(s.name)}</strong>
+                    <span style="color:${confColor}; font-family:'JetBrains Mono', monospace; font-size:0.75rem">${(s.placement_confidence || 0).toFixed(2)}</span>
+                  </summary>
+                  <div style="margin-top:0.35rem; font-size:0.8rem; line-height:1.5">
+                    <em>${escape(s.reasoning || "")}</em>
+                    ${secondaryHtml}
+                  </div>
+                </details>
+              `;
+            }).join("");
+            return `
+              <h4 style="margin-top:0.6rem; font-size:0.82rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.05em">${escape(dim)} (${byDim[dim].length})</h4>
+              ${items}
+            `;
+          }).join("");
+
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${summary}
+          ${skillsHtml}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+        </div>
+      `;
+    }
+
+    function renderTypingBlock(tr) {
+      if (!tr) return "";
+      activeTypingRunId = tr.run_id;
+      const polling = POLLABLE.has(tr.status);
+      const skills = tr.typed_skills || [];
+      const routing = tr.routing || { auto_approved: [], sample_review: [], full_review: [] };
+      const log = tr.validator_log || { warnings: [], errors: [] };
+      const findings = [
+        ...(log.errors || []).map(f => ({ ...f, level: "error" })),
+        ...(log.warnings || []).map(f => ({ ...f, level: "warning" })),
+      ];
+      const findingsHtml = findings.length
+        ? findings.map(f => `
+            <div class="validator-finding ${f.level === "error" ? "error" : ""}">
+              <span class="loc">${escape(f.code || "")}</span>
+              <span>${escape(f.message || "")}</span>
+            </div>
+          `).join("")
+        : "";
+
+      const errorBlock = tr.error_message
+        ? `<div class="validator-finding error">
+             <span class="loc">error</span>
+             <span><pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escape(tr.error_message)}</pre></span>
+           </div>`
+        : "";
+
+      const header = `
+        <h3 style="display:flex;align-items:center;gap:0.5rem">
+          Stage 4 — Skill Types
+          <span class="badge ${escape(tr.status)}">${escape(tr.status)}</span>
+          ${polling ? '<span class="spinner"></span>' : ""}
+        </h3>
+      `;
+
+      const summary = `
+        <div style="font-size:0.83rem; color:var(--text-dim); margin: 0.3rem 0">
+          ${skills.length} typed skill(s) ·
+          <span style="color:var(--success)">${(routing.auto_approved || []).length} auto-approved</span> ·
+          <span style="color:var(--accent2)">${(routing.sample_review || []).length} sample-review</span> ·
+          <span style="color:var(--danger)">${(routing.full_review || []).length} full-review</span>
+        </div>
+      `;
+
+      // Group skills by type for browsability.
+      const byType = {};
+      for (const s of skills) {
+        if (!byType[s.type]) byType[s.type] = [];
+        byType[s.type].push(s);
+      }
+      const typeOrder = Object.keys(byType).sort();
+      const skillsHtml = typeOrder.length === 0
+        ? '<div class="validator-empty">no skills typed yet</div>'
+        : typeOrder.map(type => {
+            const items = byType[type].map(s => {
+              const confColor = (
+                s.confidence > 0.9 ? "var(--success)" :
+                s.confidence < 0.7 ? "var(--danger)" :
+                "var(--accent2)"
+              );
+              const altsHtml = (s.alternatives_considered || []).length
+                ? `<div class="meta">considered: ${escape((s.alternatives_considered || []).join(" · "))}</div>`
+                : "";
+              return `
+                <details style="background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:0.4rem 0.55rem; margin-bottom:0.3rem">
+                  <summary style="cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:0.5rem">
+                    <span><strong>${escape(s.name)}</strong> <span class="meta">${escape(s.subtype || "")}</span></span>
+                    <span style="color:${confColor}; font-family:'JetBrains Mono', monospace; font-size:0.75rem">${(s.confidence || 0).toFixed(2)}</span>
+                  </summary>
+                  <div style="margin-top:0.35rem; font-size:0.8rem; line-height:1.5">
+                    <em>${escape(s.reasoning || "")}</em>
+                    ${altsHtml}
+                  </div>
+                </details>
+              `;
+            }).join("");
+            return `
+              <h4 style="margin-top:0.6rem; font-size:0.82rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.05em">${escape(type)} (${byType[type].length})</h4>
+              ${items}
+            `;
+          }).join("");
+
+      return `
+        <div class="charter-section" style="margin-top:1rem; padding-top:0.85rem; border-top:2px solid var(--border)">
+          ${header}
+          ${summary}
+          ${skillsHtml}
+          ${(findingsHtml || errorBlock) ? `<div class="validator-block" style="margin-top:0.5rem">${findingsHtml}${errorBlock}</div>` : ""}
+        </div>
+      `;
+    }
+
+    async function onApproveRecon() {
+      if (!activeReconRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveReconBtn"); const r = $("regenerateReconBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeReconRunId}/approve`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("reconciliation approved");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("approve reconciliation failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    async function onRegenerateRecon() {
+      if (!activeReconRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveReconBtn"); const r = $("regenerateReconBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeReconRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("regenerating reconciliation…");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("regenerate reconciliation failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    async function onRegenerateDimensions() {
+      if (!activeDimensionsRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const btn = $("regenerateDimensionsBtn");
+      if (btn) btn.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeDimensionsRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("regenerating dimensions…");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("regenerate dimensions failed: " + e.message, true);
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function onApproveRoleCard() {
+      if (!activeRoleCardRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveRoleCardBtn"); const r = $("regenerateRoleCardBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeRoleCardRunId}/approve`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("role card approved");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("approve role card failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    async function onRegenerateRoleCard() {
+      if (!activeRoleCardRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      const a = $("approveRoleCardBtn"); const r = $("regenerateRoleCardBtn");
+      if (a) a.disabled = true; if (r) r.disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeRoleCardRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("regenerating role card…");
+        $("notesInput").value = "";
+        // Keep polling on the same charter run id; the charter response
+        // will pick up the freshly-spawned Stage 1 run on the next cycle.
+        await pollOnce();
+      } catch (e) {
+        toast("regenerate role card failed: " + e.message, true);
+        if (a) a.disabled = false; if (r) r.disabled = false;
+      }
+    }
+
+    async function onApprove() {
+      if (!activeRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      $("approveBtn").disabled = true;
+      $("regenerateBtn").disabled = true;
+      try {
+        await jpost(`/api/generate-skills/runs/${activeRunId}/approve`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("approved");
+        $("notesInput").value = "";
+        await pollOnce();
+      } catch (e) {
+        toast("approve failed: " + e.message, true);
+        $("approveBtn").disabled = false;
+        $("regenerateBtn").disabled = false;
+      }
+    }
+
+    async function onRegenerate() {
+      if (!activeRunId) return;
+      const reviewedBy = $("reviewerInput").value.trim() || null;
+      const notes = $("notesInput").value.trim() || null;
+      $("approveBtn").disabled = true;
+      $("regenerateBtn").disabled = true;
+      try {
+        const r = await jpost(`/api/generate-skills/runs/${activeRunId}/regenerate`, {
+          reviewed_by: reviewedBy, notes,
+        });
+        toast("regenerating…");
+        $("notesInput").value = "";
+        await selectRun(r.run_id);
+        await loadRecentRuns();
+      } catch (e) {
+        toast("regenerate failed: " + e.message, true);
+        $("approveBtn").disabled = false;
+        $("regenerateBtn").disabled = false;
+      }
+    }
+
+    // ── boot ────────────────────────────────────────────────────────────────
+    document.addEventListener("DOMContentLoaded", () => {
+      $("generateBtn").addEventListener("click", onGenerate);
+      $("roleNameInput").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); onGenerate(); }
+      });
+      loadRoles();
+      loadRecentRuns();
+      // Light periodic refresh of recent runs while no active poll is running.
+      setInterval(() => { if (!pollTimer) loadRecentRuns(); }, 8000);
+    });
+  </script>
+</body>
+</html>

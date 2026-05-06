@@ -43,6 +43,8 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.30,<3.0",
     "alembic>=1.13",
     "greenlet>=3.0",
+    # ── skill_library_v3: Kaggle JD ingest for charter prompt grounding ──────
+    "kagglehub>=0.3.0",
 ]
 
 [dependency-groups]

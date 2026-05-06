@@ -1,6 +1,70 @@
+# Python build noise
 .venv
 __pycache__
 *.pyc
+*.pyo
+*.pyd
+*.egg-info
+build/
+dist/
+wheels/
+
+# Secrets + git
 .env
+.env.local
 .git
+.gitignore
+.gitattributes
+
+# Local-only model cache (downloaded from Azure on PROD startup)
 setfit_models/
+
+# Eval artifacts and per-role intermediates — pipeline output, not runtime input
+evals/
+_progress.log
+_summary.json
+_intermediate/
+
+# Test artifacts
+tests/
+.pytest_cache/
+resume-test/
+test_ranking.py
+
+# Backups + scratch
+*.bak
+uv.lock.bak
+low_confidence_log.jsonl
+prompt_context_store/
+
+# Docs / IDE / CI scaffolding
+*.md
+!README.md
+.claude/
+.agents/
+.vscode/
+.idea/
+.github/
+GPU_TRAINING.md
+
+# Admin / migration / one-off utilities — not part of the runtime image.
+# The pipeline runs through main.py / generate_skills_router.py / runner.py;
+# scripts/ are operator tools (DB cleanup, schema bootstrap, prod migration,
+# dim-slug verification) invoked from a deploy host, not from inside the
+# container.
+scripts/
+
+# Internal v3 dev/inspection scratch scripts (underscore-prefixed by convention).
+# Useful in source for replayability but not needed at runtime.
+skill_library_v3/scripts/_*.py
+
+# Screenshots and design artifacts kept locally during development.
+*.png
+image.png
+
+# Skill-library v3 tests are gitignored on this branch; mirror that here so
+# they don't leak into the docker context if ever committed locally.
+skill_library_v3/tests/
+
+# Plan-mode workspace
+plans/

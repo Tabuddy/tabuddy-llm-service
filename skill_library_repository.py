@@ -658,16 +658,22 @@ class SkillLibraryRepository:
         return [dict(zip(cols, r)) for r in rows]
 
     @staticmethod
-    def _id_or_slug_clause(value: int | str) -> tuple[str, tuple]:
+    def _id_or_slug_clause(value: int | str, alias: str = "") -> tuple[str, tuple]:
         """Return (where_fragment, params) for `id = %s OR slug = %s` lookups.
+
         Numeric strings are treated as ids; non-numeric falls back to slug-only.
+        Pass ``alias`` (e.g. ``"cs"``) to qualify each column inline — required
+        when the FROM clause has joins that introduce conflicting ``id`` / ``slug``
+        columns. Note: ``cs.(id = … OR slug = …)`` is a SQL syntax error, the
+        prefix has to land on every column individually.
         """
+        prefix = f"{alias}." if alias else ""
         s = str(value).strip()
         try:
             as_int = int(s)
-            return ("(id = %s OR slug = %s)", (as_int, s))
+            return (f"({prefix}id = %s OR {prefix}slug = %s)", (as_int, s))
         except (TypeError, ValueError):
-            return ("slug = %s", (s,))
+            return (f"{prefix}slug = %s", (s,))
 
     def get_catalog_stats(self) -> dict:
         """Counts for the stats bar plus the active schema name."""
@@ -994,7 +1000,9 @@ class SkillLibraryRepository:
     def get_skill_detail(self, id_or_slug: int | str) -> dict | None:
         """Full skill record: taxonomy, aliases, parent dims, transitive parent
         roles, tags, skill_relationships (both directions), parent + version."""
-        clause, params = self._id_or_slug_clause(id_or_slug)
+        # Use alias="cs" because the FROM has joins to categories + sub_categories
+        # which also have id/slug columns — the WHERE clause must qualify them.
+        clause, params = self._id_or_slug_clause(id_or_slug, alias="cs")
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1022,7 +1030,7 @@ class SkillLibraryRepository:
                     FROM {self.schema}.canonical_skills cs
                     LEFT JOIN {self.schema}.categories     c  ON c.id  = cs.category_id
                     LEFT JOIN {self.schema}.sub_categories sc ON sc.id = cs.sub_category_id
-                    WHERE cs.{clause}
+                    WHERE {clause}
                     LIMIT 1
                     """,
                     params,

@@ -54,6 +54,8 @@ from contextlib import asynccontextmanager
 from model_azure import download_models_from_azure, upload_models_to_azure
 from model_pipeline import router as model_pipeline_router
 from canonical_skill_api import canonical_skill_router
+from generate_skills_router import generate_skills_router
+from skill_library_v3.db import repository as v3_repo
 
 # Suppress noisy third-party progress bars BEFORE any imports that pull in tqdm
 import os
@@ -101,6 +103,13 @@ async def lifespan(app: FastAPI):
     await db.seed_static_skills()
     await skill_library.init()
 
+    # v3 stage 0: reap any 'running' charter runs left behind by a prior
+    # uvicorn crash so the UI doesn't show them as in-flight forever.
+    try:
+        await asyncio.to_thread(v3_repo.recover_orphan_runs, stale_after_seconds=600)
+    except Exception:  # noqa: BLE001 — never block startup on this
+        logger.exception("[v3] orphan-run recovery failed; continuing startup")
+
     yield
     logger.info("Shutting down TABuddy service")
 
@@ -118,6 +127,7 @@ app = FastAPI(
 app.include_router(docling_router)
 app.include_router(model_pipeline_router)
 app.include_router(canonical_skill_router)
+app.include_router(generate_skills_router)
 
 templates = Jinja2Templates(directory="templates")
 
