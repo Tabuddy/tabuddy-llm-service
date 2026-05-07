@@ -326,6 +326,32 @@ No extra keys. No markdown. No prose outside the JSON object.
 """
 
 
+_DEDUP_SYSTEM_PROMPT = """\
+You are a deduplication assistant for a professional skill library database.
+You are given a proposed new entity (skill, dimension, or role) and up to 3
+similar existing records retrieved by vector similarity search (similarity >= 70%).
+
+Decide: is the proposed entity genuinely new, or does an existing record already
+cover it well enough that creating a duplicate would add noise?
+
+RULES:
+- REUSE if an existing record is semantically equivalent — same concept, just
+  different wording (e.g. "Backend Developer" vs "Backend Engineer").
+- CREATE NEW if the proposed entity has a clearly distinct meaning not covered
+  by any existing record.
+- When in doubt, prefer REUSE to keep the library clean.
+
+OUTPUT — strict JSON only, no markdown:
+{
+  "action": "use_existing" | "create_new",
+  "existing_id": <integer id of the chosen existing record, or null>,
+  "reason": "<one short sentence>"
+}
+
+Rules: existing_id MUST be an integer when action is "use_existing". Set null for "create_new".
+"""
+
+
 def _sanitize_json(content: str) -> str:
     txt = (content or "").strip()
     if txt.startswith("```"):
@@ -497,6 +523,43 @@ class AzureReversePlannerLLM:
             "role_archetype": archetype,
             "rationale": rationale,
         }
+
+    async def confirm_or_reuse_entity(
+        self,
+        entity_type: str,
+        proposed: dict[str, Any],
+        similar_existing: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Ask LLM whether to create a new entity or reuse a similar existing one.
+
+        Returns {"action": "use_existing", "existing_id": int} or
+                {"action": "create_new", "existing_id": None}.
+        Falls back to create_new on any error.
+        """
+        if not similar_existing:
+            return {"action": "create_new", "existing_id": None}
+
+        payload = json.dumps(
+            {
+                "entity_type": entity_type,
+                "proposed": proposed,
+                "similar_existing": similar_existing,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            parsed = await self._call(
+                _DEDUP_SYSTEM_PROMPT,
+                payload,
+                max_completion_tokens=200,
+            )
+            action = (parsed.get("action") or "create_new").strip().lower()
+            existing_id = parsed.get("existing_id")
+            if action == "use_existing" and isinstance(existing_id, int):
+                return {"action": "use_existing", "existing_id": existing_id}
+        except Exception:
+            pass
+        return {"action": "create_new", "existing_id": None}
 
     async def infer_dimensions(
         self,

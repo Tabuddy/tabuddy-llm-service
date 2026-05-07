@@ -394,6 +394,17 @@ def _extract_jd_sentence(jd_text: str, word: str, max_chars: int = 180) -> str:
     return ""
 
 
+_embedder_model = None
+
+
+def _embed_text(text: str) -> list[float]:
+    global _embedder_model
+    if _embedder_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedder_model.encode([(text or "").strip()], show_progress_bar=False)[0].tolist()
+
+
 def _norm_token(v: str | None) -> str:
     return (v or "").strip().lower().replace("_", "-")
 
@@ -1182,6 +1193,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     cost_acc = CostAccumulator()
     repo = SkillLibraryRepository()
+    rev_planner = AzureReversePlannerLLM(accumulator=cost_acc)
 
     # 1) Build final input skills with in_db/new tags.
     final_input_skills = [
@@ -1220,13 +1232,28 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
         if should_create:
             try:
-                resolved_role = await asyncio.to_thread(
-                    repo.create_role,
-                    slug=chosen.slug,
-                    display_name=chosen.display_name,
-                    role_archetype=chosen.role_archetype,
-                    source=chosen.source or "llm",
-                )
+                role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
+                role_vec = await asyncio.to_thread(_embed_text, role_embed_text.strip())
+                similar_roles = await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                if similar_roles:
+                    dedup = await rev_planner.confirm_or_reuse_entity(
+                        "role",
+                        {"display_name": chosen.display_name, "role_archetype": chosen.role_archetype},
+                        similar_roles,
+                    )
+                    if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
+                        resolved_role = await asyncio.to_thread(
+                            repo.find_role_by_identity, role_id=dedup["existing_id"]
+                        )
+                if resolved_role is None:
+                    resolved_role = await asyncio.to_thread(
+                        repo.create_role,
+                        slug=chosen.slug,
+                        display_name=chosen.display_name,
+                        role_archetype=chosen.role_archetype,
+                        source=chosen.source or "llm",
+                        name_embedding=role_vec,
+                    )
             except Exception as exc:
                 logger.warning("create_role failed for chosen role %r: %s", chosen.slug, exc)
 
@@ -1274,6 +1301,20 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             )
             continue
         try:
+            skill_vec = await asyncio.to_thread(_embed_text, skill_name)
+            similar_skills = await asyncio.to_thread(repo.find_similar_skills_by_embedding, skill_vec)
+            if similar_skills:
+                dedup = await rev_planner.confirm_or_reuse_entity(
+                    "skill",
+                    {"display_name": skill_name, "category": meta.category, "skill_nature": meta.skill_nature},
+                    similar_skills,
+                )
+                if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
+                    reused_id = dedup["existing_id"]
+                    skill_id_by_input[skill_name] = reused_id
+                    skill_id_by_input_lower[skill_name.lower()] = reused_id
+                    continue
+
             cat_row = await asyncio.to_thread(
                 repo.find_or_create_category,
                 display_name=meta.category,
@@ -1294,6 +1335,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 sub_category_id=sub_cat_id,
                 skill_nature=meta.skill_nature,
                 typical_lifespan=meta.typical_lifespan,
+                name_embedding=skill_vec,
             )
             new_skill_id = int(skill_row["id"])
             skill_id_by_input[skill_name] = new_skill_id
@@ -1338,15 +1380,28 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
 
         try:
             if dim_id is None:
-                dim_row = await asyncio.to_thread(
-                    repo.find_or_create_dimension,
-                    slug=dim_slug,
-                    display_name=dim_name,
-                    rationale=dd.dimension.rationale,
-                    difficulty_hint=dd.dimension.difficulty_hint,
-                    source=dd.dimension.source,
-                )
-                dim_id = int(dim_row["id"])
+                dim_embed_text = (dim_name or "").strip() + " " + (dd.dimension.rationale or "").strip()
+                dim_vec = await asyncio.to_thread(_embed_text, dim_embed_text.strip())
+                similar_dims = await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, dim_vec)
+                if similar_dims:
+                    dedup = await rev_planner.confirm_or_reuse_entity(
+                        "dimension",
+                        {"display_name": dim_name, "rationale": dd.dimension.rationale},
+                        similar_dims,
+                    )
+                    if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
+                        dim_id = dedup["existing_id"]
+                if dim_id is None:
+                    dim_row = await asyncio.to_thread(
+                        repo.find_or_create_dimension,
+                        slug=dim_slug,
+                        display_name=dim_name,
+                        rationale=dd.dimension.rationale,
+                        difficulty_hint=dd.dimension.difficulty_hint,
+                        source=dd.dimension.source,
+                        name_embedding=dim_vec,
+                    )
+                    dim_id = int(dim_row["id"])
             dim_id = int(dim_id)
             item.dimension_id = dim_id
 
@@ -1419,20 +1474,37 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         [d.dimension_id],
                     )
                     existed = bool(dim_before)
-                    dim_row = await asyncio.to_thread(
-                        repo.find_or_create_dimension,
-                        slug=d.dimension_id,
-                        display_name=d.dimension_name,
-                        rationale=d.rationale,
-                        difficulty_hint=d.difficulty_hint,
-                        source="llm",
-                    )
+                    planner_dim_embed_text = (d.dimension_name or "").strip() + " " + (d.rationale or "").strip()
+                    planner_dim_vec = await asyncio.to_thread(_embed_text, planner_dim_embed_text.strip())
+                    final_dim_id: int | None = None
+                    if not existed:
+                        similar_dims = await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, planner_dim_vec)
+                        if similar_dims:
+                            dedup = await rev_planner.confirm_or_reuse_entity(
+                                "dimension",
+                                {"display_name": d.dimension_name, "rationale": d.rationale},
+                                similar_dims,
+                            )
+                            if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
+                                final_dim_id = dedup["existing_id"]
+                                existed = True
+                    if final_dim_id is None:
+                        dim_row = await asyncio.to_thread(
+                            repo.find_or_create_dimension,
+                            slug=d.dimension_id,
+                            display_name=d.dimension_name,
+                            rationale=d.rationale,
+                            difficulty_hint=d.difficulty_hint,
+                            source="llm",
+                            name_embedding=planner_dim_vec,
+                        )
+                        final_dim_id = int(dim_row["id"])
                     if not existed:
                         planner_saved_dim_creates += 1
                     rd_ins = await asyncio.to_thread(
                         repo.upsert_role_dimension_link,
                         role_id=int(chosen_role_out.id),
-                        dimension_id=int(dim_row["id"]),
+                        dimension_id=final_dim_id,
                     )
                     if rd_ins:
                         planner_saved_role_dims += 1
