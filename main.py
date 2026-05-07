@@ -37,6 +37,7 @@ from non_skill_repository import NonSkillRepository
 from unknown_word_classifier import AzureUnknownWordClassifier
 from reverse_planner_llm import AzureReversePlannerLLM
 from skill_library_repository import SkillLibraryRepository
+from jd_pipeline_run_repository import JdPipelineRunRepository
 from skill_library_v2.agents.planner import PlannerAgent
 from cost_tracker import CostAccumulator
 from pathlib import Path
@@ -111,6 +112,14 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 — never block startup on this
         logger.exception("[v3] orphan-run recovery failed; continuing startup")
 
+    # Ensure JD pipeline history tables exist (never blocks startup).
+    try:
+        await asyncio.to_thread(JdPipelineRunRepository().ensure_schema)
+    except Exception as exc:
+        logger.warning(
+            "JD pipeline history schema bootstrap failed (continuing): %s", exc
+        )
+
     yield
     logger.info("Shutting down TABuddy service")
 
@@ -177,6 +186,7 @@ class JDSkillPipelineResponse(BaseModel):
     final_skills: list[str]
     final_non_skills: list[str]
     jd_role_hint: JdRoleHint | None = None
+    run_id: str | None = None
 
 
 # ── Skill Detail / Reverse Planner models ────────────────────────────────────
@@ -184,6 +194,7 @@ class ExtractDetailsRequest(BaseModel):
     final_skills: list[str] = Field(default_factory=list)
     llm_skills: list[str] = Field(default_factory=list)
     jd_role_hint: JdRoleHint | None = None
+    run_id: str | None = None
 
 
 class CanonicalSkillSummary(BaseModel):
@@ -291,6 +302,7 @@ class ExtractDetailsResponse(BaseModel):
     skills_detail: list[SkillDetail]
     candidate_roles: list[RoleSummary]
     chosen_role: ChosenRole | None = None
+    run_id: str | None = None
 
 
 class FinalInputSkillTag(BaseModel):
@@ -339,6 +351,59 @@ class FinalRoleOutputResponse(BaseModel):
     final_input_skills: list[FinalInputSkillTag] = Field(default_factory=list)
     persistence: PersistenceReport
     planner_output: PlannerGeneratedOutput | None = None
+    run_id: str | None = None
+
+
+# ── JD Pipeline History models ───────────────────────────────────────────────
+class JdRunSummary(BaseModel):
+    """Compact row for the history list page."""
+
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    status: str
+    chosen_role_display: str | None = None
+    chosen_role_id: int | None = None
+    final_skills_count: int | None = None
+    final_skills: list[str] | None = None
+    jd_role_hint_display: str | None = None
+    duration_ms: int | None = None
+    error_message: str | None = None
+    jd_text_preview: str | None = None
+    jd_text_length: int | None = None
+
+
+class JdRunListResponse(BaseModel):
+    runs: list[JdRunSummary]
+    limit: int
+    offset: int
+
+
+class JdRunArtifact(BaseModel):
+    id: int
+    artifact_kind: str
+    artifact_id: int | None = None
+    artifact_text: str | None = None
+    created_at: datetime
+
+
+class JdRunDetail(BaseModel):
+    id: str
+    jd_text: str
+    status: str
+    api1_response: dict[str, Any] | None = None
+    api2_response: dict[str, Any] | None = None
+    api3_response: dict[str, Any] | None = None
+    chosen_role_display: str | None = None
+    chosen_role_id: int | None = None
+    final_skills_count: int | None = None
+    final_skills: list[str] | None = None
+    jd_role_hint_display: str | None = None
+    error_message: str | None = None
+    duration_ms: int | None = None
+    created_at: datetime
+    updated_at: datetime
+    artifacts: list[JdRunArtifact] = Field(default_factory=list)
 
 
 class PdfLinkItem(BaseModel):
@@ -553,15 +618,20 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 llm_skills.append("deployments")
 
         if llm_non_skills:
-            await asyncio.to_thread(repo.add_non_skills, llm_non_skills)
+            persisted_non_skills = await asyncio.to_thread(
+                repo.add_non_skills, llm_non_skills
+            )
+        else:
+            persisted_non_skills = []
     else:
         initial_skills = initial_skills_raw
+        persisted_non_skills = []
 
     final_skills = _dedupe_case_insensitive(initial_skills + llm_skills)
     final_non_skills = _dedupe_case_insensitive(llm_non_skills)
 
     # cost_acc.log_summary("skills/extract-from-jd", logger)
-    return JDSkillPipelineResponse(
+    response = JDSkillPipelineResponse(
         initial_skills=initial_skills,
         unknown_words=unknown_words,
         filtered_unknown_words=filtered_unknown_words,
@@ -571,6 +641,25 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         final_non_skills=final_non_skills,
         jd_role_hint=jd_role_hint,
     )
+
+    # ── History persistence───────────────────────────────────
+    history_repo = JdPipelineRunRepository()
+    run_id = await asyncio.to_thread(
+        history_repo.start_run,
+        jd_text=jd_text,
+        api1_response=response,
+        jd_role_hint_display=(jd_role_hint.display_name if jd_role_hint else None),
+    )
+    if run_id and persisted_non_skills:
+        artifact_items = [
+            {"kind": "non_skill_added", "artifact_text": w}
+            for w in persisted_non_skills
+        ]
+        await asyncio.to_thread(
+            history_repo.record_artifacts_bulk, run_id, artifact_items
+        )
+    response.run_id = run_id
+    return response
 
 
 def _canonical_summary_from_row(row: dict) -> CanonicalSkillSummary:
@@ -721,11 +810,13 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             ))
 
     new_aliases_persisted = 0
+    persisted_alias_pairs: list[tuple[int, str]] = []
     if aliases_to_insert:
         try:
             new_aliases_persisted = await asyncio.to_thread(
                 repo.add_aliases, aliases_to_insert
             )
+            persisted_alias_pairs = list(aliases_to_insert)
         except Exception as exc:
             logger.exception("Persisting aliases failed: %s", exc)
             for am in alias_matches:
@@ -734,6 +825,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                     am.alias_persist_skipped_reason = f"db error: {exc}"
             new_alias_per_final.clear()
             new_aliases_persisted = 0
+            persisted_alias_pairs = []
 
     # ── Stage 2: pull DB enrichment for every matched skill ─────────────────
     matched_skill_ids = sorted({
@@ -1176,7 +1268,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             )
 
     # cost_acc.log_summary("skills/extract-details", logger)
-    return ExtractDetailsResponse(
+    response = ExtractDetailsResponse(
         input_final_skills=final_skills,
         input_llm_skills=llm_skills,
         alias_matches=alias_matches,
@@ -1186,14 +1278,37 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         skills_detail=skills_detail,
         candidate_roles=candidate_roles,
         chosen_role=chosen_role,
+        run_id=req.run_id,
     )
+
+    # ── History persistence (only if API 1 minted a run_id) ────
+    if req.run_id:
+        history_repo = JdPipelineRunRepository()
+        await asyncio.to_thread(history_repo.attach_api2, req.run_id, response)
+        if persisted_alias_pairs:
+            artifact_items = [
+                {
+                    "kind": "alias_added",
+                    "artifact_id": int(skill_id),
+                    "artifact_text": str(alias_text),
+                }
+                for (skill_id, alias_text) in persisted_alias_pairs
+            ]
+            await asyncio.to_thread(
+                history_repo.record_artifacts_bulk, req.run_id, artifact_items
+            )
+
+    return response
 
 
 @app.post("/skills/final-role-output", response_model=FinalRoleOutputResponse)
 async def final_role_output_endpoint(req: FinalRoleOutputRequest):
+    api3_started_at = time.monotonic()
     cost_acc = CostAccumulator()
     repo = SkillLibraryRepository()
     rev_planner = AzureReversePlannerLLM(accumulator=cost_acc)
+    history_repo = JdPipelineRunRepository() if req.run_id else None
+    artifacts: list[dict[str, Any]] = []
 
     # 1) Build final input skills with in_db/new tags.
     final_input_skills = [
@@ -1204,12 +1319,25 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     chosen = req.chosen_role
     persistence = PersistenceReport()
     if chosen is None:
-        return FinalRoleOutputResponse(
+        empty_response = FinalRoleOutputResponse(
             chosen_role=None,
             final_input_skills=final_input_skills,
             persistence=persistence,
             planner_output=None,
+            run_id=req.run_id,
         )
+        if history_repo is not None:
+            duration_ms = int((time.monotonic() - api3_started_at) * 1000)
+            await asyncio.to_thread(
+                history_repo.attach_api3,
+                req.run_id,
+                empty_response,
+                chosen_role_display=None,
+                chosen_role_id=None,
+                final_skills=req.input_final_skills,
+                duration_ms=duration_ms,
+            )
+        return empty_response
 
     # 2) Resolve role in DB (or conditionally create when missing).
     resolved_role = await asyncio.to_thread(
@@ -1235,6 +1363,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
                 role_vec = await asyncio.to_thread(_embed_text, role_embed_text.strip())
                 similar_roles = await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                role_reused = False
                 if similar_roles:
                     dedup = await rev_planner.confirm_or_reuse_entity(
                         "role",
@@ -1245,6 +1374,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         resolved_role = await asyncio.to_thread(
                             repo.find_role_by_identity, role_id=dedup["existing_id"]
                         )
+                        role_reused = True
                 if resolved_role is None:
                     resolved_role = await asyncio.to_thread(
                         repo.create_role,
@@ -1254,6 +1384,18 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         source=chosen.source or "llm",
                         name_embedding=role_vec,
                     )
+                    if (
+                        resolved_role is not None
+                        and resolved_role.get("id") is not None
+                        and not role_reused
+                    ):
+                        artifacts.append({
+                            "kind": "role_created",
+                            "artifact_id": int(resolved_role["id"]),
+                            "artifact_text": str(
+                                resolved_role.get("display_name") or chosen.display_name
+                            ),
+                        })
             except Exception as exc:
                 logger.warning("create_role failed for chosen role %r: %s", chosen.slug, exc)
 
@@ -1341,6 +1483,11 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             skill_id_by_input[skill_name] = new_skill_id
             skill_id_by_input_lower[skill_name.lower()] = new_skill_id
             persistence.new_skills_created += 1
+            artifacts.append({
+                "kind": "canonical_skill_added",
+                "artifact_id": new_skill_id,
+                "artifact_text": skill_name,
+            })
         except Exception as exc:
             logger.warning("Failed to create canonical skill %r: %s", skill_name, exc)
 
@@ -1401,7 +1548,14 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         source=dd.dimension.source,
                         name_embedding=dim_vec,
                     )
-                    dim_id = int(dim_row["id"])
+                    created_id = int(dim_row["id"])
+                    if dim_row.get("created"):
+                        artifacts.append({
+                            "kind": "dimension_created",
+                            "artifact_id": created_id,
+                            "artifact_text": dim_name,
+                        })
+                    dim_id = created_id
             dim_id = int(dim_id)
             item.dimension_id = dim_id
 
@@ -1412,6 +1566,11 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             )
             if sd_inserted:
                 persistence.skill_dimension_saved += 1
+                artifacts.append({
+                    "kind": "dimension_skill_link",
+                    "artifact_id": dim_id,
+                    "artifact_text": f"{skill_name} \u2194 {dim_name}",
+                })
             # False here usually means mapping already existed; treat as persisted.
             item.skill_dimension_saved = True
 
@@ -1427,6 +1586,13 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 )
                 if rd_inserted:
                     persistence.role_dimension_saved += 1
+                    artifacts.append({
+                        "kind": "role_dimension_link",
+                        "artifact_id": dim_id,
+                        "artifact_text": (
+                            f"{chosen_role_out.display_name} \u2194 {dim_name}"
+                        ),
+                    })
                 # False here usually means mapping already existed; still persisted.
                 item.role_dimension_saved = True
             elif matched and (chosen_role_out is None or chosen_role_out.id is None):
@@ -1501,6 +1667,11 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         final_dim_id = int(dim_row["id"])
                     if not existed:
                         planner_saved_dim_creates += 1
+                        artifacts.append({
+                            "kind": "dimension_created",
+                            "artifact_id": int(dim_row["id"]),
+                            "artifact_text": d.dimension_name,
+                        })
                     rd_ins = await asyncio.to_thread(
                         repo.upsert_role_dimension_link,
                         role_id=int(chosen_role_out.id),
@@ -1508,6 +1679,13 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     )
                     if rd_ins:
                         planner_saved_role_dims += 1
+                        artifacts.append({
+                            "kind": "role_dimension_link",
+                            "artifact_id": int(dim_row["id"]),
+                            "artifact_text": (
+                                f"{chosen_role_out.display_name} \u2194 {d.dimension_name}"
+                            ),
+                        })
                 planner_output.saved_dimensions_created = planner_saved_dim_creates
                 planner_output.saved_role_dimensions = planner_saved_role_dims
         except Exception as exc:
@@ -1515,12 +1693,81 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             planner_output.payload = {"error": str(exc)}
 
     # cost_acc.log_summary("skills/final-role-output", logger)
-    return FinalRoleOutputResponse(
+    response = FinalRoleOutputResponse(
         chosen_role=chosen_role_out,
         final_input_skills=final_input_skills,
         persistence=persistence,
         planner_output=planner_output,
+        run_id=req.run_id,
     )
+
+    # ── History persistence (only if API 1 minted a run_id) ────
+    if history_repo is not None:
+        duration_ms = int((time.monotonic() - api3_started_at) * 1000)
+        chosen_role_id_for_history: int | None = None
+        chosen_role_display_for_history: str | None = None
+        if chosen_role_out is not None:
+            chosen_role_display_for_history = chosen_role_out.display_name
+            if chosen_role_out.id is not None:
+                chosen_role_id_for_history = int(chosen_role_out.id)
+        await asyncio.to_thread(
+            history_repo.attach_api3,
+            req.run_id,
+            response,
+            chosen_role_display=chosen_role_display_for_history,
+            chosen_role_id=chosen_role_id_for_history,
+            final_skills=req.input_final_skills,
+            duration_ms=duration_ms,
+        )
+        if artifacts:
+            await asyncio.to_thread(
+                history_repo.record_artifacts_bulk, req.run_id, artifacts
+            )
+
+    return response
+
+
+@app.get("/skills/runs", response_model=JdRunListResponse)
+async def list_jd_pipeline_runs(
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+):
+    """Return a paginated history of JD pipeline runs (most recent first)."""
+    repo = JdPipelineRunRepository()
+    try:
+        rows = await asyncio.to_thread(
+            repo.list_runs, limit=limit, offset=offset, status=status
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list JD pipeline runs: {exc}",
+        ) from exc
+    summaries = [JdRunSummary(**row) for row in rows]
+    return JdRunListResponse(
+        runs=summaries,
+        limit=max(1, min(int(limit), 200)),
+        offset=max(0, int(offset)),
+    )
+
+
+@app.get("/skills/runs/{run_id}", response_model=JdRunDetail)
+async def get_jd_pipeline_run(run_id: str):
+    """Return the full row for one run, including artifacts."""
+    repo = JdPipelineRunRepository()
+    try:
+        row = await asyncio.to_thread(repo.get_run, run_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch JD pipeline run: {exc}",
+        ) from exc
+    if not row:
+        raise HTTPException(status_code=404, detail="run_id not found")
+    artifacts_raw = row.pop("artifacts", []) or []
+    artifacts = [JdRunArtifact(**a) for a in artifacts_raw]
+    return JdRunDetail(**row, artifacts=artifacts)
 
 
 @app.post("/extract-pdf-links", response_model=PdfLinksResponse)

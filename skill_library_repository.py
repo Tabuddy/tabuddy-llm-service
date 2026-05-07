@@ -554,7 +554,11 @@ class SkillLibraryRepository:
         source: str | None = "llm",
         name_embedding: list[float] | None = None,
     ) -> dict:
-        """Resolve dimension by slug/display_name, else insert it."""
+        """Resolve dimension by slug/display_name, else insert it.
+
+        The returned dict always includes a ``created`` key (bool) so callers
+        can tell whether the row was newly inserted.
+        """
         found = self.find_dimensions_by_names([display_name], [slug])
         if found:
             key = (display_name or "").strip().lower() or (slug or "").strip().lower()
@@ -562,7 +566,9 @@ class SkillLibraryRepository:
             if rec is None and found:
                 rec = next(iter(found.values()))
             if rec is not None:
-                return rec
+                rec_with_flag = dict(rec)
+                rec_with_flag.setdefault("created", False)
+                return rec_with_flag
 
         if name_embedding is not None:
             vec_str = "[" + ",".join(map(str, name_embedding)) + "]"
@@ -588,7 +594,9 @@ class SkillLibraryRepository:
                 row = cur.fetchone()
                 cols = [c[0] for c in cur.description]
             conn.commit()
-        return dict(zip(cols, row))
+        result = dict(zip(cols, row))
+        result["created"] = True
+        return result
 
     def upsert_dimension_skill_link(self, *, skill_id: int, dimension_id: int) -> bool:
         """Ensure one (skill_id, dimension_id) mapping. Returns True if inserted."""
