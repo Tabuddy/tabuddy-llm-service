@@ -36,6 +36,7 @@ _reasoning_async: AsyncAzureOpenAI | None = None
 _generation_async: AsyncAzureOpenAI | None = None
 _embedding_async: AsyncAzureOpenAI | None = None
 _fast_sync: AzureOpenAI | None = None
+_embedding_sync: AzureOpenAI | None = None
 
 
 def _api_key() -> str | None:
@@ -124,3 +125,19 @@ def get_fast_sync_client() -> AzureOpenAI | None:
         api_version=_AZURE_API_VERSION,
     )
     return _fast_sync
+
+
+def get_embedding_sync_client() -> AzureOpenAI | None:
+    """Sync client for Azure embeddings (e.g. text-embedding-3-small, 1536-dim)."""
+    global _embedding_sync
+    if _embedding_sync is not None:
+        return _embedding_sync
+    key = _api_key()
+    if not key:
+        return None
+    _embedding_sync = AzureOpenAI(
+        api_key=key,
+        azure_endpoint=_AZURE_ENDPOINT,
+        api_version=_AZURE_API_VERSION,
+    )
+    return _embedding_sync

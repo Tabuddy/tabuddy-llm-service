@@ -58,6 +58,14 @@ def _normalize_entity_source(source: str | None) -> str:
     return "AUTOMATED_DISCOVERY"
 
 
+def _quote_ident(ident: str) -> str:
+    """Return a safely double-quoted SQL identifier."""
+    s = (ident or "").strip()
+    if not s:
+        return '"public"'
+    return '"' + s.replace('"', '""') + '"'
+
+
 class SkillLibraryRepository:
     """Read/write helpers for public.canonical_skills, public.skill_aliases,
     public.dimensions, public.role_dimensions, public.roles."""
@@ -79,9 +87,12 @@ class SkillLibraryRepository:
         self.db_name = os.getenv("DB_NAME", "")
         self.db_user = os.getenv("DB_USER", "")
         self.db_password = os.getenv("DB_PASSWORD", "")
-        self.schema = (
+        raw_schema = (
             schema if schema is not None else os.getenv("SKILL_LIBRARY_SCHEMA", "public")
         )
+        # Keep schema SQL-safe for f-string composed queries (supports hyphenated
+        # names like "skill-library").
+        self.schema = _quote_ident(raw_schema)
 
         if not self.database_url and not (
             self.db_host and self.db_name and self.db_user and self.db_password

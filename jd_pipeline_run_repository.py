@@ -72,6 +72,10 @@ _VALID_ARTIFACT_KINDS = {
     "role_created",
     "dimension_skill_link",
     "role_dimension_link",
+    "canonical_skill_proposed",
+    "dimension_proposed",
+    "dimension_skill_link_proposed",
+    "role_dimension_link_proposed",
 }
 
 
