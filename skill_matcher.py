@@ -5,11 +5,9 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
-from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.pool
-from opensearchpy import OpenSearch
 
 logger = logging.getLogger(__name__)
 
@@ -21,14 +19,6 @@ class Config:
     pg_database: str = os.getenv("DB_NAME",     "postgres")
     pg_user: str     = os.getenv("DB_USER",     "linkedin_scraper")
     pg_password: str = os.getenv("DB_PASSWORD", os.getenv("LINKEDIN_PASSWORD", "L!nked!nS3r@p3R"))
-    opensearch_url: str = os.getenv(
-        "OPENSEARCH_URL", os.getenv("OPENSEARCH_NODE_URL", "https://135.235.196.207:9200")
-    )
-    opensearch_index: str    = os.getenv("OPENSEARCH_SKILLS_INDEX", "canonical_skills")
-    opensearch_username: str = os.getenv("OPENSEARCH_USERNAME", os.getenv("OPENSEARCH_USER", "admin"))
-    opensearch_password: str = os.getenv(
-        "OPENSEARCH_PASSWORD", os.getenv("OPENSEARCH_PASS", "Link3diN$c6ap3rOp3nS3a6ch")
-    )
     fuzzy_threshold: float  = 0.45
     vector_threshold: float = 0.75
     embed_model_name: str   = "all-MiniLM-L6-v2"
@@ -96,18 +86,31 @@ def _extract_sentence_context(jd_text: str, word: str, max_chars: int = 200) -> 
     return word
 
 
-def _is_ambiguous_token(ngram_lower: str) -> bool:
+# File extensions whose library names are often confused with common English words
+# e.g. "should" → Should.js, "chance" → Chance.js, "from" → from.js
+_EXTENSION_RE = re.compile(
+    r'\.(js|ts|py|rb|go|rs|php|cs|java|sh|pl|r)$', re.IGNORECASE
+)
+
+
+def _is_ambiguous_token(ngram_lower: str, canonical_name: str = "") -> bool:
     """Return True if the matched n-gram needs LLM context to confirm it is a skill.
 
-    Multi-word phrases and tokens longer than 3 chars are specific enough to
-    accept directly.  Short single words ("Go", "R", "C", "SQL", "AWS" …)
-    share spelling with common English words and need a sentence-level check.
+    Flags as ambiguous when:
+    1. Short single token (≤3 chars) — e.g. "Go", "R", "C"
+    2. Canonical skill has a file-extension suffix (.js, .py …) but the matched
+       token in the JD does not contain a dot — e.g. "should" → Should.js
     """
     if ngram_lower in _ALWAYS_SKILL_TOKENS:
         return False
     if len(ngram_lower.split()) >= 2:
         return False  # multi-word → unambiguous
-    return len(ngram_lower) <= 3
+    if len(ngram_lower) <= 3:
+        return True
+    # Token is a plain word but canonical name is a dotted library name
+    if canonical_name and _EXTENSION_RE.search(canonical_name) and "." not in ngram_lower:
+        return True
+    return False
 
 
 def _llm_disambiguate(items: list[tuple[str, str]]) -> list[str]:
@@ -153,7 +156,7 @@ def _llm_disambiguate(items: list[tuple[str, str]]) -> list[str]:
         )
         out = json.loads(resp.choices[0].message.content or "{}")
         confirmed = [r["skill"] for r in out.get("results", []) if r.get("is_skill")]
-        # logger.info("[ngram_scan] LLM disambiguated %d/%d as skills", len(confirmed), len(items))
+        # logger.info("[ngram_scan] LLM disambiguated %d/%d as skills: %s", len(confirmed), len(items), confirmed)
         return confirmed
     except Exception as exc:
         # logger.warning("[ngram_scan] LLM disambiguation failed: %s", exc)
@@ -193,15 +196,19 @@ def _ngram_skill_scan(jd_text: str, matcher: "SkillMatcher") -> list[str]:
     ambiguous_items: list[tuple[str, str]] = []  # (canonical_name, sentence)
 
     for ngram_lower, skill_match in exact_matches.items():
-        if _is_ambiguous_token(ngram_lower):
+        if _is_ambiguous_token(ngram_lower, skill_match.canonical_name):
             sentence = _extract_sentence_context(jd_text, ngram_lower)
+            # logger.info(
+            #     "[ngram_scan] AMBIGUOUS token=%r → canonical=%r | sending to LLM | sentence: %s",
+            #     ngram_lower, skill_match.canonical_name, sentence[:120],
+            # )
             ambiguous_items.append((skill_match.canonical_name, sentence))
         else:
             unambiguous.append(skill_match.canonical_name)
 
     llm_confirmed = _llm_disambiguate(ambiguous_items)
 
-    all_confirmed = list(dict.fromkeys(unambiguous + llm_confirmed))
+    all_confirmed = _drop_subword_skills(list(dict.fromkeys(unambiguous + llm_confirmed)))
     # logger.info(
     #     "[ngram_scan] ngrams=%d exact_hits=%d unambiguous=%d ambiguous=%d llm_confirmed=%d total=%d",
     #     len(unique_ngrams),
@@ -214,13 +221,52 @@ def _ngram_skill_scan(jd_text: str, matcher: "SkillMatcher") -> list[str]:
     return all_confirmed
 
 
+def _drop_subword_skills(skills: list[str]) -> list[str]:
+    """Remove single-word skills that are exact whole-word components of a
+    multi-word skill in the same list.
+
+    Matching is done on whitespace-split tokens only — "java" will NEVER match
+    "javascript" because they are different complete words after split.
+
+    Example:
+      ["Azure SQL", "Azure", "SQL", "Java", "JavaScript"]
+        → covered words from "Azure SQL": {"azure", "sql"}
+        → "Azure" removed  ("azure" in covered)
+        → "SQL"   removed  ("sql"   in covered)
+        → "Java"  KEPT     ("java"  NOT in covered — "javascript" ≠ "java")
+        → "JavaScript" KEPT (single-word, not covered by anything)
+    """
+    # Map: word → which multi-word skill put it in covered (for logging)
+    covered: dict[str, str] = {}
+    for skill in skills:
+        parts = skill.split()
+        if len(parts) >= 2:
+            for w in parts:
+                covered.setdefault(w.lower(), skill)
+
+    result = []
+    for skill in skills:
+        parts = skill.split()
+        if len(parts) >= 2:
+            result.append(skill)  # always keep multi-word skills intact
+        elif skill.lower() not in covered:
+            result.append(skill)  # single-word not covered by any multi-word
+        else:
+            # logger.info(
+            #     "[drop_subword] dropping '%s' — whole-word covered by '%s'",
+            #     skill, covered[skill.lower()],
+            # )
+            pass
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_jd(jd_text: str, config: Config = None) -> dict:
     """
-    Full pipeline: JD text → SkillNer extraction + OpenSearch n-gram scan
+    Full pipeline: JD text → SkillNer extraction + n-gram scan
                    → canonical DB matching (exact/fuzzy/vector)
                    + spaCy noun/propn/OOV extraction with unknown-word filtering.
 
@@ -240,7 +286,8 @@ def process_jd(jd_text: str, config: Config = None) -> dict:
     config = config or Config()
 
     spacy_words        = _extract_spacy_words(jd_text)
-    skillner_extracted = _extract_skills_from_jd(jd_text)
+    skillner_extracted = _drop_subword_skills(_extract_skills_from_jd(jd_text))
+    # logger.info("[skillner] extracted %d raw tokens: %s", len(skillner_extracted), skillner_extracted)
 
     with SkillMatcher(config) as matcher:
         # Pass 1 — SkillNer results through full exact → fuzzy → vector pipeline
@@ -250,14 +297,19 @@ def process_jd(jd_text: str, config: Config = None) -> dict:
         # Pass 2 — n-gram exact scan; returns canonical names directly
         ngram_canonical = _ngram_skill_scan(jd_text, matcher)
 
-    skillner_skills = [
+    skillner_skills = _drop_subword_skills([
         r.canonical_name
         for r in skillner_results
         if r.matched() and r.confidence >= 0.60
-    ]
+    ])
+    # logger.info(
+    #     "[skillner] matched %d skills (confidence>=0.60): %s",
+    #     len(skillner_skills), skillner_skills,
+    # )
 
-    # Union both passes, preserving SkillNer order first
-    skills = list(dict.fromkeys(skillner_skills + ngram_canonical))
+    # Union both passes, preserving SkillNer order first, then drop sub-words globally
+    skills = _drop_subword_skills(list(dict.fromkeys(skillner_skills + ngram_canonical)))
+    # logger.info("[process_jd] final skills after merge: %d → %s", len(skills), skills)
 
     extracted_lower = {s.lower() for s in skillner_extracted}
     unknown_words = [
@@ -275,6 +327,15 @@ def process_jd(jd_text: str, config: Config = None) -> dict:
 
 _nlp             = None
 _skill_extractor = None
+_embedder        = None
+
+
+def _get_embedder(model_name: str = "all-MiniLM-L6-v2"):
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(model_name)
+    return _embedder
 
 _AMBIGUOUS_SKILLS = ["Go", "R", "C", "C++", "C#", "Scala", "Rust", "Swift", "Julia"]
 _AMBIGUOUS_PATTERN = re.compile(
@@ -359,15 +420,13 @@ def _extract_skills_from_jd(jd_text: str) -> list[str]:
 # INTERNAL — THREE-STAGE MATCHER
 # Stage 1: Exact   → PostgreSQL alias_lower (indexed B-tree)
 # Stage 2: Fuzzy   → PostgreSQL pg_trgm  |  Python difflib fallback
-# Stage 3: Vector  → OpenSearch k-NN cosine on name_embedding
+# Stage 3: Vector  → pgvector cosine on name_embedding (HNSW index)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SkillMatcher:
     def __init__(self, config: Config = None):
         self.config  = config or Config()
         self._pg_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
-        self._os_client: Optional[OpenSearch] = None
-        self._embed_model = None
         self._pg_trgm: Optional[bool] = None
 
     def __enter__(self):
@@ -391,26 +450,12 @@ class SkillMatcher:
                 password=self.config.pg_password,
                 sslmode=os.getenv("DB_SSLMODE", "require"),
                 connect_timeout=30,
+                options="-c search_path=dev,public",
             )
         return self._pg_pool
 
-    def _os(self) -> OpenSearch:
-        if self._os_client is None:
-            parsed = urlparse(self.config.opensearch_url)
-            self._os_client = OpenSearch(
-                hosts=[{"host": parsed.hostname, "port": parsed.port or 9200}],
-                http_auth=(self.config.opensearch_username, self.config.opensearch_password),
-                use_ssl=parsed.scheme == "https",
-                verify_certs=False,
-                ssl_show_warn=False,
-            )
-        return self._os_client
-
     def _embedder(self):
-        if self._embed_model is None:
-            from sentence_transformers import SentenceTransformer
-            self._embed_model = SentenceTransformer(self.config.embed_model_name)
-        return self._embed_model
+        return _get_embedder(self.config.embed_model_name)
 
     def _batch_exact(self, skills: list[str]) -> dict[str, SkillMatch]:
         pool = self._pg()
@@ -418,6 +463,9 @@ class SkillMatcher:
         results: dict[str, SkillMatch] = {}
         try:
             with conn.cursor() as cur:
+                # Pass 1: display_name exact match — highest priority.
+                # An alias like "java" may point to "Workday Studio Java" (wrong);
+                # matching against the canonical display_name directly is more precise.
                 cur.execute("""
                     SELECT lower(input_skill),
                            cs.id::text,
@@ -425,8 +473,8 @@ class SkillMatcher:
                            cs.slug,
                            c.display_name AS category
                     FROM unnest(%s::text[]) AS input_skill
-                    JOIN dev.skill_aliases sa ON sa.alias_lower = lower(input_skill)
-                    JOIN dev.canonical_skills cs ON cs.id = sa.skill_id
+                    JOIN dev.canonical_skills cs
+                      ON lower(cs.display_name) = lower(input_skill)
                     LEFT JOIN dev.categories c ON c.id = cs.category_id
                 """, (skills,))
                 for input_lower, cid, display_name, slug, category in cur.fetchall():
@@ -439,6 +487,32 @@ class SkillMatcher:
                         category=category,
                         confidence=1.0,
                     )
+
+                # Pass 2: alias lookup for inputs not resolved by display_name.
+                unresolved = [s for s in skills if s.lower() not in results]
+                if unresolved:
+                    cur.execute("""
+                        SELECT lower(input_skill),
+                               cs.id::text,
+                               cs.display_name,
+                               cs.slug,
+                               c.display_name AS category
+                        FROM unnest(%s::text[]) AS input_skill
+                        JOIN dev.skill_aliases sa ON sa.alias_lower = lower(input_skill)
+                        JOIN dev.canonical_skills cs ON cs.id = sa.skill_id
+                        LEFT JOIN dev.categories c ON c.id = cs.category_id
+                    """, (unresolved,))
+                    for input_lower, cid, display_name, slug, category in cur.fetchall():
+                        if input_lower not in results:
+                            results[input_lower] = SkillMatch(
+                                input_skill=input_lower,
+                                match_type="exact",
+                                canonical_id=cid,
+                                canonical_name=display_name,
+                                canonical_slug=slug,
+                                category=category,
+                                confidence=1.0,
+                            )
         finally:
             pool.putconn(conn)
         return results
@@ -529,34 +603,40 @@ class SkillMatcher:
         if not skills:
             return {}
         vectors = self._embedder().encode(skills, batch_size=64, show_progress_bar=False)
-        msearch_body = []
-        for vec in vectors:
-            msearch_body.append({"index": self.config.opensearch_index})
-            msearch_body.append({
-                "size": 1,
-                "query": {"knn": {"name_embedding": {"vector": vec.tolist(), "k": 1}}},
-                "_source": ["id", "display_name", "slug", "category"],
-            })
-        responses = self._os().msearch(body=msearch_body)["responses"]
+        pool = self._pg()
+        conn = pool.getconn()
         results: dict[str, SkillMatch] = {}
-        for skill, resp in zip(skills, responses):
-            hits = resp.get("hits", {}).get("hits", [])
-            if not hits:
-                continue
-            hit   = hits[0]
-            score = float(hit["_score"])
-            if score < self.config.vector_threshold:
-                continue
-            src = hit["_source"]
-            results[skill.lower()] = SkillMatch(
-                input_skill=skill,
-                match_type="vector",
-                canonical_id=src.get("id"),
-                canonical_name=src.get("display_name"),
-                canonical_slug=src.get("slug"),
-                category=src.get("category"),
-                confidence=round(score, 4),
-            )
+        try:
+            with conn.cursor() as cur:
+                for skill, vec in zip(skills, vectors):
+                    vec_str = "[" + ",".join(map(str, vec.tolist())) + "]"
+                    cur.execute("""
+                        SELECT cs.id::text, cs.display_name, cs.slug,
+                               c.display_name AS category,
+                               1 - (cs.name_embedding <=> %s::dev.vector) AS score
+                        FROM dev.canonical_skills cs
+                        LEFT JOIN dev.categories c ON c.id = cs.category_id
+                        WHERE cs.name_embedding IS NOT NULL
+                        ORDER BY cs.name_embedding <=> %s::dev.vector
+                        LIMIT 1
+                    """, (vec_str, vec_str))
+                    row = cur.fetchone()
+                    if not row:
+                        continue
+                    cid, display_name, slug, category, score = row
+                    if float(score) < self.config.vector_threshold:
+                        continue
+                    results[skill.lower()] = SkillMatch(
+                        input_skill=skill,
+                        match_type="vector",
+                        canonical_id=cid,
+                        canonical_name=display_name,
+                        canonical_slug=slug,
+                        category=category,
+                        confidence=round(float(score), 4),
+                    )
+        finally:
+            pool.putconn(conn)
         return results
 
     def known_terms(self) -> set[str]:
@@ -581,16 +661,25 @@ class SkillMatcher:
 
         exact = self._batch_exact(pending)
         resolved.update(exact)
+        # if exact:
+        #     logger.info("[pg_match] exact=%d %s", len(exact),
+        #                 [(k, v.canonical_name) for k, v in exact.items()])
         pending = [s for s in pending if s.lower() not in resolved]
 
         if pending:
             fuzzy = self._batch_fuzzy(pending)
             resolved.update(fuzzy)
+            # if fuzzy:
+            #     logger.info("[pg_match] fuzzy=%d %s", len(fuzzy),
+            #                 [(k, v.canonical_name, v.confidence) for k, v in fuzzy.items()])
             pending = [s for s in pending if s.lower() not in resolved]
 
         if pending:
             vector = self._batch_vector(pending)
             resolved.update(vector)
+            # if vector:
+            #     logger.info("[pg_match] vector=%d %s", len(vector),
+            #                 [(k, v.canonical_name, v.confidence) for k, v in vector.items()])
 
         output: list[SkillMatch] = []
         for skill in skills:

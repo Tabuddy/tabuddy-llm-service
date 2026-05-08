@@ -8,6 +8,16 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
+_alias_embedder = None
+
+
+def _get_alias_embedder():
+    global _alias_embedder
+    if _alias_embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _alias_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return _alias_embedder
+
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
@@ -91,6 +101,7 @@ class SkillLibraryRepository:
             password=self.db_password,
             sslmode=os.getenv("DB_SSLMODE", "require"),
             connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "30")),
+            options="-c search_path=dev,public",
         )
 
     # ── Canonical skill / alias lookup ──────────────────────────────────────
@@ -175,17 +186,29 @@ class SkillLibraryRepository:
         via ON CONFLICT DO NOTHING. Returns number of newly inserted rows."""
         if not records:
             return 0
-        rows = [
+        raw = [
             (int(skill_id), str(alias_text), alias_type, match_strategy)
             for skill_id, alias_text in records
             if alias_text and str(alias_text).strip()
         ]
-        if not rows:
+        if not raw:
             return 0
+
+        alias_texts = [r[1] for r in raw]
+        model = _get_alias_embedder()
+        vectors = model.encode(alias_texts, show_progress_bar=False)
+
+        rows = [
+            (
+                skill_id, alias_text, atype, strategy,
+                "[" + ",".join(map(str, vec.tolist())) + "]",
+            )
+            for (skill_id, alias_text, atype, strategy), vec in zip(raw, vectors)
+        ]
 
         sql = f"""
             INSERT INTO {self.schema}.skill_aliases
-                (skill_id, alias_text, alias_type, match_strategy)
+                (skill_id, alias_text, alias_type, match_strategy, alias_embedding)
             VALUES %s
             ON CONFLICT ON CONSTRAINT uq_skill_alias DO NOTHING
             RETURNING id
@@ -193,7 +216,9 @@ class SkillLibraryRepository:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 returned = psycopg2.extras.execute_values(
-                    cur, sql, rows, fetch=True
+                    cur, sql, rows,
+                    template="(%s, %s, %s, %s, %s::dev.vector)",
+                    fetch=True,
                 )
                 inserted = len(returned or [])
             conn.commit()
@@ -345,6 +370,85 @@ class SkillLibraryRepository:
                     out.setdefault(sid, []).append(rec)
         return out
 
+    # ── Embedding similarity search ──────────────────────────────────────────
+
+    def find_similar_skills_by_embedding(
+        self, name_vec: list[float], *, threshold: float = 0.70, limit: int = 3
+    ) -> list[dict]:
+        """Return up to `limit` canonical skills with cosine similarity >= threshold."""
+        vec_str = "[" + ",".join(map(str, name_vec)) + "]"
+        sql = f"""
+            SELECT id, slug, display_name,
+                   skill_nature::text AS skill_nature,
+                   typical_lifespan::text AS typical_lifespan,
+                   ROUND((1 - (name_embedding <=> %s::dev.vector))::numeric, 4) AS similarity
+            FROM {self.schema}.canonical_skills
+            WHERE name_embedding IS NOT NULL
+              AND 1 - (name_embedding <=> %s::dev.vector) >= %s
+            ORDER BY name_embedding <=> %s::dev.vector
+            LIMIT %s
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (vec_str, vec_str, threshold, vec_str, limit))
+                cols = [c[0] for c in cur.description]
+                rows = []
+                for row in cur.fetchall():
+                    rec = dict(zip(cols, row))
+                    rec["similarity"] = float(rec["similarity"])
+                    rows.append(rec)
+                return rows
+
+    def find_similar_dimensions_by_embedding(
+        self, name_vec: list[float], *, threshold: float = 0.70, limit: int = 3
+    ) -> list[dict]:
+        """Return up to `limit` dimensions with cosine similarity >= threshold."""
+        vec_str = "[" + ",".join(map(str, name_vec)) + "]"
+        sql = f"""
+            SELECT id, slug, display_name, rationale,
+                   ROUND((1 - (name_embedding <=> %s::dev.vector))::numeric, 4) AS similarity
+            FROM {self.schema}.dimensions
+            WHERE name_embedding IS NOT NULL
+              AND 1 - (name_embedding <=> %s::dev.vector) >= %s
+            ORDER BY name_embedding <=> %s::dev.vector
+            LIMIT %s
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (vec_str, vec_str, threshold, vec_str, limit))
+                cols = [c[0] for c in cur.description]
+                rows = []
+                for row in cur.fetchall():
+                    rec = dict(zip(cols, row))
+                    rec["similarity"] = float(rec["similarity"])
+                    rows.append(rec)
+                return rows
+
+    def find_similar_roles_by_embedding(
+        self, name_vec: list[float], *, threshold: float = 0.70, limit: int = 3
+    ) -> list[dict]:
+        """Return up to `limit` roles with cosine similarity >= threshold."""
+        vec_str = "[" + ",".join(map(str, name_vec)) + "]"
+        sql = f"""
+            SELECT id, slug, display_name, role_archetype,
+                   ROUND((1 - (name_embedding <=> %s::dev.vector))::numeric, 4) AS similarity
+            FROM {self.schema}.roles
+            WHERE name_embedding IS NOT NULL
+              AND 1 - (name_embedding <=> %s::dev.vector) >= %s
+            ORDER BY name_embedding <=> %s::dev.vector
+            LIMIT %s
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (vec_str, vec_str, threshold, vec_str, limit))
+                cols = [c[0] for c in cur.description]
+                rows = []
+                for row in cur.fetchall():
+                    rec = dict(zip(cols, row))
+                    rec["similarity"] = float(rec["similarity"])
+                    rows.append(rec)
+                return rows
+
     # ── Persistence helpers for final-role-output ────────────────────────────
     def find_role_by_identity(
         self,
@@ -409,28 +513,32 @@ class SkillLibraryRepository:
         display_name: str,
         role_archetype: str | None = None,
         source: str = "llm",
+        name_embedding: list[float] | None = None,
     ) -> dict:
         """Create role if needed and return the canonical DB row."""
         existing = self.find_role_by_identity(slug=slug, display_name=display_name)
         if existing:
             return existing
 
-        sql = f"""
-            INSERT INTO {self.schema}.roles (slug, display_name, role_archetype, source)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id, slug, display_name, role_archetype
-        """
+        if name_embedding is not None:
+            vec_str = "[" + ",".join(map(str, name_embedding)) + "]"
+            sql = f"""
+                INSERT INTO {self.schema}.roles (slug, display_name, role_archetype, source, name_embedding)
+                VALUES (%s, %s, %s, %s, %s::dev.vector)
+                RETURNING id, slug, display_name, role_archetype
+            """
+            params = (str(slug).strip(), str(display_name).strip(), role_archetype, _normalize_entity_source(source), vec_str)
+        else:
+            sql = f"""
+                INSERT INTO {self.schema}.roles (slug, display_name, role_archetype, source)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, slug, display_name, role_archetype
+            """
+            params = (str(slug).strip(), str(display_name).strip(), role_archetype, _normalize_entity_source(source))
+
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    sql,
-                    (
-                        str(slug).strip(),
-                        str(display_name).strip(),
-                        role_archetype,
-                        _normalize_entity_source(source),
-                    ),
-                )
+                cur.execute(sql, params)
                 row = cur.fetchone()
                 cols = [c[0] for c in cur.description]
             conn.commit()
@@ -444,8 +552,13 @@ class SkillLibraryRepository:
         rationale: str | None = None,
         difficulty_hint: str | None = None,
         source: str | None = "llm",
+        name_embedding: list[float] | None = None,
     ) -> dict:
-        """Resolve dimension by slug/display_name, else insert it."""
+        """Resolve dimension by slug/display_name, else insert it.
+
+        The returned dict always includes a ``created`` key (bool) so callers
+        can tell whether the row was newly inserted.
+        """
         found = self.find_dimensions_by_names([display_name], [slug])
         if found:
             key = (display_name or "").strip().lower() or (slug or "").strip().lower()
@@ -453,30 +566,37 @@ class SkillLibraryRepository:
             if rec is None and found:
                 rec = next(iter(found.values()))
             if rec is not None:
-                return rec
+                rec_with_flag = dict(rec)
+                rec_with_flag.setdefault("created", False)
+                return rec_with_flag
 
-        sql = f"""
-            INSERT INTO {self.schema}.dimensions
-                (slug, display_name, rationale, difficulty_hint, source)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id, slug, display_name, rationale, difficulty_hint
-        """
+        if name_embedding is not None:
+            vec_str = "[" + ",".join(map(str, name_embedding)) + "]"
+            sql = f"""
+                INSERT INTO {self.schema}.dimensions
+                    (slug, display_name, rationale, difficulty_hint, source, name_embedding)
+                VALUES (%s, %s, %s, %s, %s, %s::dev.vector)
+                RETURNING id, slug, display_name, rationale, difficulty_hint
+            """
+            params = (str(slug).strip(), str(display_name).strip(), rationale, difficulty_hint, _normalize_entity_source(source), vec_str)
+        else:
+            sql = f"""
+                INSERT INTO {self.schema}.dimensions
+                    (slug, display_name, rationale, difficulty_hint, source)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, slug, display_name, rationale, difficulty_hint
+            """
+            params = (str(slug).strip(), str(display_name).strip(), rationale, difficulty_hint, _normalize_entity_source(source))
+
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    sql,
-                    (
-                        str(slug).strip(),
-                        str(display_name).strip(),
-                        rationale,
-                        difficulty_hint,
-                        _normalize_entity_source(source),
-                    ),
-                )
+                cur.execute(sql, params)
                 row = cur.fetchone()
                 cols = [c[0] for c in cur.description]
             conn.commit()
-        return dict(zip(cols, row))
+        result = dict(zip(cols, row))
+        result["created"] = True
+        return result
 
     def upsert_dimension_skill_link(self, *, skill_id: int, dimension_id: int) -> bool:
         """Ensure one (skill_id, dimension_id) mapping. Returns True if inserted."""
@@ -594,6 +714,7 @@ class SkillLibraryRepository:
         skill_nature: str = "TOOL",
         typical_lifespan: str = "MULTI_YEAR",
         source: str = "llm",
+        name_embedding: list[float] | None = None,
     ) -> dict:
         """Find or create a canonical skill. Returns the row (id, slug, display_name, ...)."""
         name_lc = display_name.strip().lower()
@@ -613,29 +734,35 @@ class SkillLibraryRepository:
                 if row:
                     return dict(zip([c[0] for c in cur.description], row))
 
-        sql_insert = f"""
-            INSERT INTO {self.schema}.canonical_skills
-                (slug, display_name, category_id, sub_category_id,
-                 skill_nature, typical_lifespan, source, confidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id, slug, display_name, category_id, sub_category_id,
-                      skill_nature::text, typical_lifespan::text
-        """
+        if name_embedding is not None:
+            vec_str = "[" + ",".join(map(str, name_embedding)) + "]"
+            sql_insert = f"""
+                INSERT INTO {self.schema}.canonical_skills
+                    (slug, display_name, category_id, sub_category_id,
+                     skill_nature, typical_lifespan, source, confidence, name_embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::dev.vector)
+                RETURNING id, slug, display_name, category_id, sub_category_id,
+                          skill_nature::text, typical_lifespan::text
+            """
+            params = (slug, display_name.strip(), int(category_id),
+                      int(sub_category_id) if sub_category_id is not None else None,
+                      skill_nature, typical_lifespan, _normalize_entity_source(source), 0.7, vec_str)
+        else:
+            sql_insert = f"""
+                INSERT INTO {self.schema}.canonical_skills
+                    (slug, display_name, category_id, sub_category_id,
+                     skill_nature, typical_lifespan, source, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, slug, display_name, category_id, sub_category_id,
+                          skill_nature::text, typical_lifespan::text
+            """
+            params = (slug, display_name.strip(), int(category_id),
+                      int(sub_category_id) if sub_category_id is not None else None,
+                      skill_nature, typical_lifespan, _normalize_entity_source(source), 0.7)
+
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    sql_insert,
-                    (
-                        slug,
-                        display_name.strip(),
-                        int(category_id),
-                        int(sub_category_id) if sub_category_id is not None else None,
-                        skill_nature,
-                        typical_lifespan,
-                        _normalize_entity_source(source),
-                        0.7,
-                    ),
-                )
+                cur.execute(sql_insert, params)
                 row = cur.fetchone()
                 cols = [c[0] for c in cur.description]
             conn.commit()

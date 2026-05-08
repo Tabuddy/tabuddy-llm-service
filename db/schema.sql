@@ -6,6 +6,7 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ─── Categories (replaces the old skill_category enum) ─────────────────────
 CREATE TABLE categories (
@@ -408,3 +409,41 @@ SELECT
     (SELECT COUNT(*) FROM dimensions)          AS total_dimensions,
     (SELECT COUNT(*) FROM skill_aliases     WHERE alias_embedding IS NOT NULL) AS aliases_with_embeddings,
     (SELECT COUNT(*) FROM canonical_skills  WHERE name_embedding  IS NOT NULL) AS skills_with_embeddings;
+
+-- ============================================================================
+-- JD PIPELINE HISTORY
+-- One row per end-to-end run of the 3-API JD pipeline
+-- (extract-from-jd → extract-details → final-role-output).
+-- ============================================================================
+
+CREATE TABLE jd_pipeline_runs (
+    id                    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    jd_text               TEXT         NOT NULL,
+    status                TEXT         NOT NULL,
+    api1_response         JSONB,
+    api2_response         JSONB,
+    api3_response         JSONB,
+    chosen_role_display   TEXT,
+    chosen_role_id        BIGINT       REFERENCES roles(id) ON DELETE SET NULL,
+    final_skills_count    INTEGER,
+    final_skills          TEXT[],
+    jd_role_hint_display  TEXT,
+    error_message         TEXT,
+    duration_ms           INTEGER,
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_jd_runs_created_at ON jd_pipeline_runs (created_at DESC);
+CREATE INDEX idx_jd_runs_status     ON jd_pipeline_runs (status);
+CREATE INDEX idx_jd_runs_chosen_role ON jd_pipeline_runs (chosen_role_id) WHERE chosen_role_id IS NOT NULL;
+
+CREATE TABLE jd_run_artifacts (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id          UUID         NOT NULL REFERENCES jd_pipeline_runs(id) ON DELETE CASCADE,
+    artifact_kind   TEXT         NOT NULL,
+    artifact_id     BIGINT,
+    artifact_text   TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_jd_run_artifacts_run  ON jd_run_artifacts (run_id);
+CREATE INDEX idx_jd_run_artifacts_kind ON jd_run_artifacts (run_id, artifact_kind);
