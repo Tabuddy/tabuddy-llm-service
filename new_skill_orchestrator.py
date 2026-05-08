@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from cost_tracker import CostAccumulator
 
 from skill_driven_dim_gen import SkillDrivenDimGenAgent
 from skill_library_v3.agents.containment import Stage6ContainmentAgent
@@ -267,7 +270,10 @@ def _fallback_enrichment(skill_id: str) -> SkillEnrichment:
     )
 
 
-async def _run_enrichment(skill_payload: dict) -> tuple[SkillEnrichment | None, list[str]]:
+async def _run_enrichment(
+    skill_payload: dict,
+    accumulator: "CostAccumulator | None" = None,
+) -> tuple[SkillEnrichment | None, list[str]]:
     agents = (
         Stage7VendorLicenseAgent(),
         Stage7MaturityAgent(),
@@ -275,6 +281,8 @@ async def _run_enrichment(skill_payload: dict) -> tuple[SkillEnrichment | None, 
         Stage7AmbiguityAgent(),
         Stage7VersioningAgent(),
     )
+    for agent in agents:
+        agent._accumulator = accumulator
     results = await asyncio.gather(
         agents[0].enrich(skill=skill_payload),
         agents[1].enrich(skill=skill_payload),
@@ -329,6 +337,7 @@ async def enrich_new_skill(
     candidate_skills_pool: list[dict] | None = None,
     embedder: DimensionEmbedder | None = None,
     overlap_threshold: float = 0.65,
+    accumulator: "CostAccumulator | None" = None,
 ) -> NewSkillMetaV3:
     skill_id = _make_skill_id(skill_name)
     warnings: list[str] = []
@@ -338,7 +347,9 @@ async def enrich_new_skill(
 
     candidate_dims: list[CandidateDimension] = []
     try:
-        candidate_dims = await SkillDrivenDimGenAgent().generate(
+        _dim_gen_agent = SkillDrivenDimGenAgent()
+        _dim_gen_agent._accumulator = accumulator
+        candidate_dims = await _dim_gen_agent.generate(
             skill_name=skill_name,
             jd_excerpt=jd_excerpt,
             role_hint=role_hint,
@@ -368,6 +379,7 @@ async def enrich_new_skill(
             )
             if flagged:
                 reconciler = Stage3ReconcilerAgent()
+                reconciler._accumulator = accumulator
                 pair_decisions = []
                 for pair in flagged:
                     a_dim = next((d.model_dump() for d in candidate_dims if d.tentative_id == pair["a_tentative_id"]), None)
@@ -420,7 +432,9 @@ async def enrich_new_skill(
 
     typed: TypedSkill | None = None
     try:
-        typed_rows = await Stage4TypeAssignerAgent().assign_types(skills=[{"skill_id": skill_id, "name": skill_name}])
+        _type_agent = Stage4TypeAssignerAgent()
+        _type_agent._accumulator = accumulator
+        typed_rows = await _type_agent.assign_types(skills=[{"skill_id": skill_id, "name": skill_name}])
         typed = typed_rows[0] if typed_rows else None
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"stage4_type_assigner_failed: {type(exc).__name__}: {exc}")
@@ -444,7 +458,9 @@ async def enrich_new_skill(
             embedder=embedder,
             k=20,
         )
-        relationships = await Stage6ContainmentAgent().resolve(
+        _containment_agent = Stage6ContainmentAgent()
+        _containment_agent._accumulator = accumulator
+        relationships = await _containment_agent.resolve(
             typed=typed,
             placed=placed,
             candidates=top_k,
@@ -461,7 +477,8 @@ async def enrich_new_skill(
             "type": typed.type,
             "subtype": typed.subtype,
             "primary_dimension": placed.primary_dimension,
-        }
+        },
+        accumulator=accumulator,
     )
     warnings.extend(enrich_warnings)
     if enrichment is None:

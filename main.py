@@ -48,6 +48,7 @@ from new_skill_orchestrator import (
 )
 from cost_tracker import CostAccumulator
 from pathlib import Path
+import json
 import tempfile
 import time
 from datetime import datetime
@@ -184,15 +185,13 @@ class JdRoleHint(BaseModel):
     rationale: str | None = None
 
 
+class FinalSkillItem(BaseModel):
+    skill_name: str
+    is_primary: bool
+
+
 class JDSkillPipelineResponse(BaseModel):
-    initial_skills: list[str]
-    unknown_words: list[str]
-    filtered_unknown_words: list[str]
-    llm_skills: list[str]
-    llm_non_skills: list[str]
-    final_skills: list[str]
-    final_non_skills: list[str]
-    jd_role_hint: JdRoleHint | None = None
+    final_skills: list[FinalSkillItem] = Field(default_factory=list)
     run_id: str | None = None
 
 
@@ -200,6 +199,7 @@ class JDSkillPipelineResponse(BaseModel):
 class ExtractDetailsRequest(BaseModel):
     final_skills: list[str] = Field(default_factory=list)
     llm_skills: list[str] = Field(default_factory=list)
+    primary_skills: list[str] = Field(default_factory=list)
     jd_role_hint: JdRoleHint | None = None
     run_id: str | None = None
 
@@ -537,128 +537,117 @@ async def normalize_skills_endpoint(req: SkillsRequest):
     )
 
 
+async def _llm_extract_skills_with_tags(
+    jd_text: str,
+    cost_acc: "CostAccumulator | None" = None,
+) -> list[FinalSkillItem]:
+    """Send the full JD to the LLM and return skills with primary/secondary tags.
+
+    Each skill is tagged is_primary=True if it is a core/must-have requirement,
+    and is_primary=False if it is nice-to-have or supporting.
+    """
+    from llm_client import get_fast_client, FAST_MODEL
+
+    client = get_fast_client()
+    if client is None:
+        raise RuntimeError("LLM client unavailable — check AZURE_OPEN_AI_KEY")
+
+    system_prompt = (
+        "You are a precise technical skill extractor for job descriptions.\n"
+        "Extract only SPECIFIC, NAMED skills that belong to one of these categories:\n\n"
+        "  LANGUAGE      — e.g. Python, Java, TypeScript, JavaScript, SQL, Apex\n"
+        "  FRAMEWORK     — e.g. React, Spring Boot, Django, Next.js, Lightning (Salesforce)\n"
+        "  LIBRARY       — e.g. Redux, Pandas, NumPy, Hibernate, Lodash\n"
+        "  TOOL          — e.g. Git, Docker, Jenkins, Postman, Webpack, Salesforce CLI\n"
+        "  PLATFORM      — e.g. Salesforce, Kubernetes, AWS, Azure, GCP, Hadoop, Spark\n"
+        "  CLOUD_SERVICE — e.g. AWS Lambda, S3, RDS, Azure Blob, GCP BigQuery\n"
+        "  DATABASE      — e.g. MySQL, PostgreSQL, MongoDB, Redis, Cassandra\n"
+        "  METHODOLOGY   — e.g. Agile, Scrum, TDD, CI/CD, DevOps\n"
+        "  PROTOCOL      — e.g. REST, GraphQL, gRPC, WebSocket, OAuth2, SOQL, SOSL\n"
+        "  STANDARD      — e.g. OpenAPI, OWASP, WCAG, ISO 27001\n"
+        "  PATTERN       — e.g. Microservices, Event-Driven Architecture, CQRS, MVC\n"
+        "  PRACTICE      — e.g. Code Review, Pair Programming, A/B Testing\n"
+        "  CONCEPT       — e.g. Machine Learning, Distributed Systems (only when no specific tool fits)\n\n"
+        "STRICT REJECT RULES — never include these:\n"
+        "  1. Certifications: anything like 'Salesforce Certified X', 'AWS Certified X', 'PMP', etc.\n"
+        "  2. Vague soft skills or activities: Troubleshooting, Debugging, Architecture, Software Development,\n"
+        "     Change Management, Compliance, Governance, Vendor Management, Communication, Leadership\n"
+        "  3. Broad category words: 'databases', 'cloud platforms', 'server-side development',\n"
+        "     'back-end web development', 'Metadata repository', 'Deployments'\n"
+        "  4. Expanded names when the acronym IS the skill: use 'SOQL' not 'Salesforce Object Query Language',\n"
+        "     use 'SOSL' not 'Salesforce Object Search Language'\n\n"
+        "BAD examples (reject these):\n"
+        "  'Salesforce Object Query Language', 'Salesforce Certified Platform Developer I',\n"
+        "  'Troubleshooting', 'Debugging', 'Architecture', 'Software Development', 'Metadata repository'\n\n"
+        "GOOD examples (extract these):\n"
+        "  'Salesforce', 'Apex', 'Lightning', 'SOQL', 'SOSL', 'JavaScript', 'Git', 'Agile'\n\n"
+        "Additional rules:\n"
+        "  - Use the canonical short name (e.g. 'Node.js', 'PostgreSQL', 'AWS')\n"
+        "  - Each skill is a separate entry — do not group\n"
+        "  - is_primary=true for core/required, false for nice-to-have\n"
+        "  - Return valid JSON only: {\"skills\": [{\"skill_name\": \"...\", \"is_primary\": true/false}, ...]}"
+    )
+    prompt = f"Extract all specific technical skills from this job description:\n\n{jd_text}"
+    resp = await client.chat.completions.create(
+        model=FAST_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    if cost_acc is not None and resp.usage is not None:
+        cost_acc.add(FAST_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    raw = json.loads(resp.choices[0].message.content or "{}")
+    items = []
+    for s in raw.get("skills", []):
+        if isinstance(s, dict) and (s.get("skill_name") or "").strip():
+            items.append(FinalSkillItem(
+                skill_name=str(s["skill_name"]).strip(),
+                is_primary=bool(s.get("is_primary", False)),
+            ))
+    return items
+
+
 @app.post("/skills/extract-from-jd", response_model=JDSkillPipelineResponse)
 async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     jd_text = (req.jd_text or "").strip()
     if not jd_text:
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
-    stage1 = await asyncio.to_thread(process_jd, jd_text)
-    initial_skills_raw = _clean_strings(stage1.get("skills"))
-    unknown_words = _clean_strings(stage1.get("unknown_words"))
-
-    repo = NonSkillRepository()
-    filtered_unknown_words = await asyncio.to_thread(
-        repo.filter_non_skills, unknown_words
-    )
-
-    # ── Stage 2: LLM verification of ALL candidates with sentence context ────
-    # All candidates (DB-matched initial skills + spaCy unknowns) are verified
-    # together. Each word is paired with its JD sentence — no full JD is sent.
-    # This catches noise in initial_skills (e.g. "Job Level", "Form Routines")
-    # and context-dependent unknowns (e.g. "L1" as a support tier = non-skill).
+    # ── LLM-based skill extraction (full JD → primary/secondary tags) ─────────
+    # SkillNer / spaCy pipeline commented out — kept for reference:
+    # stage1 = await asyncio.to_thread(process_jd, jd_text)
+    # initial_skills_raw = _clean_strings(stage1.get("skills"))
+    # unknown_words = _clean_strings(stage1.get("unknown_words"))
+    # repo = NonSkillRepository()
+    # filtered_unknown_words = await asyncio.to_thread(repo.filter_non_skills, unknown_words)
+    # cost_acc = CostAccumulator()
+    # classifier = AzureUnknownWordClassifier()
+    # items_with_context = [{"word": w, "sentence": _extract_jd_sentence(jd_text, w)} for w in all_candidates]
+    # llm_result = await classifier.classify_with_context(items_with_context, role_hint_excerpt=jd_text[:600], accumulator=cost_acc)
     cost_acc = CostAccumulator()
-    initial_skills: list[str] = []
-    llm_skills: list[str] = []
-    llm_non_skills: list[str] = []
-    jd_role_hint: JdRoleHint | None = None
+    try:
+        final_skills = await _llm_extract_skills_with_tags(jd_text, cost_acc=cost_acc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM skill extraction failed: {exc}",
+        ) from exc
 
-    all_candidates = _dedupe_case_insensitive(initial_skills_raw + filtered_unknown_words)
-    if all_candidates:
-        classifier = AzureUnknownWordClassifier()
-        items_with_context = [
-            {"word": w, "sentence": _extract_jd_sentence(jd_text, w)}
-            for w in all_candidates
-        ]
-        # Short JD excerpt for role hint inference only (first 600 chars)
-        role_excerpt = jd_text[:600]
-        try:
-            llm_result = await classifier.classify_with_context(
-                items_with_context,
-                role_hint_excerpt=role_excerpt,
-                accumulator=cost_acc,
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Stage-2 LLM classification failed: {exc}",
-            ) from exc
+    cost_acc.log_summary("skills/extract-from-jd", logger)
 
-        verified_set = {w.lower() for w in _clean_strings(llm_result.get("skills"))}
-        non_skill_set = {w.lower() for w in _clean_strings(llm_result.get("non_skills"))}
+    response = JDSkillPipelineResponse(final_skills=final_skills)
 
-        # Split verified back: initial vs newly-discovered
-        initial_skills = [w for w in initial_skills_raw if w.lower() in verified_set]
-        llm_skills = [w for w in filtered_unknown_words if w.lower() in verified_set]
-
-        # Non-skills: only persist words from unknown_words (not DB canonical names)
-        unknown_lower = {w.lower() for w in filtered_unknown_words}
-        llm_non_skills = [
-            w for w in all_candidates
-            if w.lower() in non_skill_set and w.lower() in unknown_lower
-        ]
-
-        hint_raw = llm_result.get("jd_role_hint")
-        if isinstance(hint_raw, dict) and (hint_raw.get("display_name") or "").strip():
-            _arc = hint_raw.get("role_archetype")
-            _rat = hint_raw.get("rationale")
-            jd_role_hint = JdRoleHint(
-                display_name=str(hint_raw["display_name"]).strip(),
-                slug=str(hint_raw.get("slug") or "").strip(),
-                role_archetype=(str(_arc).strip() if _arc is not None else "") or None,
-                rationale=(str(_rat).strip() if _rat is not None else "") or None,
-            )
-
-        # Guardrail: deployments is an activity-domain skill and must never be
-        # persisted as non-skill.
-        if "deployments" in {w.lower() for w in filtered_unknown_words}:
-            llm_non_skills = [w for w in llm_non_skills if w.lower() != "deployments"]
-            if "deployments" not in {w.lower() for w in llm_skills}:
-                llm_skills.append("deployments")
-
-        # TODO: REMOVE COMMENT AFTER TESTING — non-skill INSERT into `{SKILL_LIBRARY_SCHEMA}.non_skills`.
-        # if llm_non_skills:
-        #     persisted_non_skills = await asyncio.to_thread(
-        #         repo.add_non_skills, llm_non_skills
-        #     )
-        # else:
-        #     persisted_non_skills = []
-        persisted_non_skills = []
-    else:
-        initial_skills = initial_skills_raw
-        persisted_non_skills = []
-
-    final_skills = _dedupe_case_insensitive(initial_skills + llm_skills)
-    final_non_skills = _dedupe_case_insensitive(llm_non_skills)
-
-    # cost_acc.log_summary("skills/extract-from-jd", logger)
-    response = JDSkillPipelineResponse(
-        initial_skills=initial_skills,
-        unknown_words=unknown_words,
-        filtered_unknown_words=filtered_unknown_words,
-        llm_skills=llm_skills,
-        llm_non_skills=llm_non_skills,
-        final_skills=final_skills,
-        final_non_skills=final_non_skills,
-        jd_role_hint=jd_role_hint,
-    )
-
-    # ── History persistence───────────────────────────────────
+    # ── History persistence ───────────────────────────────────────────────────
     history_repo = JdPipelineRunRepository()
     run_id = await asyncio.to_thread(
         history_repo.start_run,
         jd_text=jd_text,
         api1_response=response,
-        jd_role_hint_display=(jd_role_hint.display_name if jd_role_hint else None),
+        jd_role_hint_display=None,
     )
-    if run_id and persisted_non_skills:
-        artifact_items = [
-            {"kind": "non_skill_added", "artifact_text": w}
-            for w in persisted_non_skills
-        ]
-        await asyncio.to_thread(
-            history_repo.record_artifacts_bulk, run_id, artifact_items
-        )
     response.run_id = run_id
     return response
 
@@ -724,6 +713,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     final_skills = _dedupe_case_insensitive(_clean_strings(req.final_skills))
     llm_skills = _dedupe_case_insensitive(_clean_strings(req.llm_skills))
     llm_skills_lower = {s.lower() for s in llm_skills}
+    primary_skills_lower = {s.strip().lower() for s in (req.primary_skills or []) if s.strip()}
 
     cost_acc = CostAccumulator()
     repo = SkillLibraryRepository()
@@ -943,6 +933,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                     role_hint=role_hint_text,
                     existing_dims=existing_dims_v3,
                     candidate_skills_pool=candidate_skills_pool,
+                    accumulator=cost_acc,
                 )
                 return skill_name, meta
             except Exception as exc:  # noqa: BLE001
@@ -1363,7 +1354,10 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             }
 
         context = {
-            "final_skills": final_skills,
+            "final_skills": [
+                {"skill_name": s, "is_primary": s.lower() in primary_skills_lower}
+                for s in final_skills
+            ],
             "jd_role_hint": jd_role_hint_ctx,
             "dimension_role_map": dimension_role_map,
         }
@@ -1414,7 +1408,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 rationale=c.rationale,
             )
 
-    # cost_acc.log_summary("skills/extract-details", logger)
+    cost_acc.log_summary("skills/extract-details", logger)
     response = ExtractDetailsResponse(
         input_final_skills=final_skills,
         input_llm_skills=llm_skills,
@@ -1899,7 +1893,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             logger.warning("planner generation failed for missing role=%r: %s", chosen.slug, exc)
             planner_output.payload = {"error": str(exc)}
 
-    # cost_acc.log_summary("skills/final-role-output", logger)
+    cost_acc.log_summary("skills/final-role-output", logger)
     response = FinalRoleOutputResponse(
         chosen_role=chosen_role_out,
         final_input_skills=final_input_skills,
