@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-DIM_GEN_PROMPT_VERSION = "stage2_dim_gen_v1.0"
+DIM_GEN_PROMPT_VERSION = "stage2_dim_gen_v1.1"
 
 
 DIM_GEN_SYSTEM_PROMPT = """\
@@ -20,10 +20,16 @@ charter), produce 12-20 candidate dimensions covering the role's skill
 surface.
 
 A "dimension" is a coherent skill cluster a practitioner of this role
-needs. Examples for Backend Engineer: Programming Languages, Web &
-Application Frameworks, API Design & Patterns, Relational Databases,
-Authentication & Authorization, Microservices & Service Architecture,
-Distributed Systems Concepts, Software Design Patterns, etc.
+needs. Examples across role families:
+  * Backend Engineer: Programming Languages, Web & Application Frameworks,
+    API Design & Patterns, Relational Databases, Authentication &
+    Authorization, Microservices & Service Architecture.
+  * Cybersecurity Engineer: Network Security, Endpoint Security & EDR
+    Products, SIEM Products & Detection Engineering, Vulnerability
+    Management Products, Cloud Security Tools (CNAPP/CSPM/CWPP),
+    Cryptography Primitives, Web Application Vulnerability Concepts.
+  * Data Engineer: Cloud Data Warehouses, Data Pipeline Orchestrators,
+    Stream Processing, ETL/ELT Tools, Data Quality & Lineage.
 
 Hard rules:
 
@@ -74,29 +80,44 @@ Per-dimension fields:
     Use overlap_flags WHENEVER an adjacent role has a dim that would
     plausibly contain the same skill. Stage 3 needs these to reconcile.
 
-Coverage discipline. For technical roles, sweep these axes before
-finalizing — drop any axis that doesn't apply, but check each:
+Coverage discipline — five-bucket framework. Every role's skill surface
+decomposes into some mixture of these five buckets. Use them as a
+checklist before finalising:
 
-  * Programming Languages used by the role
-  * Web/application/server frameworks
-  * Data stores (relational + NoSQL split when both apply)
-  * Caching / in-memory stores
-  * Messaging / event streaming
-  * Authentication / authorization
-  * Service architecture (microservices, gateways, mesh)
-  * Containerization (consumer depth for application roles)
-  * Testing (frameworks + types)
-  * Observability / monitoring
-  * Application security
-  * CI/CD usage (consumer depth for application roles)
-  * Distributed systems concepts
-  * Software design patterns / architecture
-  * Data serialization / protocols
-  * ORMs / data access libraries (when relational DB applies)
-  * Cloud platforms (consumer depth for application roles)
+  1. **Languages & DSLs** — what the role authors code in. Programming
+     languages, query languages, IaC DSLs, smart-contract languages,
+     detection-rule languages, shader languages — whichever apply.
+  2. **Frameworks & Libraries** — runtime libraries the role depends on
+     (web frameworks, ORMs, ML libs, smart-contract frameworks, UI
+     toolkits, agentic frameworks).
+  3. **Vendor Product Families** — concrete commercial / open-source
+     product categories. Each product family with 3+ named offerings the
+     role engages with deserves its own dimension: SIEM products, EDR
+     products, CNAPP/CSPM tools, IAM products, vulnerability scanners,
+     MLOps platforms, cloud data warehouses, BI tools, container
+     security, CI/CD platforms, orchestrators, observability stacks.
+  4. **Concepts, Patterns & Practices** — methodology and design
+     knowledge (distributed systems concepts, threat modelling, OWASP
+     Top 10, design patterns, MLOps practices, network protocols).
+  5. **Standards, Protocols & Compliance** — formal specs and compliance
+     frameworks (TLS / IPSec / DNSSEC, OAuth / OIDC / SAML, PCI-DSS /
+     HIPAA / SOC 2 / ISO 27001) — kept as their own dim when the role
+     is regulated.
 
-Don't force-fit irrelevant axes — if the role doesn't touch it, omit it.
-But sweep before finalizing.
+Anti-pattern — DO NOT collapse a vendor product family into a one-token
+mention inside a concepts dim. If a role legitimately uses Splunk AND
+Microsoft Sentinel AND Elastic Security, those belong in a `SIEM
+Products & Detection Engineering` dim, not as the word "SIEM" buried in
+the in_scope of a `Security Monitoring` concepts dim. The same rule
+applies to EDR products, CNAPP tools, IAM products, MLOps platforms,
+data warehouses, etc.: a category with 3+ named offerings the role
+engages with is its own dimension, separate from any concepts dim that
+governs the same area.
+
+Don't force-fit irrelevant axes — if the role doesn't touch a bucket,
+omit it. A pure-concepts role legitimately has fewer Vendor Product
+Families dims; a heavy-tooling role legitimately has more. Sweep the
+five buckets before finalising.
 
 Emit a single JSON object matching the schema. No prose, no code fences.
 """
@@ -110,7 +131,7 @@ Role card for {role_name} ({role_slug}):
 Always-load skills (do NOT make these dimensions):
 {always_load_block}
 
-{adjacent_dim_block}
+{family_hints_block}{adjacent_dim_block}
 
 Produce the JSON dimension list now. Remember: 12-20 dimensions, every
 dimension has 3+ exemplar_skills, flag overlaps with adjacent roles
@@ -158,6 +179,316 @@ def format_always_load_block(skills: list[str]) -> str:
     if not skills:
         return "(none — no cross-cutting universals to exclude)"
     return ", ".join(skills)
+
+
+# ── family-aware axis hints ────────────────────────────────────────────────
+
+
+# Family → narrative axis-hints paragraph. The LLM sees these as
+# *suggestions to consider* — not a must-have list. The 12-20 dim cap
+# forces it to pick the highest-value axes for the specific role.
+#
+# Software Engineering is split by canonical_name (sub-archetype) because
+# Backend / Frontend / Mobile / AI Engineer / Blockchain Developer share a
+# family but need wildly different axis hints. Backend / full-stack →
+# empty hints (the system prompt's universal layer already covers them).
+#
+# Order of fall-through inside Software Engineering:
+#   1. Blockchain (canonical contains "blockchain")
+#   2. Mobile (canonical contains "ios" / "android" / "mobile")
+#   3. AI Engineer (canonical contains "ai engineer")
+#   4. Frontend (canonical contains "frontend")
+#   5. Default → empty hints
+_SECURITY_HINTS = (
+    "Sub-archetype axis hints for Security roles — consider these "
+    "vendor-product and concept dimensions before finalising:\n"
+    "  - Network Security (firewalls, IDS/IPS, NDR, VPN, ZTNA; network "
+    "protocols TLS/IPSec/DNS-security)\n"
+    "  - Endpoint Security & EDR Products (CrowdStrike, SentinelOne, "
+    "Microsoft Defender, Carbon Black, Cortex XDR)\n"
+    "  - SIEM Products & Detection Engineering Languages (Splunk, "
+    "Microsoft Sentinel, QRadar, Elastic Security, Sumo Logic + SPL, "
+    "KQL, Lucene, Sigma)\n"
+    "  - Vulnerability Management Products (Nessus, Qualys, Rapid7, "
+    "OpenVAS, Burp Suite)\n"
+    "  - Cloud Security Tools — CNAPP/CSPM/CWPP (Wiz, Prisma Cloud, "
+    "Lacework, Aqua, Sysdig, Orca + GuardDuty, Defender for Cloud, "
+    "Security Command Center)\n"
+    "  - IAM Products (Okta, Auth0, Azure AD, PingIdentity, ForgeRock + "
+    "PAM products: CyberArk, BeyondTrust)\n"
+    "  - Container & Kubernetes Security (Trivy, Clair, Falco, Sysdig "
+    "Runtime, OPA, Kyverno)\n"
+    "  - Cryptography Primitives (hashing, symmetric/asymmetric, "
+    "PKI/CA/CRL/OCSP, digital signatures, TLS internals)\n"
+    "  - Forensics & Malware Analysis (Volatility, IDA Pro, Ghidra, "
+    "YARA, Sigma)\n"
+    "  - Web Application Vulnerability Concepts (OWASP Top 10 — XSS, "
+    "CSRF, SQLi, IDOR, SSRF; WAF, RASP)\n"
+    "  - Email Security (DMARC, DKIM, SPF, Proofpoint, Mimecast)\n"
+    "  - Data Security & DLP (Microsoft Purview, Symantec DLP, "
+    "Forcepoint; classification, tokenisation)\n"
+    "  - Pentesting & Red-Team Tools (Burp Suite, Metasploit, Kali, "
+    "BloodHound, Cobalt Strike, Nmap, sqlmap)\n"
+    "  - Compliance Frameworks (PCI-DSS, HIPAA, SOC 2, ISO 27001, "
+    "NIST CSF, NIST 800-53, GDPR, FedRAMP)\n"
+    "  - Cloud Platforms (AWS, Azure, GCP) — include this so cross-"
+    "cutting Service-typed skills (KMS, GuardDuty, Defender for Cloud, "
+    "Security Command Center) have a Platform parent to attach to in "
+    "Stage 6 containment\n"
+)
+
+_BLOCKCHAIN_HINTS = (
+    "Sub-archetype axis hints for Blockchain Developer — consider these "
+    "platform, primitive, and tooling dimensions:\n"
+    "  - L1/L2 Chain Platforms (Ethereum, Solana, Avalanche, Polygon, "
+    "Sui, Aptos, Arbitrum, Optimism)\n"
+    "  - Smart Contract Languages (Solidity, Rust, Move, Vyper, Cairo)\n"
+    "  - Smart Contract Frameworks (Hardhat, Foundry, Anchor, Truffle, "
+    "OpenZeppelin Contracts, CosmWasm)\n"
+    "  - Wallet Ecosystems (MetaMask, Phantom, WalletConnect, "
+    "Coinbase Wallet)\n"
+    "  - Web3 Client Libraries (ethers.js, web3.js, viem, web3.py)\n"
+    "  - On-Chain Indexing Infrastructure (Alchemy, Infura, QuickNode, "
+    "The Graph, subgraphs)\n"
+    "  - DeFi Primitives (DEX/AMM, lending, staking, yield farming, "
+    "derivatives, perps)\n"
+    "  - NFT Ecosystem (ERC-721/1155 standards, marketplaces, "
+    "metadata, royalties)\n"
+    "  - Cross-Chain Bridges Products (LayerZero, Wormhole, Axelar, "
+    "Chainlink CCIP)\n"
+    "  - DAO Tooling (Snapshot, Tally, Aragon, Gnosis Safe)\n"
+    "  - Smart Contract Audit Tooling (Slither, Mythril, Echidna, "
+    "Certora, Foundry fuzzing)\n"
+    "  - Cryptographic Primitives & Key Management (ECDSA, Schnorr, "
+    "BLS, hashing, Merkle proofs, HSMs)\n"
+    "  - Token Standards (ERC-20, ERC-721, ERC-1155, ERC-4626, SPL)\n"
+)
+
+_MOBILE_HINTS = (
+    "Sub-archetype axis hints for Mobile roles — consider these "
+    "platform-specific dimensions:\n"
+    "  - Native Languages (Swift, Kotlin, Objective-C, Java)\n"
+    "  - UI Frameworks (SwiftUI, UIKit, Jetpack Compose, Android Views)\n"
+    "  - Cross-Platform Frameworks (React Native, Flutter)\n"
+    "  - Build Systems (Xcode, Gradle, fastlane)\n"
+    "  - Mobile Storage & Persistence (Core Data, Room, SQLite, Realm)\n"
+    "  - Mobile Networking (URLSession, OkHttp, Retrofit, Alamofire)\n"
+    "  - Mobile Auth & Keychain (Keychain Services, Android Keystore, "
+    "biometrics)\n"
+    "  - Background Services & Lifecycle (WorkManager, BGTaskScheduler)\n"
+    "  - Push Notifications (APNs, FCM)\n"
+    "  - Mobile Testing (XCTest, Espresso, UI Automator)\n"
+    "  - App Distribution (App Store Connect, Google Play Console, "
+    "TestFlight, internal CI for mobile)\n"
+    "  - Mobile Observability (Firebase Crashlytics, Sentry, "
+    "Bugsnag)\n"
+)
+
+_AI_ENGINEER_HINTS = (
+    "Sub-archetype axis hints for AI Engineer — consider these "
+    "LLM-application dimensions:\n"
+    "  - LLM Provider APIs (OpenAI, Anthropic, Azure OpenAI, "
+    "Bedrock, Vertex AI)\n"
+    "  - Prompt Engineering Patterns (few-shot, CoT, ReAct, "
+    "structured output)\n"
+    "  - RAG Architectures (retrieval, reranking, chunking, "
+    "hybrid search)\n"
+    "  - Vector Databases (Pinecone, Weaviate, Qdrant, Chroma, "
+    "pgvector, Milvus)\n"
+    "  - Embedding Models (OpenAI embeddings, Cohere, BGE, E5)\n"
+    "  - LLM Orchestration Frameworks (LangChain, LlamaIndex, DSPy, "
+    "Semantic Kernel)\n"
+    "  - Agentic Frameworks (LangGraph, CrewAI, AutoGen, Letta)\n"
+    "  - Evaluation Tooling (Ragas, Promptfoo, DeepEval, TruLens)\n"
+    "  - Fine-tuning Pipelines (LoRA/QLoRA, PEFT, Unsloth, Together)\n"
+    "  - LLM Observability (LangSmith, Langfuse, Phoenix, Helicone)\n"
+)
+
+_FRONTEND_HINTS = (
+    "Sub-archetype axis hints for Frontend Engineer — consider these "
+    "browser-app dimensions:\n"
+    "  - UI Frameworks (React, Vue, Angular, Svelte, Solid)\n"
+    "  - State Management (Redux, Zustand, MobX, Pinia, Recoil)\n"
+    "  - CSS Architecture (Tailwind, CSS-in-JS, CSS Modules, BEM, "
+    "Sass)\n"
+    "  - Build Tooling (Vite, Webpack, Turbopack, esbuild, Rollup)\n"
+    "  - Browser APIs (Fetch, WebSockets, Service Workers, "
+    "IndexedDB)\n"
+    "  - Accessibility Standards (WCAG, ARIA, screen-reader testing)\n"
+    "  - Component Libraries (Material UI, shadcn/ui, Chakra, "
+    "Ant Design)\n"
+    "  - Testing (Jest, Vitest, Testing Library, Playwright, Cypress)\n"
+    "  - Bundling & Performance (code-splitting, lazy-loading, "
+    "Lighthouse, Core Web Vitals)\n"
+    "  - Mobile-Web (responsive design, PWA, mobile-first patterns)\n"
+)
+
+_DATA_ML_HINTS = (
+    "Family axis hints for Data & ML roles — consider these data-platform "
+    "and ML dimensions:\n"
+    "  - OLTP & OLAP Data Stores (split when both apply)\n"
+    "  - Cloud Data Warehouses (Snowflake, BigQuery, Redshift, "
+    "Synapse, Databricks SQL)\n"
+    "  - Data Pipeline Orchestrators (Airflow, Dagster, Prefect, "
+    "Argo Workflows)\n"
+    "  - ETL/ELT Tools (dbt, Fivetran, Informatica, Matillion, "
+    "Airbyte)\n"
+    "  - Stream Processing (Apache Flink, Spark Streaming, "
+    "Kafka Streams, ksqlDB)\n"
+    "  - ML Frameworks (PyTorch, TensorFlow, JAX, scikit-learn, "
+    "XGBoost, LightGBM)\n"
+    "  - Feature Stores (Feast, Tecton, SageMaker Feature Store)\n"
+    "  - Model Serving (TorchServe, TFServing, Triton, BentoML, "
+    "Ray Serve)\n"
+    "  - MLOps Platforms (Vertex AI, SageMaker, Azure ML, MLflow, "
+    "Kubeflow, Weights & Biases)\n"
+    "  - Experiment Tracking (MLflow, Weights & Biases, Neptune, "
+    "Comet)\n"
+    "  - BI & Visualization (Tableau, Power BI, Looker, Metabase, "
+    "Superset)\n"
+    "  - Data Quality & Lineage (Great Expectations, Monte Carlo, "
+    "OpenLineage, dbt tests)\n"
+)
+
+_STORAGE_ENGINEER_HINTS = (
+    "Sub-archetype axis hints for Storage Engineer — the vendor surface "
+    "is wholly distinct from generic DevOps and deserves dedicated "
+    "product-family dimensions:\n"
+    "  - Enterprise Storage Vendor Products (NetApp ONTAP, Pure Storage "
+    "FlashArray/FlashBlade, Dell EMC PowerStore/PowerMax/Unity, HPE "
+    "3PAR/Primera/Alletra, Hitachi VSP, IBM FlashSystem)\n"
+    "  - Software-Defined / Object Storage (Ceph, MinIO, OpenStack "
+    "Swift, VMware vSAN, GlusterFS)\n"
+    "  - Cloud Storage Services (AWS S3 / EBS / EFS / FSx, Azure Blob / "
+    "Files / Disks, Google Cloud Storage / Persistent Disk / Filestore)\n"
+    "  - Backup & Data Protection Software (Veeam, Commvault, Veritas "
+    "NetBackup, Rubrik, Cohesity, Dell Avamar / NetWorker)\n"
+    "  - Disaster Recovery & Replication Products (Zerto, Azure Site "
+    "Recovery, AWS DRS, EMC SRDF, NetApp SnapMirror)\n"
+    "  - Storage Networking & Fabric (Fibre Channel switches — Brocade, "
+    "Cisco MDS; iSCSI, NVMe-oF, FCoE, multipathing, zoning)\n"
+    "  - Storage Protocols & Filesystems (NFS, SMB/CIFS, NVMe, ZFS, "
+    "BTRFS, XFS, ext4, GPFS, Lustre)\n"
+    "  - Storage Management & Orchestration (NetApp Active IQ / "
+    "OnCommand, Pure1, Dell Unisphere, vSphere Storage)\n"
+    "  - Capacity & Performance Analytics (capacity forecasting, IOPS "
+    "modelling, latency budgets, telemetry pipelines)\n"
+    "  - Data Lifecycle & Archive (lifecycle policies, tiering, WORM, "
+    "immutability, archive transitions, AWS Glacier / Azure Archive)\n"
+    "  - Storage Security (encryption at rest, KMIP, key management "
+    "integration, tenant isolation, secure erase)\n"
+    "  - Provisioning Automation (storage provisioning APIs, Ansible / "
+    "Terraform storage providers, vendor REST APIs)\n"
+)
+
+
+_INFRA_PLATFORM_HINTS = (
+    "Family axis hints for Infrastructure & Platform roles — consider "
+    "these platform-tooling dimensions:\n"
+    "  - IaC (Terraform, Pulumi, CloudFormation, Bicep, CDK)\n"
+    "  - Configuration Management (Ansible, Chef, Puppet, SaltStack)\n"
+    "  - Container Orchestrators (Kubernetes, Nomad, ECS)\n"
+    "  - Service Mesh (Istio, Linkerd, Consul, Cilium)\n"
+    "  - CI/CD Platforms (GitHub Actions, GitLab CI, Jenkins, "
+    "CircleCI, Buildkite, Argo CD)\n"
+    "  - Observability Stacks (Prometheus, Grafana, Datadog, "
+    "New Relic, Splunk, OpenTelemetry)\n"
+    "  - Cloud Networking (VPC, subnets, peering, Transit Gateway, "
+    "DNS, load balancers)\n"
+    "  - Database Operations (when DBA-shaped — backups, replication, "
+    "HA, query tuning)\n"
+    "  - Storage Systems (when Storage-Engineer-shaped — block, file, "
+    "object, SAN/NAS)\n"
+    "  - Cost & FinOps Tools (CloudHealth, Apptio, native cost "
+    "explorers)\n"
+    "  - Reliability Engineering (capacity planning, chaos "
+    "engineering, runbooks, error budgets)\n"
+)
+
+_QA_SDET_HINTS = (
+    "Family axis hints for QA & SDET roles — consider these "
+    "test-engineering dimensions:\n"
+    "  - Test Automation Frameworks (Selenium, Playwright, Cypress, "
+    "Appium, Puppeteer)\n"
+    "  - BDD Tools (Cucumber, SpecFlow, Behave)\n"
+    "  - API Testing (Postman, Rest Assured, Karate, Newman)\n"
+    "  - Performance Testing (JMeter, Gatling, k6, Locust)\n"
+    "  - Test Management (TestRail, Zephyr, Xray, qTest)\n"
+    "  - Mobile Testing (XCTest, Espresso, Appium, BrowserStack, "
+    "Sauce Labs)\n"
+    "  - CI Integration for Tests (test runners on GH Actions / "
+    "Jenkins / GitLab CI)\n"
+    "  - Defect Tracking (JIRA, Azure Boards, Linear)\n"
+    "  - Test Data Management (synthetic data, anonymisation, "
+    "fixtures)\n"
+    "  - Accessibility Testing (axe, WAVE, screen-reader QA)\n"
+    "  - Security Testing Concepts (SAST/DAST/IAST awareness for QA)\n"
+)
+
+_ERP_ENTERPRISE_HINTS = (
+    "Family axis hints for ERP & Enterprise platform roles — consider "
+    "platform-specific dimensions:\n"
+    "  - Platform-specific languages (e.g., GlideScript for "
+    "ServiceNow; ABAP for SAP; Apex for Salesforce)\n"
+    "  - Platform Modules (e.g., ITSM, HRSD, CSM, SecOps for "
+    "ServiceNow)\n"
+    "  - Integration Patterns (IntegrationHub, REST/SOAP APIs, "
+    "MID Server, middleware)\n"
+    "  - UI Frameworks (Service Portal, Now Experience UI Builder, "
+    "Lightning, SAP Fiori)\n"
+    "  - Workflow Engines (Flow Designer, Workflow Editor, "
+    "Process Builder)\n"
+    "  - Discovery & CMDB (asset discovery, configuration items, "
+    "dependency mapping)\n"
+    "  - Event Management (alert correlation, event rules, "
+    "MID Server connectors)\n"
+    "  - Performance Analytics (dashboards, indicators, reporting)\n"
+    "  - Platform Administration (instance management, upgrades, "
+    "user access)\n"
+    "  - Update Sets / Application Repository (versioning, "
+    "deployment, scoped apps)\n"
+    "  - Custom Apps & Scoped Applications (app development, ACLs, "
+    "best practices)\n"
+)
+
+
+def _se_subarchetype_hints(canonical_name: str) -> str:
+    """Route Software Engineering family by canonical_name.
+    Backend / full-stack default → empty (system prompt covers them)."""
+    cn = (canonical_name or "").lower()
+    if "blockchain" in cn:
+        return _BLOCKCHAIN_HINTS
+    if "ios" in cn or "android" in cn or "mobile" in cn:
+        return _MOBILE_HINTS
+    if "ai engineer" in cn:
+        return _AI_ENGINEER_HINTS
+    if "frontend" in cn:
+        return _FRONTEND_HINTS
+    return ""
+
+
+def format_family_hints_block(family: str, canonical_name: str) -> str:
+    """Pick a narrative axis-hints paragraph for the role's family
+    (and, for Software Engineering, sub-archetype). Return empty string
+    when the family is unknown or a Software Engineering sub-archetype
+    doesn't need extra hints (backend / full-stack)."""
+    fam = (family or "").strip()
+    if fam == "Security":
+        return _SECURITY_HINTS
+    if fam == "Software Engineering":
+        return _se_subarchetype_hints(canonical_name)
+    if fam == "Data & ML":
+        return _DATA_ML_HINTS
+    if fam == "Infrastructure & Platform":
+        cn = (canonical_name or "").lower()
+        if "storage" in cn:
+            return _STORAGE_ENGINEER_HINTS
+        return _INFRA_PLATFORM_HINTS
+    if fam == "QA & SDET":
+        return _QA_SDET_HINTS
+    if fam == "ERP & Enterprise":
+        return _ERP_ENTERPRISE_HINTS
+    return ""
 
 
 def format_adjacent_dim_block(

@@ -54,6 +54,7 @@ from skill_library_v3.placement_validators import (
     cross_skill_consistency,
     embedding_cross_check,
     secondary_dim_audit,
+    tool_standard_cross_mismatch,
     type_dim_consistency,
 )
 from skill_library_v3.prompts.charter import CHARTER_PROMPT_VERSION
@@ -1178,6 +1179,19 @@ async def run_stage_5(role_slug: str) -> None:
             if typed is None:
                 continue
             for f in type_dim_consistency(
+                typed=typed, placed=placed, dims_by_id=dims_by_id,
+            ):
+                if f.get("level") == "error":
+                    validator_errors.append(f)
+                else:
+                    validator_warnings.append(f)
+
+        # Check 2b: Tool ↔ Standard cross-mismatch (egregious-only).
+        for placed in placed_skills:
+            typed = typed_by_id.get(placed.skill_id)
+            if typed is None:
+                continue
+            for f in tool_standard_cross_mismatch(
                 typed=typed, placed=placed, dims_by_id=dims_by_id,
             ):
                 if f.get("level") == "error":

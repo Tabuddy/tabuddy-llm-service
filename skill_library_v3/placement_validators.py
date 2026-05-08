@@ -28,6 +28,19 @@ from skill_library_v3.schemas.typology import TypedSkill
 # ── 1. embedding cross-check ──────────────────────────────────────────────
 
 
+# Minimum cosine-similarity gap between embedding-nearest and llm-primary
+# before we flag a mismatch. Below this, the LLM's pick and the
+# embedding-nearest are both reasonable home dims and the LLM may have
+# made a nuanced call the embedding model can't see (e.g., "Threat
+# Modeling" placed in Risk Assessment when embedding nearest is Threat
+# Hunting — modelling is design-time, hunting is runtime). On cybersec
+# prod data, ~50% of embedding_mismatch findings had diff < 0.10 and
+# were the source of the validator-noise complaint. 0.10 keeps obvious
+# outliers (diff > 0.15 was 100% real placement issues there) while
+# dropping the close-call noise.
+_EMBEDDING_MISMATCH_MIN_DIFF = 0.10
+
+
 async def embedding_cross_check(
     *,
     skill: PlacedSkill,
@@ -36,14 +49,14 @@ async def embedding_cross_check(
 ) -> list[dict]:
     """Compare the LLM's ``primary_dimension`` to the dim whose
     embedding is nearest to the skill's name. Mismatch -> warning.
-    Per blueprint: every embedding mismatch goes to 100% human review.
 
     Two distinct findings:
       * ``primary_unknown`` — LLM picked a dim_id that's not in the
         role's dim set (LLM hallucination). Surfaced regardless of
         dim count.
       * ``embedding_mismatch`` — LLM's primary IS in the set but is
-        not the embedding-nearest. Only meaningful with 2+ dims.
+        not the embedding-nearest, AND the similarity gap exceeds
+        ``_EMBEDDING_MISMATCH_MIN_DIFF``. Only meaningful with 2+ dims.
     """
     dim_ids = {d["tentative_id"] for d in dims}
     if skill.primary_dimension not in dim_ids:
@@ -71,6 +84,9 @@ async def embedding_cross_check(
     nearest_id = max(sims_by_id, key=sims_by_id.get)
 
     if skill.primary_dimension != nearest_id:
+        diff = sims_by_id[nearest_id] - sims_by_id[skill.primary_dimension]
+        if diff < _EMBEDDING_MISMATCH_MIN_DIFF:
+            return []
         return [
             {
                 "level": "warning",
@@ -97,8 +113,12 @@ async def embedding_cross_check(
 
 # Per skill type, the keywords that should appear (case-insensitively) in
 # the primary dim's name OR description for the placement to be coherent.
-# Types not in this map have no automatic check (e.g. Concept, SoftSkill —
-# they can land in many dims, no good heuristic).
+# Types not in this map have no automatic check — Concept, SoftSkill,
+# and Methodology can legitimately span functional dims, so no good
+# heuristic exists for them. (Methodology was previously keyed but
+# generated 44/44 false positives on cybersec prod — methodologies like
+# fuzzing, tls-hardening, control-testing all live inside functional
+# dims by nature, never in a "Methodology" dim that doesn't exist.)
 _TYPE_DIM_KEYWORDS: dict[str, tuple[str, ...]] = {
     "Format":      ("format", "serialization", "protocol", "schema", "wire"),
     "Datastore":   ("database", "datastore", "storage", "store", "db", "warehouse"),
@@ -109,9 +129,13 @@ _TYPE_DIM_KEYWORDS: dict[str, tuple[str, ...]] = {
     "Platform":    ("platform", "cloud", "infrastructure"),
     "Runtime":     ("runtime", "container", "execution", "vm"),
     "Protocol":    ("protocol", "networking", "communication", "wire", "api"),
-    "Methodology": ("methodology", "process", "practice", "agile", "ci/cd", "delivery"),
     "Architecture": ("architecture", "pattern", "design", "system"),
 }
+
+
+def _dim_matches_type_keywords(dim: dict, keywords: tuple[str, ...]) -> bool:
+    haystack = (dim.get("name", "") + " " + dim.get("description", "")).lower()
+    return any(kw in haystack for kw in keywords)
 
 
 def type_dim_consistency(
@@ -123,6 +147,15 @@ def type_dim_consistency(
     """Soft heuristic: the primary dim's name/description should mention
     a keyword associated with the skill's type. Types without an entry
     in ``_TYPE_DIM_KEYWORDS`` skip the check rather than warn spuriously.
+
+    Canonical-home exemption: if the placed dim doesn't match the type's
+    keywords BUT the role *has* another dim that does, the LLM made an
+    intentional functional placement (e.g., Python-the-Language placed
+    in Security Automation when a Programming Languages dim also
+    exists). Skip the flag — the LLM saw both options and chose the
+    functional one. This was the single biggest noise source on cybersec
+    prod (Languages and Libraries placed in functional dims when their
+    canonical home dim also existed).
     """
     dim = dims_by_id.get(placed.primary_dimension)
     if dim is None:
@@ -141,9 +174,14 @@ def type_dim_consistency(
     keywords = _TYPE_DIM_KEYWORDS.get(typed.type)
     if not keywords:
         return []
-    haystack = (dim.get("name", "") + " " + dim.get("description", "")).lower()
-    if any(kw in haystack for kw in keywords):
+    if _dim_matches_type_keywords(dim, keywords):
         return []
+    # Canonical-home exemption — does any OTHER dim in the role match?
+    for other_id, other_dim in dims_by_id.items():
+        if other_id == placed.primary_dimension:
+            continue
+        if _dim_matches_type_keywords(other_dim, keywords):
+            return []
     return [
         {
             "level": "warning",
@@ -155,10 +193,102 @@ def type_dim_consistency(
             "message": (
                 f"{typed.type}-typed skill {typed.name!r} placed in dim "
                 f"{dim.get('name')!r} which doesn't match expected "
-                f"keywords for its type"
+                f"keywords for its type and the role has no canonical-home "
+                f"dim for this type either"
             ),
         }
     ]
+
+
+# ── 2b. Tool ↔ Standard cross-mismatch (egregious-only) ───────────────────
+
+
+# Markers that signal a dim is fundamentally a "Standards / Compliance"
+# dim. Triggers when a Tool-typed skill lands here. Kept narrow so it
+# only fires on the genuinely incompatible case.
+_STANDARDS_DIM_MARKERS: tuple[str, ...] = (
+    "compliance",
+    "standards",
+    "policy",
+    "policies",
+    "audit",
+    "governance",
+    "regulation",
+    "regulations",
+)
+
+
+# Markers that signal a dim is fundamentally a "Tool / Products" dim.
+# Triggers when a Standard-typed skill lands here. Kept narrow so it
+# only fires on the genuinely incompatible case.
+_TOOLS_DIM_MARKERS: tuple[str, ...] = (
+    "tool",
+    "tools",
+    "tooling",
+    "scanner",
+    "scanners",
+    "products",
+)
+
+
+def tool_standard_cross_mismatch(
+    *,
+    typed: TypedSkill,
+    placed: PlacedSkill,
+    dims_by_id: dict[str, dict],
+) -> list[dict]:
+    """Egregious-only cross-type rule per the v1.1 policy.
+
+    Tools are operational software you run; Standards are policy
+    specifications you comply with. They are genuinely incompatible
+    when crossed: a Tool placed in a Standards/Compliance dim or a
+    Standard placed in a Tools/Products dim is almost always a real
+    placement error, not a nuanced LLM call. Fires only on these two
+    cases — every other type-dim combination is handled (or ignored)
+    by ``type_dim_consistency``.
+    """
+    dim = dims_by_id.get(placed.primary_dimension)
+    if dim is None:
+        return []
+    haystack = (dim.get("name", "") + " " + dim.get("description", "")).lower()
+
+    if typed.type == "Tool" and any(m in haystack for m in _STANDARDS_DIM_MARKERS):
+        return [
+            {
+                "level": "warning",
+                "code": "tool_in_standards_dim",
+                "skill_id": typed.skill_id,
+                "skill_type": typed.type,
+                "primary_dimension": placed.primary_dimension,
+                "primary_dim_name": dim.get("name"),
+                "message": (
+                    f"Tool-typed skill {typed.name!r} placed in Standards/"
+                    f"Compliance dim {dim.get('name')!r} — Tools are "
+                    f"operational software, Standards are policy; this "
+                    f"cross is almost always wrong"
+                ),
+            }
+        ]
+
+    if typed.type == "Standard" and any(m in haystack for m in _TOOLS_DIM_MARKERS):
+        return [
+            {
+                "level": "warning",
+                "code": "standard_in_tools_dim",
+                "skill_id": typed.skill_id,
+                "skill_type": typed.type,
+                "primary_dimension": placed.primary_dimension,
+                "primary_dim_name": dim.get("name"),
+                "message": (
+                    f"Standard-typed skill {typed.name!r} placed in Tools/"
+                    f"Products dim {dim.get('name')!r} — Standards are "
+                    f"specifications, Tools are operational software; "
+                    f"this cross is almost always wrong"
+                ),
+            }
+        ]
+
+    return []
 
 
 # ── 3. cross-skill consistency ─────────────────────────────────────────────
