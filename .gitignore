@@ -29,7 +29,6 @@ skill_library_v3/tests
 # Plan-mode workspace + screenshots used during development
 plans
 *.png
-image.png
 
 # Skill-library v3 batch + run artifacts (intermediate, not source)
 _intermediate

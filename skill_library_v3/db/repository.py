@@ -1379,23 +1379,40 @@ def insert_jd_samples(rows: Iterable[dict]) -> int:
 
 
 def get_alias_lookup_set() -> set[str]:
-    """Lowercased set of every known skill alias plus canonical display name.
+    """Lowercased set of every concrete-nature skill alias + display name.
 
     Used by validators.no_skills_in_scope to detect when the LLM smuggled a
-    skill/tool name into a charter scope statement.
+    real tool/library/platform name into a charter scope statement.
 
-    Falls back to an empty set when ``v_alias_lookup`` is unavailable
-    (e.g. the v3 DB has been bootstrapped but no skills have been loaded yet
-    — a brand-new ``skill-library`` DB has zero rows in skill_aliases / canonical_skills).
+    The query joins ``skill_aliases`` and ``canonical_skills`` and excludes
+    rows whose ``skill_nature`` is ``CONCEPT``, ``METHODOLOGY``, ``PATTERN``,
+    or ``PRACTICE``. Those four natures describe responsibility-shaped
+    skills — words like "automation", "disaster recovery", "alerting",
+    "naming conventions" — that the LLM legitimately uses when describing
+    what a role does. Treating them as skill leaks produced 14/23 false
+    positives in the first prod cohort. The validator's local stop-list
+    (``_GENERIC_NOUN_STOPLIST``) handles the residual concrete-nature
+    English-collision cases that this filter doesn't catch.
+
+    Falls back to an empty set when the DB is unavailable or the v3 schema
+    has been bootstrapped but no skills have been loaded yet (a brand-new
+    ``skill-library`` DB has zero rows in skill_aliases / canonical_skills).
     """
     try:
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT lower(alias_text) FROM skill_aliases
+                    SELECT lower(sa.alias_text)
+                      FROM skill_aliases sa
+                      JOIN canonical_skills cs ON cs.id = sa.skill_id
+                     WHERE cs.skill_nature::text NOT IN
+                           ('CONCEPT', 'METHODOLOGY', 'PATTERN', 'PRACTICE')
                     UNION
-                    SELECT lower(display_name) FROM canonical_skills
+                    SELECT lower(cs.display_name)
+                      FROM canonical_skills cs
+                     WHERE cs.skill_nature::text NOT IN
+                           ('CONCEPT', 'METHODOLOGY', 'PATTERN', 'PRACTICE')
                     """
                 )
                 return {row[0] for row in cur.fetchall() if row[0]}

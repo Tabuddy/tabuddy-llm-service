@@ -226,6 +226,30 @@
     table.runs tr.clickable { cursor: pointer; }
     table.runs tr.clickable:hover td { background: var(--surface2); }
 
+    /* recent runs pager */
+    .runs-pager {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      margin-top: 0.6rem;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+    .runs-pager button {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.25rem 0.55rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+      line-height: 1;
+    }
+    .runs-pager button:hover:not(:disabled) { background: var(--border); }
+    .runs-pager button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .runs-pager .indicator { min-width: 5.5rem; text-align: center; }
+
     /* review pane */
     .review-pane { display: flex; flex-direction: column; gap: 0.85rem; }
     .review-empty { color: var(--text-dim); font-style: italic; padding: 2rem 1rem; text-align: center; }
@@ -346,13 +370,18 @@
         <div class="lane-body">
           <div id="statusCard" class="status-card" style="display:none"></div>
 
-          <div class="lane-title" style="margin-top: 0.85rem;">Recent runs (last 20)</div>
+          <div class="lane-title" style="margin-top: 0.85rem;">Recent runs</div>
           <table class="runs">
             <thead><tr><th>Role</th><th>Status</th><th>When</th></tr></thead>
             <tbody id="recentRunsBody">
               <tr><td colspan="3" style="color:var(--text-dim)">loading…</td></tr>
             </tbody>
           </table>
+          <div id="recentRunsPager" class="runs-pager" style="display:none">
+            <button id="recentRunsPrev" type="button" aria-label="previous page">‹ Prev</button>
+            <span class="indicator" id="recentRunsIndicator">Page 1 of 1</span>
+            <button id="recentRunsNext" type="button" aria-label="next page">Next ›</button>
+          </div>
         </div>
       </section>
 
@@ -445,30 +474,70 @@
       }
     }
 
+    // Recent-runs pagination — list is fetched in one shot (API caps at 100)
+    // and paginated client-side. Keeping the user's current page across the
+    // 8s polling refresh, clamping if rows shrink.
+    const RECENT_PAGE_SIZE = 10;
+    let recentRuns = [];
+    let recentPage = 1;
+
     async function loadRecentRuns() {
       try {
-        const data = await jget("/api/generate-skills/runs?limit=20");
-        const tbody = $("recentRunsBody");
-        if (!data.items.length) {
-          tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-dim)">no runs yet</td></tr>';
-          return;
-        }
-        tbody.innerHTML = "";
-        for (const r of data.items) {
-          const tr = document.createElement("tr");
-          tr.classList.add("clickable");
-          tr.dataset.runId = r.run_id;
-          tr.innerHTML = `
-            <td>${escape(r.role_display)}</td>
-            <td><span class="badge ${escape(r.status)}">${escape(r.status)}</span></td>
-            <td style="color:var(--text-dim)">${fmtTime(r.started_at)}</td>
-          `;
-          tr.addEventListener("click", () => selectRun(r.run_id));
-          tbody.appendChild(tr);
-        }
+        const data = await jget("/api/generate-skills/runs?limit=100");
+        recentRuns = Array.isArray(data.items) ? data.items : [];
+        renderRecentRuns();
       } catch (e) {
         // non-fatal — no toast spam
       }
+    }
+
+    function totalRecentPages() {
+      return Math.max(1, Math.ceil(recentRuns.length / RECENT_PAGE_SIZE));
+    }
+
+    function renderRecentRuns() {
+      const tbody = $("recentRunsBody");
+      const pager = $("recentRunsPager");
+      if (!recentRuns.length) {
+        tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-dim)">no runs yet</td></tr>';
+        pager.style.display = "none";
+        return;
+      }
+      const total = totalRecentPages();
+      if (recentPage > total) recentPage = total;
+      if (recentPage < 1) recentPage = 1;
+      const start = (recentPage - 1) * RECENT_PAGE_SIZE;
+      const slice = recentRuns.slice(start, start + RECENT_PAGE_SIZE);
+      tbody.innerHTML = "";
+      for (const r of slice) {
+        const tr = document.createElement("tr");
+        tr.classList.add("clickable");
+        tr.dataset.runId = r.run_id;
+        tr.innerHTML = `
+          <td>${escape(r.role_display)}</td>
+          <td><span class="badge ${escape(r.status)}">${escape(r.status)}</span></td>
+          <td style="color:var(--text-dim)">${fmtTime(r.started_at)}</td>
+        `;
+        tr.addEventListener("click", () => selectRun(r.run_id));
+        tbody.appendChild(tr);
+      }
+      // Hide pager when everything fits on one page; otherwise update controls.
+      if (total <= 1) {
+        pager.style.display = "none";
+      } else {
+        pager.style.display = "flex";
+        $("recentRunsIndicator").textContent = `Page ${recentPage} of ${total}`;
+        $("recentRunsPrev").disabled = recentPage <= 1;
+        $("recentRunsNext").disabled = recentPage >= total;
+      }
+    }
+
+    function gotoRecentPage(delta) {
+      const total = totalRecentPages();
+      const next = Math.min(total, Math.max(1, recentPage + delta));
+      if (next === recentPage) return;
+      recentPage = next;
+      renderRecentRuns();
     }
 
     // ── generate / poll / render ───────────────────────────────────────────
@@ -486,6 +555,8 @@
         $("roleNameInput").value = "";
         $("roleSelect").value = "";
         await selectRun(r.run_id);
+        // Jump back to page 1 so the just-created run is visible.
+        recentPage = 1;
         await loadRecentRuns();
         await loadRoles();
       } catch (e) {
@@ -1795,6 +1866,8 @@
       $("roleNameInput").addEventListener("keydown", (e) => {
         if (e.key === "Enter") { e.preventDefault(); onGenerate(); }
       });
+      $("recentRunsPrev").addEventListener("click", () => gotoRecentPage(-1));
+      $("recentRunsNext").addEventListener("click", () => gotoRecentPage(+1));
       loadRoles();
       loadRecentRuns();
       // Light periodic refresh of recent runs while no active poll is running.

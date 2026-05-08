@@ -25,14 +25,25 @@ def _normalize(s: str) -> str:
     return (s or "").strip().lower()
 
 
-def _scope_strings(charter: CharterOutput) -> Iterable[tuple[str, str]]:
-    """Yield ``(location_label, text)`` for every place a skill name might
-    sneak into the charter."""
-    yield "definition", charter.definition
+def _scope_strings(
+    charter: CharterOutput,
+) -> Iterable[tuple[str, str, frozenset[str]]]:
+    """Yield ``(location_label, text, owner_tokens)`` for every place a skill
+    name might sneak into the charter.
+
+    ``owner_tokens`` is non-empty only for ``out_of_scope[i].task`` rows —
+    it carries the lowercased word-tokens of the same item's ``owned_by``
+    field so the alias scanner can exempt platform/role words that the LLM
+    naturally repeats when describing a boundary (e.g. an out-of-scope task
+    "Operate Azure infrastructure" with owned_by "Azure Cloud Engineer").
+    """
+    empty: frozenset[str] = frozenset()
+    yield "definition", charter.definition, empty
     for i, item in enumerate(charter.in_scope):
-        yield f"in_scope[{i}]", item
+        yield f"in_scope[{i}]", item, empty
     for i, item in enumerate(charter.out_of_scope):
-        yield f"out_of_scope[{i}].task", item.task
+        owner_tokens = frozenset(_tokenize(item.owned_by or ""))
+        yield f"out_of_scope[{i}].task", item.task, owner_tokens
 
 
 def adjacent_roles_in_catalog(
@@ -89,6 +100,43 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in _WORD_RE.split(text.lower()) if t]
 
 
+# Generic-noun stop-list. These words are real canonical skills in the catalog,
+# but they double as everyday English nouns/verbs that legitimately appear in
+# responsibility prose. Flagging them as "skill leaks" produced 8/23 false
+# positives in the first prod cohort (servicenow-developer, manual-tester,
+# data-analyst, etc.). The repository-layer type filter handles the
+# CONCEPT/METHODOLOGY/PATTERN/PRACTICE bucket; this set is the safety net for
+# concrete-nature collisions plus a defense-in-depth duplicate of the most
+# common dual-use soft-nature words.
+_GENERIC_NOUN_STOPLIST: frozenset[str] = frozenset({
+    # Concrete-nature collisions — the canonical skill is a real tool but the
+    # alias word is a generic English noun that responsibility text reuses.
+    "move",            # Move (Aptos/Sui smart-contract language)
+    "combine",         # Combine (SwiftUI reactive framework)
+    "flow",            # Flow (Facebook static type checker)
+    "activities",      # Activities (Android Activity framework)
+    "notifications",   # Notifications (cloud service)
+    "dashboards",      # dashboards (catalog TOOL)
+    "task",            # Task (C#/.NET Task framework — collides with English noun)
+    "cost management", # Cost Management (Azure CLOUD_SERVICE — but also a
+                       # generic responsibility area like "FinOps cost
+                       # management"; multi-word stop-list entry).
+    # Defense-in-depth for soft-nature words. These are filtered out at the
+    # repository layer (get_alias_lookup_set), but listing them here keeps
+    # the validator safe when alias_lookup is constructed by callers that
+    # bypass that filter — tests, fresh-DB bootstrap, ad-hoc scripts.
+    "automation",
+    "alerting",
+    "logging",
+    "monitoring",
+    "messaging",
+    "caching",
+    "tracing",
+    "indexing",
+    "queries",
+})
+
+
 def no_skills_in_scope(
     charter: CharterOutput,
     alias_lookup: set[str],
@@ -97,10 +145,22 @@ def no_skills_in_scope(
     for whole-token or whole-phrase hits in each scope string. Empty
     ``alias_lookup`` (fresh DB, no skills loaded yet) is a no-op.
 
-    Aliases that overlap with the *role's own name* are exempt — for an
-    "Azure Cloud Engineer", the word "azure" in the definition is the
-    role's identity, not a skill leak. We strip role-name tokens (and
-    the full role name) from the alias set before scanning.
+    Three exemptions stack on top of the raw alias set:
+
+    1. **Role-name tokens.** For "Azure Cloud Engineer" the word "azure" in
+       the definition is the role's identity, not a skill leak. Strip
+       role-name tokens (and the full role name) from the alias set.
+
+    2. **Generic-noun stop-list** (``_GENERIC_NOUN_STOPLIST``). Some catalog
+       skill names are everyday English nouns ("notifications", "move",
+       "automation"). These produced ~8/23 false positives in the first
+       prod cohort; the stop-list pre-emptively drops them.
+
+    3. **Per-task owner tokens.** For ``out_of_scope[i].task`` only,
+       aliases that are tokens of the same item's ``owned_by`` field are
+       exempt — a charter that says "Operate Azure infrastructure"
+       owned_by "Azure Cloud Engineer" is naming the boundary, not
+       leaking a tool.
     """
     if not alias_lookup:
         return []
@@ -110,17 +170,22 @@ def no_skills_in_scope(
         a for a in alias_lookup
         if a
         and a != role_name_lower
+        and a not in _GENERIC_NOUN_STOPLIST
         and (" " in a or a not in role_name_tokens)
     }
     if not effective_aliases:
         return []
     out: list[dict] = []
-    for location, text in _scope_strings(charter):
+    for location, text, owner_tokens in _scope_strings(charter):
         if not text:
             continue
         tokens = set(_tokenize(text))
         lower_text = " " + text.lower() + " "
         for alias in effective_aliases:
+            # Per-task owner-token exemption (only out_of_scope items have
+            # non-empty owner_tokens).
+            if alias in owner_tokens:
+                continue
             if " " in alias:
                 # Multi-word: substring check with surrounding whitespace
                 # to keep "node js" from matching "Node.js" but allow real
