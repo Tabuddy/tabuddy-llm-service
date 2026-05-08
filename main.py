@@ -39,8 +39,16 @@ from reverse_planner_llm import AzureReversePlannerLLM
 from skill_library_repository import SkillLibraryRepository
 from jd_pipeline_run_repository import JdPipelineRunRepository
 from skill_library_v2.agents.planner import PlannerAgent
+from new_skill_orchestrator import (
+    NewSkillMetaV3,
+    enrich_new_skill,
+    fetch_candidate_skills_pool_skill_library,
+    fetch_dimensions_catalog_skill_library,
+    find_dimensions_by_identity_skill_library,
+)
 from cost_tracker import CostAccumulator
 from pathlib import Path
+import json
 import tempfile
 import time
 from datetime import datetime
@@ -177,15 +185,13 @@ class JdRoleHint(BaseModel):
     rationale: str | None = None
 
 
+class FinalSkillItem(BaseModel):
+    skill_name: str
+    is_primary: bool
+
+
 class JDSkillPipelineResponse(BaseModel):
-    initial_skills: list[str]
-    unknown_words: list[str]
-    filtered_unknown_words: list[str]
-    llm_skills: list[str]
-    llm_non_skills: list[str]
-    final_skills: list[str]
-    final_non_skills: list[str]
-    jd_role_hint: JdRoleHint | None = None
+    final_skills: list[FinalSkillItem] = Field(default_factory=list)
     run_id: str | None = None
 
 
@@ -193,6 +199,7 @@ class JDSkillPipelineResponse(BaseModel):
 class ExtractDetailsRequest(BaseModel):
     final_skills: list[str] = Field(default_factory=list)
     llm_skills: list[str] = Field(default_factory=list)
+    primary_skills: list[str] = Field(default_factory=list)
     jd_role_hint: JdRoleHint | None = None
     run_id: str | None = None
 
@@ -253,14 +260,6 @@ class AliasInfo(BaseModel):
     is_primary: bool | None = None
 
 
-class NewSkillMeta(BaseModel):
-    """LLM-inferred metadata for a skill not yet in the canonical library."""
-    category: str | None = None
-    sub_category: str | None = None
-    skill_nature: str | None = None
-    typical_lifespan: str | None = None
-
-
 class SkillDetail(BaseModel):
     """One entry per skill in final_skills.
 
@@ -280,7 +279,7 @@ class SkillDetail(BaseModel):
     new_alias_persisted: bool = False
     new_alias_text: str | None = None
     dimensions: list[DimensionDetail] = Field(default_factory=list)
-    new_skill_meta: NewSkillMeta | None = None
+    new_skill_meta: NewSkillMetaV3 | None = None
 
 
 class ChosenRole(BaseModel):
@@ -538,126 +537,117 @@ async def normalize_skills_endpoint(req: SkillsRequest):
     )
 
 
+async def _llm_extract_skills_with_tags(
+    jd_text: str,
+    cost_acc: "CostAccumulator | None" = None,
+) -> list[FinalSkillItem]:
+    """Send the full JD to the LLM and return skills with primary/secondary tags.
+
+    Each skill is tagged is_primary=True if it is a core/must-have requirement,
+    and is_primary=False if it is nice-to-have or supporting.
+    """
+    from llm_client import get_fast_client, FAST_MODEL
+
+    client = get_fast_client()
+    if client is None:
+        raise RuntimeError("LLM client unavailable — check AZURE_OPEN_AI_KEY")
+
+    system_prompt = (
+        "You are a precise technical skill extractor for job descriptions.\n"
+        "Extract only SPECIFIC, NAMED skills that belong to one of these categories:\n\n"
+        "  LANGUAGE      — e.g. Python, Java, TypeScript, JavaScript, SQL, Apex\n"
+        "  FRAMEWORK     — e.g. React, Spring Boot, Django, Next.js, Lightning (Salesforce)\n"
+        "  LIBRARY       — e.g. Redux, Pandas, NumPy, Hibernate, Lodash\n"
+        "  TOOL          — e.g. Git, Docker, Jenkins, Postman, Webpack, Salesforce CLI\n"
+        "  PLATFORM      — e.g. Salesforce, Kubernetes, AWS, Azure, GCP, Hadoop, Spark\n"
+        "  CLOUD_SERVICE — e.g. AWS Lambda, S3, RDS, Azure Blob, GCP BigQuery\n"
+        "  DATABASE      — e.g. MySQL, PostgreSQL, MongoDB, Redis, Cassandra\n"
+        "  METHODOLOGY   — e.g. Agile, Scrum, TDD, CI/CD, DevOps\n"
+        "  PROTOCOL      — e.g. REST, GraphQL, gRPC, WebSocket, OAuth2, SOQL, SOSL\n"
+        "  STANDARD      — e.g. OpenAPI, OWASP, WCAG, ISO 27001\n"
+        "  PATTERN       — e.g. Microservices, Event-Driven Architecture, CQRS, MVC\n"
+        "  PRACTICE      — e.g. Code Review, Pair Programming, A/B Testing\n"
+        "  CONCEPT       — e.g. Machine Learning, Distributed Systems (only when no specific tool fits)\n\n"
+        "STRICT REJECT RULES — never include these:\n"
+        "  1. Certifications: anything like 'Salesforce Certified X', 'AWS Certified X', 'PMP', etc.\n"
+        "  2. Vague soft skills or activities: Troubleshooting, Debugging, Architecture, Software Development,\n"
+        "     Change Management, Compliance, Governance, Vendor Management, Communication, Leadership\n"
+        "  3. Broad category words: 'databases', 'cloud platforms', 'server-side development',\n"
+        "     'back-end web development', 'Metadata repository', 'Deployments'\n"
+        "  4. Expanded names when the acronym IS the skill: use 'SOQL' not 'Salesforce Object Query Language',\n"
+        "     use 'SOSL' not 'Salesforce Object Search Language'\n\n"
+        "BAD examples (reject these):\n"
+        "  'Salesforce Object Query Language', 'Salesforce Certified Platform Developer I',\n"
+        "  'Troubleshooting', 'Debugging', 'Architecture', 'Software Development', 'Metadata repository'\n\n"
+        "GOOD examples (extract these):\n"
+        "  'Salesforce', 'Apex', 'Lightning', 'SOQL', 'SOSL', 'JavaScript', 'Git', 'Agile'\n\n"
+        "Additional rules:\n"
+        "  - Use the canonical short name (e.g. 'Node.js', 'PostgreSQL', 'AWS')\n"
+        "  - Each skill is a separate entry — do not group\n"
+        "  - is_primary=true for core/required, false for nice-to-have\n"
+        "  - Return valid JSON only: {\"skills\": [{\"skill_name\": \"...\", \"is_primary\": true/false}, ...]}"
+    )
+    prompt = f"Extract all specific technical skills from this job description:\n\n{jd_text}"
+    resp = await client.chat.completions.create(
+        model=FAST_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    if cost_acc is not None and resp.usage is not None:
+        cost_acc.add(FAST_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    raw = json.loads(resp.choices[0].message.content or "{}")
+    items = []
+    for s in raw.get("skills", []):
+        if isinstance(s, dict) and (s.get("skill_name") or "").strip():
+            items.append(FinalSkillItem(
+                skill_name=str(s["skill_name"]).strip(),
+                is_primary=bool(s.get("is_primary", False)),
+            ))
+    return items
+
+
 @app.post("/skills/extract-from-jd", response_model=JDSkillPipelineResponse)
 async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     jd_text = (req.jd_text or "").strip()
     if not jd_text:
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
-    stage1 = await asyncio.to_thread(process_jd, jd_text)
-    initial_skills_raw = _clean_strings(stage1.get("skills"))
-    unknown_words = _clean_strings(stage1.get("unknown_words"))
-
-    repo = NonSkillRepository()
-    filtered_unknown_words = await asyncio.to_thread(
-        repo.filter_non_skills, unknown_words
-    )
-
-    # ── Stage 2: LLM verification of ALL candidates with sentence context ────
-    # All candidates (DB-matched initial skills + spaCy unknowns) are verified
-    # together. Each word is paired with its JD sentence — no full JD is sent.
-    # This catches noise in initial_skills (e.g. "Job Level", "Form Routines")
-    # and context-dependent unknowns (e.g. "L1" as a support tier = non-skill).
+    # ── LLM-based skill extraction (full JD → primary/secondary tags) ─────────
+    # SkillNer / spaCy pipeline commented out — kept for reference:
+    # stage1 = await asyncio.to_thread(process_jd, jd_text)
+    # initial_skills_raw = _clean_strings(stage1.get("skills"))
+    # unknown_words = _clean_strings(stage1.get("unknown_words"))
+    # repo = NonSkillRepository()
+    # filtered_unknown_words = await asyncio.to_thread(repo.filter_non_skills, unknown_words)
+    # cost_acc = CostAccumulator()
+    # classifier = AzureUnknownWordClassifier()
+    # items_with_context = [{"word": w, "sentence": _extract_jd_sentence(jd_text, w)} for w in all_candidates]
+    # llm_result = await classifier.classify_with_context(items_with_context, role_hint_excerpt=jd_text[:600], accumulator=cost_acc)
     cost_acc = CostAccumulator()
-    initial_skills: list[str] = []
-    llm_skills: list[str] = []
-    llm_non_skills: list[str] = []
-    jd_role_hint: JdRoleHint | None = None
+    try:
+        final_skills = await _llm_extract_skills_with_tags(jd_text, cost_acc=cost_acc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM skill extraction failed: {exc}",
+        ) from exc
 
-    all_candidates = _dedupe_case_insensitive(initial_skills_raw + filtered_unknown_words)
-    if all_candidates:
-        classifier = AzureUnknownWordClassifier()
-        items_with_context = [
-            {"word": w, "sentence": _extract_jd_sentence(jd_text, w)}
-            for w in all_candidates
-        ]
-        # Short JD excerpt for role hint inference only (first 600 chars)
-        role_excerpt = jd_text[:600]
-        try:
-            llm_result = await classifier.classify_with_context(
-                items_with_context,
-                role_hint_excerpt=role_excerpt,
-                accumulator=cost_acc,
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Stage-2 LLM classification failed: {exc}",
-            ) from exc
+    cost_acc.log_summary("skills/extract-from-jd", logger)
 
-        verified_set = {w.lower() for w in _clean_strings(llm_result.get("skills"))}
-        non_skill_set = {w.lower() for w in _clean_strings(llm_result.get("non_skills"))}
+    response = JDSkillPipelineResponse(final_skills=final_skills)
 
-        # Split verified back: initial vs newly-discovered
-        initial_skills = [w for w in initial_skills_raw if w.lower() in verified_set]
-        llm_skills = [w for w in filtered_unknown_words if w.lower() in verified_set]
-
-        # Non-skills: only persist words from unknown_words (not DB canonical names)
-        unknown_lower = {w.lower() for w in filtered_unknown_words}
-        llm_non_skills = [
-            w for w in all_candidates
-            if w.lower() in non_skill_set and w.lower() in unknown_lower
-        ]
-
-        hint_raw = llm_result.get("jd_role_hint")
-        if isinstance(hint_raw, dict) and (hint_raw.get("display_name") or "").strip():
-            _arc = hint_raw.get("role_archetype")
-            _rat = hint_raw.get("rationale")
-            jd_role_hint = JdRoleHint(
-                display_name=str(hint_raw["display_name"]).strip(),
-                slug=str(hint_raw.get("slug") or "").strip(),
-                role_archetype=(str(_arc).strip() if _arc is not None else "") or None,
-                rationale=(str(_rat).strip() if _rat is not None else "") or None,
-            )
-
-        # Guardrail: deployments is an activity-domain skill and must never be
-        # persisted as non-skill.
-        if "deployments" in {w.lower() for w in filtered_unknown_words}:
-            llm_non_skills = [w for w in llm_non_skills if w.lower() != "deployments"]
-            if "deployments" not in {w.lower() for w in llm_skills}:
-                llm_skills.append("deployments")
-
-        if llm_non_skills:
-            persisted_non_skills = await asyncio.to_thread(
-                repo.add_non_skills, llm_non_skills
-            )
-        else:
-            persisted_non_skills = []
-    else:
-        initial_skills = initial_skills_raw
-        persisted_non_skills = []
-
-    final_skills = _dedupe_case_insensitive(initial_skills + llm_skills)
-    final_non_skills = _dedupe_case_insensitive(llm_non_skills)
-
-    # cost_acc.log_summary("skills/extract-from-jd", logger)
-    response = JDSkillPipelineResponse(
-        initial_skills=initial_skills,
-        unknown_words=unknown_words,
-        filtered_unknown_words=filtered_unknown_words,
-        llm_skills=llm_skills,
-        llm_non_skills=llm_non_skills,
-        final_skills=final_skills,
-        final_non_skills=final_non_skills,
-        jd_role_hint=jd_role_hint,
-    )
-
-    # ── History persistence───────────────────────────────────
+    # ── History persistence ───────────────────────────────────────────────────
     history_repo = JdPipelineRunRepository()
     run_id = await asyncio.to_thread(
         history_repo.start_run,
         jd_text=jd_text,
         api1_response=response,
-        jd_role_hint_display=(jd_role_hint.display_name if jd_role_hint else None),
+        jd_role_hint_display=None,
     )
-    if run_id and persisted_non_skills:
-        artifact_items = [
-            {"kind": "non_skill_added", "artifact_text": w}
-            for w in persisted_non_skills
-        ]
-        await asyncio.to_thread(
-            history_repo.record_artifacts_bulk, run_id, artifact_items
-        )
     response.run_id = run_id
     return response
 
@@ -723,6 +713,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     final_skills = _dedupe_case_insensitive(_clean_strings(req.final_skills))
     llm_skills = _dedupe_case_insensitive(_clean_strings(req.llm_skills))
     llm_skills_lower = {s.lower() for s in llm_skills}
+    primary_skills_lower = {s.strip().lower() for s in (req.primary_skills or []) if s.strip()}
 
     cost_acc = CostAccumulator()
     repo = SkillLibraryRepository()
@@ -809,23 +800,34 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 alias_persisted=True,
             ))
 
+    # TODO: REMOVE COMMENT AFTER TESTING — persist new synonyms for matched LLM terms into skill_aliases.
+    # new_aliases_persisted = 0
+    # persisted_alias_pairs: list[tuple[int, str]] = []
+    # if aliases_to_insert:
+    #     try:
+    #         new_aliases_persisted = await asyncio.to_thread(
+    #             repo.add_aliases, aliases_to_insert
+    #         )
+    #         persisted_alias_pairs = list(aliases_to_insert)
+    #     except Exception as exc:
+    #         logger.exception("Persisting aliases failed: %s", exc)
+    #         for am in alias_matches:
+    #             if am.alias_persisted:
+    #                 am.alias_persisted = False
+    #                 am.alias_persist_skipped_reason = f"db error: {exc}"
+    #         new_alias_per_final.clear()
+    #         new_aliases_persisted = 0
+    #         persisted_alias_pairs = []
     new_aliases_persisted = 0
     persisted_alias_pairs: list[tuple[int, str]] = []
-    if aliases_to_insert:
-        try:
-            new_aliases_persisted = await asyncio.to_thread(
-                repo.add_aliases, aliases_to_insert
+    for am in alias_matches:
+        if am.alias_persisted:
+            am.alias_persisted = False
+            am.alias_persist_skipped_reason = (
+                "TODO: REMOVE AFTER TESTING — alias DB write disabled"
             )
-            persisted_alias_pairs = list(aliases_to_insert)
-        except Exception as exc:
-            logger.exception("Persisting aliases failed: %s", exc)
-            for am in alias_matches:
-                if am.alias_persisted:
-                    am.alias_persisted = False
-                    am.alias_persist_skipped_reason = f"db error: {exc}"
-            new_alias_per_final.clear()
-            new_aliases_persisted = 0
-            persisted_alias_pairs = []
+    # Keep skills_detail/UI consistent with skipped DB persist.
+    new_alias_per_final.clear()
 
     # ── Stage 2: pull DB enrichment for every matched skill ─────────────────
     matched_skill_ids = sorted({
@@ -849,12 +851,11 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 repo.fetch_roles_for_dimensions, all_dim_ids
             )
 
-    # ── Stage 3: reverse planner for unmatched llm_skills ───────────────────
-    # Pass the existing dimension catalogue so the LLM reuses canonical slugs
-    # instead of minting near-synonyms. Run skill enrichment concurrently.
-    dimension_catalogue: list[dict] = []
-    dimensions_by_skill: dict[str, list[dict]] = {}
-    skill_enrichment: dict[str, dict] = {}
+    # ── Stage 3: v3 per-skill orchestrator for unmatched llm_skills ─────────
+    # Each unknown skill goes through the full v3 stack (dim-gen -> sim/recon
+    # -> type -> place -> contain -> enrich). Result is a v3-shaped
+    # NewSkillMetaV3 payload kept on SkillDetail.new_skill_meta.
+    new_skill_meta_by_skill: dict[str, NewSkillMetaV3] = {}
 
     # Drop plain English dictionary words before paying for LLM calls.
     # Real tech skills always have at least one of: uppercase, digit, hyphen,
@@ -873,52 +874,217 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
     unmatched_llm_skills = [s for s in unmatched_llm_skills if _looks_like_skill(s)]
 
+    role_hint_text = ""
+    if req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
+        role_hint_text = req.jd_role_hint.display_name.strip()
+
     if unmatched_llm_skills:
         try:
             dimension_catalogue = await asyncio.to_thread(
-                repo.fetch_dimension_catalogue
+                fetch_dimensions_catalog_skill_library,
+                limit=400,
             )
-            if len(dimension_catalogue) > 40:
-                step = len(dimension_catalogue) // 40
-                dimension_catalogue = dimension_catalogue[::step][:40]
         except Exception as exc:
             logger.warning(
-                "fetch_dimension_catalogue failed; LLM will run ungrounded: %s",
+                "skill-library dimensions lookup failed; v3 dim-gen will run without prior catalog: %s",
                 exc,
             )
             dimension_catalogue = []
+        # Cap and normalize skill-library dimension rows so the v3 prompt +
+        # overlap checker have the keys they expect
+        # (tentative_id, name, description).
+        if len(dimension_catalogue) > 40:
+            step = len(dimension_catalogue) // 40
+            dimension_catalogue = dimension_catalogue[::step][:40]
+        existing_dims_v3: list[dict] = []
+        for d in dimension_catalogue:
+            dim_id = str(d.get("tentative_id") or d.get("slug") or "").strip()
+            name = str(d.get("name") or d.get("display_name") or "").strip()
+            desc = str(d.get("description") or d.get("rationale") or "").strip()
+            if not dim_id or not name:
+                continue
+            existing_dims_v3.append({
+                "tentative_id": dim_id,
+                "name": name,
+                "description": desc,
+                "role_display": str(d.get("role_display") or "").strip(),
+            })
 
+        # Pull a small slice of canonical skills as the containment candidate
+        # pool. 200 keeps the embedder workload tiny while still giving the
+        # Stage 6 LLM useful similarity hints using embeddings.
+        candidate_skills_pool: list[dict] = []
         try:
-            dimensions_by_skill, skill_enrichment = await planner.infer_dimensions_and_enrich(
-                unmatched_llm_skills,
-                dimension_catalogue=dimension_catalogue,
+            candidate_skills_pool = await asyncio.to_thread(
+                fetch_candidate_skills_pool_skill_library,
+                limit=200,
             )
         except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Reverse planner LLM (infer_dimensions_and_enrich) failed: {exc}",
-            ) from exc
+            logger.warning(
+                "skill-library canonical skills pool lookup failed; pool will be empty: %s",
+                exc,
+            )
+            candidate_skills_pool = []
 
-    # Collect every (skill, llm_dim) pair for DB lookup and possible LLM role.
+        async def _enrich_one(skill_name: str) -> tuple[str, NewSkillMetaV3 | None]:
+            try:
+                meta = await enrich_new_skill(
+                    skill_name=skill_name,
+                    role_hint=role_hint_text,
+                    existing_dims=existing_dims_v3,
+                    candidate_skills_pool=candidate_skills_pool,
+                    accumulator=cost_acc,
+                )
+                return skill_name, meta
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "v3 new-skill orchestrator failed for %r: %s",
+                    skill_name, exc,
+                )
+                return skill_name, None
+
+        # Run per-skill orchestrators concurrently. Each orchestrator already
+        # caps its own internal LLM calls; the JD pipeline rarely surfaces
+        # more than a handful of unknown skills so we don't add a semaphore.
+        results = await asyncio.gather(
+            *[_enrich_one(s) for s in unmatched_llm_skills],
+            return_exceptions=False,
+        )
+        for skill_name, meta in results:
+            if meta is not None:
+                new_skill_meta_by_skill[skill_name] = meta
+
+    # Backfill role labels on Stage 3 logs from DB dimension-role links.
+    # Some logs can miss b_role/a_role depending on upstream payload shape.
+    if new_skill_meta_by_skill:
+        dim_slug_refs: set[str] = set()
+        for meta in new_skill_meta_by_skill.values():
+            for dim in (meta.locked_dimensions or []):
+                for ov in (dim.overlap_flags or []):
+                    for ref in (ov.with_dim_id, ov.with_dim_name):
+                        s = str(ref or "").strip()
+                        if s:
+                            dim_slug_refs.add(s)
+            for row in (meta.keep_log or []):
+                for key in ("a_dim_id", "b_dim_id"):
+                    slug = str(row.get(key) or "").strip()
+                    if slug:
+                        dim_slug_refs.add(slug)
+            for row in (meta.merge_log or []):
+                for key in ("a_dim_id", "b_dim_id"):
+                    slug = str(row.get(key) or "").strip()
+                    if slug:
+                        dim_slug_refs.add(slug)
+                for slug in (row.get("merged_from") or []):
+                    s = str(slug or "").strip()
+                    if s:
+                        dim_slug_refs.add(s)
+            for row in (meta.split_log or []):
+                for key in ("a_dim_id", "b_dim_id"):
+                    slug = str(row.get(key) or "").strip()
+                    if slug:
+                        dim_slug_refs.add(slug)
+                for slug in (row.get("split_from") or []):
+                    s = str(slug or "").strip()
+                    if s:
+                        dim_slug_refs.add(s)
+
+        dim_rows_by_key: dict[str, dict] = {}
+        roles_by_dim_id_for_logs: dict[int, list[dict]] = {}
+        if dim_slug_refs:
+            dim_rows_by_key = await asyncio.to_thread(
+                repo.find_dimensions_by_names,
+                [],
+                list(dim_slug_refs),
+            )
+            dim_ids_for_logs = sorted({
+                int(v.get("id"))
+                for v in dim_rows_by_key.values()
+                if v.get("id") is not None
+            })
+            if dim_ids_for_logs:
+                roles_by_dim_id_for_logs = await asyncio.to_thread(
+                    repo.fetch_roles_for_dimensions,
+                    dim_ids_for_logs,
+                )
+
+        def _roles_for_dim_slug(dim_slug: str) -> str:
+            key = str(dim_slug or "").strip().lower()
+            if not key:
+                return ""
+            dim_row = dim_rows_by_key.get(key)
+            if not dim_row:
+                return ""
+            dim_id = dim_row.get("id")
+            if dim_id is None:
+                return ""
+            role_rows = roles_by_dim_id_for_logs.get(int(dim_id), [])
+            if not role_rows:
+                return ""
+            names = [str(r.get("display_name") or "").strip() for r in role_rows]
+            names = [n for n in names if n]
+            return ", ".join(names)
+
+        for meta in new_skill_meta_by_skill.values():
+            for row in (meta.keep_log or []):
+                if not str(row.get("a_role") or "").strip():
+                    row["a_role"] = _roles_for_dim_slug(str(row.get("a_dim_id") or ""))
+                if not str(row.get("b_role") or "").strip():
+                    row["b_role"] = _roles_for_dim_slug(str(row.get("b_dim_id") or ""))
+            for row in (meta.merge_log or []):
+                if not str(row.get("a_role") or "").strip():
+                    row["a_role"] = _roles_for_dim_slug(str(row.get("a_dim_id") or ""))
+                if not str(row.get("b_role") or "").strip():
+                    row["b_role"] = _roles_for_dim_slug(str(row.get("b_dim_id") or ""))
+            for row in (meta.split_log or []):
+                if not str(row.get("a_role") or "").strip():
+                    row["a_role"] = _roles_for_dim_slug(str(row.get("a_dim_id") or ""))
+                if not str(row.get("b_role") or "").strip():
+                    row["b_role"] = _roles_for_dim_slug(str(row.get("b_dim_id") or ""))
+            # Fallback path used by UI when keep_log is empty:
+            # enrich overlap flags with DB-attached role for referenced dims.
+            for dim in (meta.locked_dimensions or []):
+                for ov in (dim.overlap_flags or []):
+                    if str(ov.with_role or "").strip():
+                        continue
+                    ref_slug = str(ov.with_dim_id or "").strip()
+                    if not ref_slug:
+                        ref_slug = str(ov.with_dim_name or "").strip()
+                    resolved = _roles_for_dim_slug(ref_slug)
+                    if resolved:
+                        ov.with_role = resolved
+
+    # Build (skill, llm_dim) pairs from each unknown skill's v3 locked dims.
+    # The DimensionSummary uses tentative_id as the slug so downstream API 3
+    # treats it as an LLM-proposed dimension (no DB id).
     llm_pairs: list[tuple[str, dict]] = []
-    all_display_names: list[str] = []
-    all_slugs: list[str] = []
-    for skill, dims in dimensions_by_skill.items():
-        for d in dims or []:
-            llm_pairs.append((skill, d))
-            if d.get("display_name"):
-                all_display_names.append(d["display_name"])
-            if d.get("slug"):
-                all_slugs.append(d["slug"])
+    for skill, meta in new_skill_meta_by_skill.items():
+        for cd in meta.locked_dimensions:
+            llm_pairs.append((skill, {
+                "slug": cd.tentative_id,
+                "display_name": cd.name,
+                "rationale": cd.description,
+                "difficulty_hint": None,
+            }))
 
+    # Even though dims came from v3 (locked), the legacy catalog may already
+    # have one of these as a real DB row. Probing find_dimensions_by_names
+    # lets us promote those entries from source="llm" to source="db" so the
+    # API 3 link path can attach to the existing dim instead of proposing a
+    # duplicate.
+    all_display_names: list[str] = [
+        d.get("display_name") for (_, d) in llm_pairs if d.get("display_name")
+    ]
+    all_slugs: list[str] = [
+        d.get("slug") for (_, d) in llm_pairs if d.get("slug")
+    ]
     db_dim_map_for_llm: dict[str, dict] = {}
     if llm_pairs:
         db_dim_map_for_llm = await asyncio.to_thread(
-            repo.find_dimensions_by_names,
+            find_dimensions_by_identity_skill_library,
             all_display_names,
             all_slugs,
         )
-        # Make sure we have roles for any newly-matched DB dims too.
         new_dim_ids = sorted({
             int(rec["id"]) for rec in db_dim_map_for_llm.values()
             if rec.get("id") is not None and int(rec["id"]) not in roles_by_dim_id
@@ -929,9 +1095,8 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             )
             roles_by_dim_id.update(extra_roles)
 
-    pending_llm_roles: list[tuple[int, str, dict]] = []
+    # Build (skill, llm_dim, db_dim) tuples for each unknown skill.
     pending_llm_pair_meta: list[tuple[str, dict, dict | None]] = []
-
     for skill, d in llm_pairs:
         name_key = (d.get("display_name") or "").lower()
         slug_key = (d.get("slug") or "").lower()
@@ -940,39 +1105,12 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             or db_dim_map_for_llm.get(slug_key)
         )
         pending_llm_pair_meta.append((skill, d, db_row))
-        idx = len(pending_llm_pair_meta) - 1
 
-        # Skip LLM role inference when the dimension is in the DB and already
-        # has roles linked to it — the picker uses roles_from_db for those.
-        db_dim_id = int(db_row["id"]) if db_row and db_row.get("id") is not None else None
-        if db_dim_id is not None and roles_by_dim_id.get(db_dim_id):
-            continue
-
-        # Only send what the LLM needs: display_name + rationale (+ slug for identity).
-        dim_for_infer: dict = {
-            "display_name": d.get("display_name") or "",
-            "slug": d.get("slug") or "",
-            "rationale": d.get("rationale") or "",
-        }
-        if db_row is not None:
-            if db_row.get("display_name"):
-                dim_for_infer["display_name"] = str(db_row["display_name"])
-            if db_row.get("slug"):
-                dim_for_infer["slug"] = str(db_row["slug"])
-            rat = db_row.get("rationale") or dim_for_infer.get("rationale")
-            if rat:
-                dim_for_infer["rationale"] = str(rat)
-        pending_llm_roles.append((idx, skill, dim_for_infer))
-
-    # ── Role inference: ONE batched LLM call for unmatched LLM skill pairs only ─
-    # DB-matched skills already have roles_from_db populated from Stage 2 —
-    # no LLM inference needed for them.
+    # The v3 orchestrator does its own placement / containment per skill,
+    # so per-pair LLM role inference is no longer needed. Roles for the
+    # JD will come from DB-matched dims (Stage 2 above) and from the
+    # role-picker prompt at Stage 6 below.
     llm_roles_by_idx: dict[int, dict | None] = {}
-    llm_batch_pairs = [(s, d) for (_, s, d) in pending_llm_roles]
-    if llm_batch_pairs:
-        batch_roles = await planner.infer_roles_for_pairs(llm_batch_pairs)
-        for list_idx, (idx, skill, dim) in enumerate(pending_llm_roles):
-            llm_roles_by_idx[idx] = batch_roles[list_idx]
 
     # ── Stage 4: aggregate dimensions per skill + candidate roles ───────────
     dimension_details: list[DimensionDetail] = []
@@ -1110,7 +1248,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             continue
 
         if was_llm:
-            enrich = skill_enrichment.get(term)
+            v3_meta = new_skill_meta_by_skill.get(term)
             skills_detail.append(SkillDetail(
                 input_skill=term,
                 source_tag="llm",
@@ -1121,7 +1259,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 new_alias_persisted=False,
                 new_alias_text=None,
                 dimensions=llm_dim_details_by_skill.get(term, []),
-                new_skill_meta=NewSkillMeta(**enrich) if enrich else None,
+                new_skill_meta=v3_meta,
             ))
         else:
             # initial_skills term that didn't canonicalize — surface it but
@@ -1216,7 +1354,10 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             }
 
         context = {
-            "final_skills": final_skills,
+            "final_skills": [
+                {"skill_name": s, "is_primary": s.lower() in primary_skills_lower}
+                for s in final_skills
+            ],
             "jd_role_hint": jd_role_hint_ctx,
             "dimension_role_map": dimension_role_map,
         }
@@ -1267,7 +1408,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 rationale=c.rationale,
             )
 
-    # cost_acc.log_summary("skills/extract-details", logger)
+    cost_acc.log_summary("skills/extract-details", logger)
     response = ExtractDetailsResponse(
         input_final_skills=final_skills,
         input_llm_skills=llm_skills,
@@ -1298,6 +1439,53 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 history_repo.record_artifacts_bulk, req.run_id, artifact_items
             )
 
+    # Post-success reconciliation diagnostics. Helps verify whether B-role data is actually present
+    # in API 2 payloads sent to the frontend.
+    keep_total = keep_missing_b = 0
+    merge_total = merge_missing_b = 0
+    split_total = split_missing_b = 0
+    missing_b_dim_samples: list[str] = []
+    for sd in response.skills_detail:
+        meta = sd.new_skill_meta
+        if not meta:
+            continue
+        for row in (meta.keep_log or []):
+            keep_total += 1
+            b_role = str(row.get("b_role") or "").strip()
+            if not b_role:
+                keep_missing_b += 1
+                b_dim = str(row.get("b_dim_id") or "").strip()
+                if b_dim and len(missing_b_dim_samples) < 12:
+                    missing_b_dim_samples.append(b_dim)
+        for row in (meta.merge_log or []):
+            merge_total += 1
+            b_role = str(row.get("b_role") or "").strip()
+            if not b_role:
+                merge_missing_b += 1
+                b_dim = str(row.get("b_dim_id") or "").strip()
+                if b_dim and len(missing_b_dim_samples) < 12:
+                    missing_b_dim_samples.append(b_dim)
+        for row in (meta.split_log or []):
+            split_total += 1
+            b_role = str(row.get("b_role") or "").strip()
+            if not b_role:
+                split_missing_b += 1
+                b_dim = str(row.get("b_dim_id") or "").strip()
+                if b_dim and len(missing_b_dim_samples) < 12:
+                    missing_b_dim_samples.append(b_dim)
+
+    logger.info(
+        "API2_SUCCESS_ROLE_COVERAGE run_id=%s keep=%d missing_b=%d merge=%d missing_b=%d split=%d missing_b=%d missing_b_dims=%s",
+        req.run_id,
+        keep_total,
+        keep_missing_b,
+        merge_total,
+        merge_missing_b,
+        split_total,
+        split_missing_b,
+        sorted(set(missing_b_dim_samples)),
+    )
+
     return response
 
 
@@ -1309,6 +1497,10 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     rev_planner = AzureReversePlannerLLM(accumulator=cost_acc)
     history_repo = JdPipelineRunRepository() if req.run_id else None
     artifacts: list[dict[str, Any]] = []
+
+    # TODO: REMOVE COMMENT AFTER TESTING — API 3 skill-library INSERT/UPSERT (roles,
+    # dimensions, links). Set ``True`` to re-enable catalogue persistence below.
+    _API3_writes_enabled = False
 
     # 1) Build final input skills with in_db/new tags.
     final_input_skills = [
@@ -1360,42 +1552,45 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
         if should_create:
             try:
-                role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
-                role_vec = await asyncio.to_thread(_embed_text, role_embed_text.strip())
-                similar_roles = await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
-                role_reused = False
-                if similar_roles:
-                    dedup = await rev_planner.confirm_or_reuse_entity(
-                        "role",
-                        {"display_name": chosen.display_name, "role_archetype": chosen.role_archetype},
-                        similar_roles,
-                    )
-                    if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
-                        resolved_role = await asyncio.to_thread(
-                            repo.find_role_by_identity, role_id=dedup["existing_id"]
+                if not _API3_writes_enabled:
+                    pass
+                else:
+                    role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
+                    role_vec = await asyncio.to_thread(_embed_text, role_embed_text.strip())
+                    similar_roles = await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                    role_reused = False
+                    if similar_roles:
+                        dedup = await rev_planner.confirm_or_reuse_entity(
+                            "role",
+                            {"display_name": chosen.display_name, "role_archetype": chosen.role_archetype},
+                            similar_roles,
                         )
-                        role_reused = True
-                if resolved_role is None:
-                    resolved_role = await asyncio.to_thread(
-                        repo.create_role,
-                        slug=chosen.slug,
-                        display_name=chosen.display_name,
-                        role_archetype=chosen.role_archetype,
-                        source=chosen.source or "llm",
-                        name_embedding=role_vec,
-                    )
-                    if (
-                        resolved_role is not None
-                        and resolved_role.get("id") is not None
-                        and not role_reused
-                    ):
-                        artifacts.append({
-                            "kind": "role_created",
-                            "artifact_id": int(resolved_role["id"]),
-                            "artifact_text": str(
-                                resolved_role.get("display_name") or chosen.display_name
-                            ),
-                        })
+                        if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
+                            resolved_role = await asyncio.to_thread(
+                                repo.find_role_by_identity, role_id=dedup["existing_id"]
+                            )
+                            role_reused = True
+                    if resolved_role is None:
+                        resolved_role = await asyncio.to_thread(
+                            repo.create_role,
+                            slug=chosen.slug,
+                            display_name=chosen.display_name,
+                            role_archetype=chosen.role_archetype,
+                            source=chosen.source or "llm",
+                            name_embedding=role_vec,
+                        )
+                        if (
+                            resolved_role is not None
+                            and resolved_role.get("id") is not None
+                            and not role_reused
+                        ):
+                            artifacts.append({
+                                "kind": "role_created",
+                                "artifact_id": int(resolved_role["id"]),
+                                "artifact_text": str(
+                                    resolved_role.get("display_name") or chosen.display_name
+                                ),
+                            })
             except Exception as exc:
                 logger.warning("create_role failed for chosen role %r: %s", chosen.slug, exc)
 
@@ -1427,8 +1622,12 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         s.lower(): sid for s, sid in skill_id_by_input.items()
     }
 
-    # 3.5) Create canonical_skills rows for new LLM-discovered skills that carry
-    # enrichment metadata (category, skill_nature, typical_lifespan from API 2).
+    # 3.5) New (canonical-miss) LLM skills: The v3
+    # orchestrator already produced a NewSkillMetaV3 in API 2 with type,
+    # placement, containment, enrichment + derived legacy fields. We just
+    # emit a `canonical_skill_proposed` artifact carrying a compact snapshot
+    # for the history page; the full v3 payload is already in api2_response.
+    # TODO:— persist these to the dedicated skill-library DB schema.
     new_skill_metas = {
         sd.input_skill: sd.new_skill_meta
         for sd in req.skills_detail
@@ -1437,59 +1636,26 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         and sd.input_skill.lower() not in skill_id_by_input_lower
     }
     for skill_name, meta in new_skill_metas.items():
-        if not meta.category or not meta.skill_nature or not meta.typical_lifespan:
-            logger.warning(
-                "Skipping new skill %r — incomplete enrichment metadata", skill_name
+        derived = meta.derived
+        typed = meta.typed
+        if derived is not None:
+            artifact_text = (
+                f"{skill_name} | type={derived.category} subtype={derived.sub_category} "
+                f"nature={derived.skill_nature} lifespan={derived.typical_lifespan}"
             )
-            continue
-        try:
-            skill_vec = await asyncio.to_thread(_embed_text, skill_name)
-            similar_skills = await asyncio.to_thread(repo.find_similar_skills_by_embedding, skill_vec)
-            if similar_skills:
-                dedup = await rev_planner.confirm_or_reuse_entity(
-                    "skill",
-                    {"display_name": skill_name, "category": meta.category, "skill_nature": meta.skill_nature},
-                    similar_skills,
-                )
-                if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
-                    reused_id = dedup["existing_id"]
-                    skill_id_by_input[skill_name] = reused_id
-                    skill_id_by_input_lower[skill_name.lower()] = reused_id
-                    continue
-
-            cat_row = await asyncio.to_thread(
-                repo.find_or_create_category,
-                display_name=meta.category,
-            )
-            cat_id = int(cat_row["id"])
-            sub_cat_id: int | None = None
-            if meta.sub_category:
-                sub_cat_row = await asyncio.to_thread(
-                    repo.find_or_create_sub_category,
-                    category_id=cat_id,
-                    display_name=meta.sub_category,
-                )
-                sub_cat_id = int(sub_cat_row["id"])
-            skill_row = await asyncio.to_thread(
-                repo.create_canonical_skill,
-                display_name=skill_name,
-                category_id=cat_id,
-                sub_category_id=sub_cat_id,
-                skill_nature=meta.skill_nature,
-                typical_lifespan=meta.typical_lifespan,
-                name_embedding=skill_vec,
-            )
-            new_skill_id = int(skill_row["id"])
-            skill_id_by_input[skill_name] = new_skill_id
-            skill_id_by_input_lower[skill_name.lower()] = new_skill_id
-            persistence.new_skills_created += 1
-            artifacts.append({
-                "kind": "canonical_skill_added",
-                "artifact_id": new_skill_id,
-                "artifact_text": skill_name,
-            })
-        except Exception as exc:
-            logger.warning("Failed to create canonical skill %r: %s", skill_name, exc)
+        elif typed is not None:
+            artifact_text = f"{skill_name} | type={typed.type} subtype={typed.subtype}"
+        else:
+            artifact_text = skill_name
+        # `artifact_text` is bounded by jd_run_artifacts.artifact_text TEXT
+        # (no length cap in DDL) but we cap to keep history rows compact —
+        # full payload lives on jd_pipeline_runs.api2_response.
+        if len(artifact_text) > 500:
+            artifact_text = artifact_text[:497] + "..."
+        artifacts.append({
+            "kind": "canonical_skill_proposed",
+            "artifact_text": artifact_text,
+        })
 
     # 4) Persist per (skill, dimension):
     # - always attempt skill-dimension for DB-backed skills
@@ -1520,7 +1686,40 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
 
         if skill_id is None:
-            item.skipped_reason = "skill_not_in_db"
+            #  we no longer auto-create canonical_skills here. Emit proposed-artifact rows
+            # so the history page still shows what the v3 stack inferred
+            # for this (skill, dim) pair, but skip every legacy INSERT.
+            item.skipped_reason = "skill_not_in_db_v3_proposed"
+            persistence.skipped += 1
+            if dim_id is None:
+                artifacts.append({
+                    "kind": "dimension_proposed",
+                    "artifact_text": (dim_name or "")[:500],
+                })
+            artifacts.append({
+                "kind": "dimension_skill_link_proposed",
+                "artifact_text": f"{skill_name} \u2194 {dim_name}"[:500],
+            })
+            if (
+                matched
+                and chosen_role_out is not None
+                and chosen_role_out.id is not None
+            ):
+                # Same as above — when the chosen role IS in the DB but the
+                # dim isn't, emit the role-dim link as a proposal too.
+                artifacts.append({
+                    "kind": "role_dimension_link_proposed",
+                    "artifact_text": (
+                        f"{chosen_role_out.display_name} \u2194 {dim_name}"
+                    )[:500],
+                })
+            persistence.items.append(item)
+            continue
+
+        if not _API3_writes_enabled:
+            item.skipped_reason = (
+                "TODO: REMOVE AFTER TESTING — api3_writes_enabled=False (writes disabled)"
+            )
             persistence.skipped += 1
             persistence.items.append(item)
             continue
@@ -1571,7 +1770,6 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     "artifact_id": dim_id,
                     "artifact_text": f"{skill_name} \u2194 {dim_name}",
                 })
-            # False here usually means mapping already existed; treat as persisted.
             item.skill_dimension_saved = True
 
             if (
@@ -1593,7 +1791,6 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                             f"{chosen_role_out.display_name} \u2194 {dim_name}"
                         ),
                     })
-                # False here usually means mapping already existed; still persisted.
                 item.role_dimension_saved = True
             elif matched and (chosen_role_out is None or chosen_role_out.id is None):
                 item.skipped_reason = "chosen_role_not_resolved_in_db"
@@ -1630,7 +1827,11 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             }
 
             # Persist planner-generated dimensions for the chosen role if we have DB role id.
-            if chosen_role_out is not None and chosen_role_out.id is not None:
+            if (
+                chosen_role_out is not None
+                and chosen_role_out.id is not None
+                and _API3_writes_enabled
+            ):
                 planner_saved_role_dims = 0
                 planner_saved_dim_creates = 0
                 for d in plan.dimensions:
@@ -1692,7 +1893,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             logger.warning("planner generation failed for missing role=%r: %s", chosen.slug, exc)
             planner_output.payload = {"error": str(exc)}
 
-    # cost_acc.log_summary("skills/final-role-output", logger)
+    cost_acc.log_summary("skills/final-role-output", logger)
     response = FinalRoleOutputResponse(
         chosen_role=chosen_role_out,
         final_input_skills=final_input_skills,

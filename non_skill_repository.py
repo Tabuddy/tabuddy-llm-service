@@ -28,7 +28,7 @@ class NonSkillRepository:
         self.db_user = os.getenv("DB_USER", "")
         self.db_password = os.getenv("DB_PASSWORD", "")
 
-        self.schema = os.getenv("DB_SCHEMA", "dev")
+        self.schema = os.getenv("SKILL_LIBRARY_SCHEMA", "skill-library").strip()
         self.table = os.getenv("DB_NON_SKILLS_TABLE", "non_skills")
 
         if not self.database_url and not (

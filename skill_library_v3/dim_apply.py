@@ -142,6 +142,14 @@ def apply_decisions(
                     "merged_from": [a_id, b_id],
                     "into": merged_id,
                     "into_name": merged_dim["name"],
+                    "a_dim_id": a_id,
+                    "a_name": pair.get("a_name") or a.get("name") or "",
+                    "a_role": pair.get("a_role") or "",
+                    "b_dim_id": b_id,
+                    "b_name": pair.get("b_name") or b.get("name") or "",
+                    "b_role": pair.get("b_role") or "",
+                    "pair_kind": pair.get("kind") or "",
+                    "similarity": pair.get("similarity"),
                     "reasoning": decision.reasoning,
                 }
             )
@@ -171,6 +179,14 @@ def apply_decisions(
                     "split_from": [a_id, b_id],
                     "into": new_ids,
                     "into_names": new_names,
+                    "a_dim_id": a_id,
+                    "a_name": pair.get("a_name") or a.get("name") or "",
+                    "a_role": pair.get("a_role") or "",
+                    "b_dim_id": b_id,
+                    "b_name": pair.get("b_name") or b.get("name") or "",
+                    "b_role": pair.get("b_role") or "",
+                    "pair_kind": pair.get("kind") or "",
+                    "similarity": pair.get("similarity"),
                     "reasoning": decision.reasoning,
                 }
             )

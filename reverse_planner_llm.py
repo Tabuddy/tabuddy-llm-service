@@ -278,6 +278,9 @@ INPUTS (user payload)
 - candidates: role candidates from the pipeline. Each has {source, slug,
   display_name} and OPTIONALLY an "id" (DB-sourced when present).
 - context.final_skills: every skill the pipeline kept for this JD.
+  Each entry is {"skill_name": "...", "is_primary": true/false}.
+  is_primary=true means the skill is core/required for the role.
+  is_primary=false means nice-to-have or supporting.
 - context.jd_role_hint: OPTIONAL weak prior from the JD text:
   {display_name, slug}. Use as tie-breaker only.
 - context.dimension_role_map: one entry PER UNIQUE DIMENSION. Each entry:
@@ -292,23 +295,34 @@ INPUTS (user payload)
 TWO ALLOWED PATHS
 ==============================================================
 Path A — REUSE a DB candidate (preferred).
-  Pick the candidate with "id" set that best summarises the dimension_role_map.
+  Pick the candidate with "id" set that best summarises the primary skills.
   Set source_role_id to that candidate's id.
 
 Path B — INVENT a role not in the candidate list.
-  Use when no candidate cleanly fits. Pick a canonical name (e.g.
-  "DevOps Engineer", "Backend Engineer", "Platform Engineer", "SRE",
-  "Data Engineer", "ML Engineer"). Set source_role_id to null.
+  Use when no candidate cleanly fits the primary skills. Pick a precise,
+  specific canonical name (e.g. "Salesforce Developer", "DevOps Engineer",
+  "Backend Engineer", "Data Engineer", "ML Engineer").
+  Set source_role_id to null.
 
 ==============================================================
-DECISION HEURISTIC
+DECISION HEURISTIC — PRIMARY SKILLS DOMINATE
 ==============================================================
-Count, per DB candidate, how many dimensions include it in roles_from_db
-(weight by skills array length). Also tally llm_roles votes across dimensions.
-- ONE candidate covers >= 60% → Path A with that candidate.
-- Split evidence + a cleaner canonical umbrella exists → Path B.
-- Tie → prefer Path A for stable DB id.
-Use jd_role_hint only to break remaining ties.
+Step 1 — Identify the primary skills (is_primary=true). These define what
+  this role MUST do. The chosen role must be a natural job title for someone
+  whose core daily work involves ALL (or most) of those primary skills.
+
+Step 2 — Score candidates: for each candidate, count how many dimensions
+  linked to PRIMARY skills include it in roles_from_db or llm_roles.
+  Weight primary-skill dimensions 3× over secondary-skill dimensions.
+
+Step 3 — Pick:
+  - ONE candidate covers the primary skills well → Path A.
+  - No candidate fits the primary skills → Path B with a specific title
+    derived from the primary skills (e.g. if primary skills are Salesforce,
+    Apex, Lightning → "Salesforce Developer", not "Full Stack Developer").
+  - Tie → prefer Path A for stable DB id.
+
+Use jd_role_hint only to break remaining ties after Steps 1-3.
 
 ==============================================================
 OUTPUT — STRICT JSON only, no markdown fences
@@ -317,7 +331,7 @@ OUTPUT — STRICT JSON only, no markdown fences
   "display_name": "<Chosen Role Display Name>",
   "slug": "<kebab-case-of-display-name>",
   "role_archetype": "<short 1-2 sentence description>",
-  "rationale": "<one short sentence grounded in dimension_role_map>",
+  "rationale": "<one short sentence grounded in primary skills>",
   "source_role_id": <integer or null>
 }
 

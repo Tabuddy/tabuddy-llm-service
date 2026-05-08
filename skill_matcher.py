@@ -2,14 +2,62 @@ import os
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional
 
 import psycopg2
 import psycopg2.pool
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 logger = logging.getLogger(__name__)
+
+
+def _pg_quote_ident(ident: str) -> str:
+    """Emit a double-quoted Postgres identifier (hyphenated schemas like skill-library)."""
+    s = (ident or "").strip()
+    if not s:
+        return '"public"'
+    return '"' + s.replace('"', '""') + '"'
+
+
+def _fq_table(schema: str, table: str) -> str:
+    return f"{_pg_quote_ident(schema)}.{_pg_quote_ident(table)}"
+
+
+def _azure_embed_sync(texts: list[str], *, chunk_size: int = 64) -> list[list[float]] | None:
+    """Azure embeddings to match ``canonical_skills.name_embedding`` (db/schema.sql).
+
+    Returns None when the client is unavailable or the API call fails — the vector match
+    stage is then skipped (exact + fuzzy matching still run).
+    """
+    if not texts:
+        return []
+    try:
+        from llm_client import EMBEDDING_MODEL, get_embedding_sync_client
+    except ImportError:
+        return None
+    client = get_embedding_sync_client()
+    if client is None:
+        return None
+    out: list[list[float]] = []
+    try:
+        for i in range(0, len(texts), chunk_size):
+            chunk = texts[i : i + chunk_size]
+            resp = client.embeddings.create(model=EMBEDDING_MODEL, input=chunk)
+            ordered = sorted(resp.data, key=lambda d: d.index)
+            out.extend([list(d.embedding) for d in ordered])
+        return out
+    except Exception as exc:  # degrade to non-vector matching
+        logger.warning(
+            "[skill_matcher] Azure embedding batch failed (%d texts): %s",
+            len(texts),
+            exc,
+        )
+        return None
 
 
 @dataclass
@@ -21,7 +69,11 @@ class Config:
     pg_password: str = os.getenv("DB_PASSWORD", os.getenv("LINKEDIN_PASSWORD", "L!nked!nS3r@p3R"))
     fuzzy_threshold: float  = 0.45
     vector_threshold: float = 0.75
-    embed_model_name: str   = "all-MiniLM-L6-v2"
+    # Same env as SkillLibraryRepository / non_skills / JD pipeline catalogue.
+    skill_library_schema: str = field(
+        default_factory=lambda: os.getenv("SKILL_LIBRARY_SCHEMA", "skill-library").strip()
+        or "skill-library"
+    )
 
 
 @dataclass
@@ -321,21 +373,13 @@ def process_jd(jd_text: str, config: Config = None) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INTERNAL — MODEL LOADING
+# INTERNAL — NLP (SkillNer + spaCy)
 # Lazy-loaded globals so importing this module does not trigger heavy downloads.
+# Vector similarity uses Azure embeddings (same dim vectors as catalogue).
 # ─────────────────────────────────────────────────────────────────────────────
 
 _nlp             = None
 _skill_extractor = None
-_embedder        = None
-
-
-def _get_embedder(model_name: str = "all-MiniLM-L6-v2"):
-    global _embedder
-    if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(model_name)
-    return _embedder
 
 _AMBIGUOUS_SKILLS = ["Go", "R", "C", "C++", "C#", "Scala", "Rust", "Swift", "Julia"]
 _AMBIGUOUS_PATTERN = re.compile(
@@ -420,7 +464,10 @@ def _extract_skills_from_jd(jd_text: str) -> list[str]:
 # INTERNAL — THREE-STAGE MATCHER
 # Stage 1: Exact   → PostgreSQL alias_lower (indexed B-tree)
 # Stage 2: Fuzzy   → PostgreSQL pg_trgm  |  Python difflib fallback
-# Stage 3: Vector  → pgvector cosine on name_embedding (HNSW index)
+# Stage 3: Vector  → pgvector cosine on canonical_skills.name_embedding (HNSW);
+#                    queries use SKILL_LIBRARY_SCHEMA (default skill-library).
+#                    Embeddings come from Azure (AZURE_EMBEDDING_DEPLOYMENT, 1536-d).
+#                    If embeddings are unavailable, this stage no-ops.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SkillMatcher:
@@ -441,6 +488,7 @@ class SkillMatcher:
 
     def _pg(self) -> psycopg2.pool.ThreadedConnectionPool:
         if self._pg_pool is None:
+            sp = _pg_quote_ident(self.config.skill_library_schema)
             self._pg_pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=1, maxconn=5,
                 host=self.config.pg_host,
@@ -450,32 +498,36 @@ class SkillMatcher:
                 password=self.config.pg_password,
                 sslmode=os.getenv("DB_SSLMODE", "require"),
                 connect_timeout=30,
-                options="-c search_path=dev,public",
+                options=f"-c search_path={sp},public",
             )
         return self._pg_pool
 
-    def _embedder(self):
-        return _get_embedder(self.config.embed_model_name)
+    def _t(self, rel: str) -> str:
+        """Qualified catalogue table: ``"<schema>"."canonical_skills"`` etc."""
+        return _fq_table(self.config.skill_library_schema, rel)
 
     def _batch_exact(self, skills: list[str]) -> dict[str, SkillMatch]:
         pool = self._pg()
         conn = pool.getconn()
         results: dict[str, SkillMatch] = {}
+        t_cs = self._t("canonical_skills")
+        t_sa = self._t("skill_aliases")
+        t_cat = self._t("categories")
         try:
             with conn.cursor() as cur:
                 # Pass 1: display_name exact match — highest priority.
                 # An alias like "java" may point to "Workday Studio Java" (wrong);
                 # matching against the canonical display_name directly is more precise.
-                cur.execute("""
+                cur.execute(f"""
                     SELECT lower(input_skill),
                            cs.id::text,
                            cs.display_name,
                            cs.slug,
                            c.display_name AS category
                     FROM unnest(%s::text[]) AS input_skill
-                    JOIN dev.canonical_skills cs
+                    JOIN {t_cs} cs
                       ON lower(cs.display_name) = lower(input_skill)
-                    LEFT JOIN dev.categories c ON c.id = cs.category_id
+                    LEFT JOIN {t_cat} c ON c.id = cs.category_id
                 """, (skills,))
                 for input_lower, cid, display_name, slug, category in cur.fetchall():
                     results[input_lower] = SkillMatch(
@@ -491,16 +543,16 @@ class SkillMatcher:
                 # Pass 2: alias lookup for inputs not resolved by display_name.
                 unresolved = [s for s in skills if s.lower() not in results]
                 if unresolved:
-                    cur.execute("""
+                    cur.execute(f"""
                         SELECT lower(input_skill),
                                cs.id::text,
                                cs.display_name,
                                cs.slug,
                                c.display_name AS category
                         FROM unnest(%s::text[]) AS input_skill
-                        JOIN dev.skill_aliases sa ON sa.alias_lower = lower(input_skill)
-                        JOIN dev.canonical_skills cs ON cs.id = sa.skill_id
-                        LEFT JOIN dev.categories c ON c.id = cs.category_id
+                        JOIN {t_sa} sa ON sa.alias_lower = lower(input_skill)
+                        JOIN {t_cs} cs ON cs.id = sa.skill_id
+                        LEFT JOIN {t_cat} c ON c.id = cs.category_id
                     """, (unresolved,))
                     for input_lower, cid, display_name, slug, category in cur.fetchall():
                         if input_lower not in results:
@@ -521,11 +573,14 @@ class SkillMatcher:
         pool = self._pg()
         conn = pool.getconn()
         results: dict[str, SkillMatch] = {}
+        t_sa = self._t("skill_aliases")
+        t_cs = self._t("canonical_skills")
+        t_cat = self._t("categories")
         try:
             if self._pg_trgm is not False:
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("""
+                        cur.execute(f"""
                             SELECT q.skill,
                                    cs.id::text,
                                    cs.display_name,
@@ -536,14 +591,14 @@ class SkillMatcher:
                             CROSS JOIN LATERAL (
                                 SELECT sa.skill_id,
                                        MAX(similarity(sa.alias_lower::text, lower(q.skill)::text)) AS sim
-                                FROM dev.skill_aliases sa
+                                FROM {t_sa} sa
                                 WHERE similarity(sa.alias_lower::text, lower(q.skill)::text) > %s
                                 GROUP BY sa.skill_id
                                 ORDER BY sim DESC
                                 LIMIT 1
                             ) AS best
-                            JOIN dev.canonical_skills cs ON cs.id = best.skill_id
-                            LEFT JOIN dev.categories c ON c.id = cs.category_id
+                            JOIN {t_cs} cs ON cs.id = best.skill_id
+                            LEFT JOIN {t_cat} c ON c.id = cs.category_id
                         """, (skills, self.config.fuzzy_threshold))
                         for skill, cid, display_name, slug, category, sim in cur.fetchall():
                             results[skill.lower()] = SkillMatch(
@@ -570,13 +625,16 @@ class SkillMatcher:
         return results
 
     def _batch_fuzzy_python(self, skills: list[str], conn) -> dict[str, SkillMatch]:
+        t_sa = self._t("skill_aliases")
+        t_cs = self._t("canonical_skills")
+        t_cat = self._t("categories")
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT sa.alias_lower, sa.skill_id::text,
                        cs.display_name, cs.slug, c.display_name AS category
-                FROM dev.skill_aliases sa
-                JOIN dev.canonical_skills cs ON cs.id = sa.skill_id
-                LEFT JOIN dev.categories c ON c.id = cs.category_id
+                FROM {t_sa} sa
+                JOIN {t_cs} cs ON cs.id = sa.skill_id
+                LEFT JOIN {t_cat} c ON c.id = cs.category_id
             """)
             all_aliases = cur.fetchall()
         results: dict[str, SkillMatch] = {}
@@ -602,22 +660,27 @@ class SkillMatcher:
     def _batch_vector(self, skills: list[str]) -> dict[str, SkillMatch]:
         if not skills:
             return {}
-        vectors = self._embedder().encode(skills, batch_size=64, show_progress_bar=False)
+        vectors = _azure_embed_sync(skills)
+        if vectors is None or len(vectors) != len(skills):
+            return {}
+        t_cs = self._t("canonical_skills")
+        t_cat = self._t("categories")
+        vec_type = f"{_pg_quote_ident(self.config.skill_library_schema)}.vector"
         pool = self._pg()
         conn = pool.getconn()
         results: dict[str, SkillMatch] = {}
         try:
             with conn.cursor() as cur:
                 for skill, vec in zip(skills, vectors):
-                    vec_str = "[" + ",".join(map(str, vec.tolist())) + "]"
-                    cur.execute("""
+                    vec_str = "[" + ",".join(map(str, vec)) + "]"
+                    cur.execute(f"""
                         SELECT cs.id::text, cs.display_name, cs.slug,
                                c.display_name AS category,
-                               1 - (cs.name_embedding <=> %s::dev.vector) AS score
-                        FROM dev.canonical_skills cs
-                        LEFT JOIN dev.categories c ON c.id = cs.category_id
+                               1 - (cs.name_embedding <=> %s::{vec_type}) AS score
+                        FROM {t_cs} cs
+                        LEFT JOIN {t_cat} c ON c.id = cs.category_id
                         WHERE cs.name_embedding IS NOT NULL
-                        ORDER BY cs.name_embedding <=> %s::dev.vector
+                        ORDER BY cs.name_embedding <=> %s::{vec_type}
                         LIMIT 1
                     """, (vec_str, vec_str))
                     row = cur.fetchone()
@@ -642,12 +705,14 @@ class SkillMatcher:
     def known_terms(self) -> set[str]:
         pool = self._pg()
         conn = pool.getconn()
+        t_sa = self._t("skill_aliases")
+        t_cs = self._t("canonical_skills")
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT alias_lower FROM dev.skill_aliases
+                cur.execute(f"""
+                    SELECT alias_lower FROM {t_sa}
                     UNION
-                    SELECT lower(display_name) FROM dev.canonical_skills
+                    SELECT lower(display_name) FROM {t_cs}
                 """)
                 return {row[0] for row in cur.fetchall()}
         finally:
