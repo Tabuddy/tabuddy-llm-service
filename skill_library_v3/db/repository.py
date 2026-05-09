@@ -235,6 +235,67 @@ def get_approved_role_names() -> set[str]:
             return {row[0] for row in cur.fetchall() if row[0]}
 
 
+def get_approved_role_aliases() -> dict[str, str]:
+    """Map every recognized role name (canonical + alias, lowercased)
+    to the canonical role slug. Used by the Stage 0 charter validator
+    to refuse charters whose ``role_name`` aliases an already-approved
+    role.
+
+    Sources two layers:
+      1. Canonical display_names of roles with an approved Stage 0 charter
+         (``roles.display_name`` joined to ``v2_run_log``).
+      2. Aliases lifted from each role's most recent approved Stage 1
+         role card (``planner_output->>aliases``).
+
+    Canonical wins when an alias collides with another role's canonical
+    name — we only ``setdefault`` aliases on top of canonicals so an
+    existing canonical entry is never shadowed.
+    """
+    out: dict[str, str] = {}
+    with connect() as conn:
+        with conn.cursor() as cur:
+            # Layer 1 — canonical names of roles with an approved charter.
+            cur.execute(
+                """
+                SELECT DISTINCT r.slug, lower(r.display_name)
+                  FROM v2_run_log v
+                  JOIN roles r ON r.slug = v.role_id
+                 WHERE v.status = 'approved'
+                   AND v.prompt_version LIKE %s
+                """,
+                (CHARTER_PROMPT_VERSION_PREFIX + "%",),
+            )
+            for slug, name in cur.fetchall():
+                if name:
+                    out[name] = slug
+            # Layer 2 — aliases from approved Stage 1 role cards (latest
+            # per role).
+            cur.execute(
+                """
+                SELECT DISTINCT ON (role_id)
+                       role_id, planner_output
+                  FROM v2_run_log
+                 WHERE status = 'approved'
+                   AND prompt_version LIKE 'stage1_%%'
+                 ORDER BY role_id, started_at DESC
+                """
+            )
+            for slug, po in cur.fetchall():
+                if po is None:
+                    continue
+                rc = po if isinstance(po, dict) else json.loads(po)
+                aliases = rc.get("aliases") or []
+                if not isinstance(aliases, list):
+                    continue
+                for alias in aliases:
+                    if not isinstance(alias, str):
+                        continue
+                    a = alias.strip().lower()
+                    if a:
+                        out.setdefault(a, slug)
+    return out
+
+
 # ── stage runs ──────────────────────────────────────────────────────────────
 
 

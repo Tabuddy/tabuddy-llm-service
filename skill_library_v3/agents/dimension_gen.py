@@ -14,6 +14,7 @@ from skill_library_v3.prompts.dimension_gen import (
     DIM_GEN_USER_TEMPLATE,
     format_adjacent_dim_block,
     format_always_load_block,
+    format_family_hints_block,
     format_role_card_block,
 )
 from skill_library_v3.schemas.dimension import DimensionList
@@ -49,6 +50,10 @@ class Stage2DimensionGeneratorAgent(BaseLLMAgent):
             role_slug=role_slug,
             role_card_block=format_role_card_block(role_card),
             always_load_block=format_always_load_block(always_load_skills),
+            family_hints_block=format_family_hints_block(
+                role_card.get("family", ""),
+                role_card.get("canonical_name", role_name),
+            ),
             adjacent_dim_block=format_adjacent_dim_block(
                 adjacent_dimensions_by_role
             ),

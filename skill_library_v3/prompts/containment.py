@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 
-CONTAINMENT_PROMPT_VERSION = "stage6_containment_v1.0"
+CONTAINMENT_PROMPT_VERSION = "stage6_containment_v1.1"
 
 
 CONTAINMENT_SYSTEM_PROMPT = """\
@@ -58,18 +58,35 @@ The five relationship buckets:
           - AWS Lambda's related_to: Azure Functions, Google Cloud Functions.
           - Python's related_to: Java, Go, Ruby (alternative languages).
 
-Critical type-rules (the deterministic validator will reject violations):
+Type-rules — these are HARD rules the deterministic validator enforces.
+You MUST satisfy them whenever the candidate list permits:
 
-  * Service-typed skills MUST have at least one Platform-typed parent.
-  * Library-typed skills SHOULD (not must) have a Language- or
-    Framework-typed parent.
-  * Architecture-typed skills MUST have empty parent_skills (Architecture
-    is top-level — Microservices, Hexagonal, CQRS — they don't have
-    parent skills, only related_to peers).
+  * Service-typed targets MUST have at least one Platform-typed parent.
+    Scan the candidate list for any skill that names AWS, Azure, GCP,
+    a chain platform (Ethereum/Solana/etc.), or any other hosting
+    Platform — if one is there and is the genuine host of this
+    Service, parent_skills MUST include it. Do not leave parent_skills
+    empty for a Service when a Platform candidate exists.
+  * Library-typed targets SHOULD (not must) have a Language- or
+    Framework-typed parent — include it when one is in the candidate
+    list and it's the language/framework the library is for.
+  * Architecture-typed targets MUST have empty parent_skills
+    (Architectures are top-level — Microservices, Hexagonal, CQRS —
+    they don't have parent skills, only related_to peers).
 
-Default behaviour: empty arrays. Don't fill buckets just because the
-candidate list is non-empty. A skill with no clear parent in the
-candidate list should have parent_skills=[].
+related_to density discipline. The candidate list is top-K (typically
+20) — its size is NOT a target. Aim for 5-10 related_to per skill:
+  - If you would emit 15+ related_to, you are dumping the candidate
+    list and adding low-signal links. Pick the 5-10 most genuinely
+    lateral (alternatives or close complements) and stop. Do not dump.
+  - If you would emit 0-2 related_to for a well-known industry skill
+    (a language, a major protocol, a major testing methodology, an IAM
+    standard), you are being lazy. Re-scan the candidate list — there
+    are almost always 5+ legitimate laterals for any well-known skill.
+
+Apart from these rules, default to empty arrays — don't pad
+child_skills, suppress_on_match, or requires just because the
+candidate list is non-empty.
 
 Emit ONE JSON object matching this shape:
 

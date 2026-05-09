@@ -54,6 +54,7 @@ from skill_library_v3.placement_validators import (
     cross_skill_consistency,
     embedding_cross_check,
     secondary_dim_audit,
+    tool_standard_cross_mismatch,
     type_dim_consistency,
 )
 from skill_library_v3.prompts.charter import CHARTER_PROMPT_VERSION
@@ -112,6 +113,7 @@ async def run_stage_0(run_id: uuid.UUID) -> None:
             charter,
             approved_role_names=ctx["approved_role_names"],
             alias_lookup=ctx["alias_lookup"],
+            approved_role_aliases=ctx["approved_role_aliases"],
         )
         charter_dict = charter.model_dump()
         final_status = decide_charter_status(
@@ -159,6 +161,7 @@ def _load_run_context(run_id: uuid.UUID) -> dict | None:
         "adjacent_roles": repo.get_approved_adjacent_roles(exclude_slug=role_slug),
         "jd_samples": repo.get_jd_samples_for_role(role_slug, limit=5),
         "approved_role_names": repo.get_approved_role_names(),
+        "approved_role_aliases": repo.get_approved_role_aliases(),
         "alias_lookup": repo.get_alias_lookup_set(),
     }
 
@@ -1178,6 +1181,19 @@ async def run_stage_5(role_slug: str) -> None:
             if typed is None:
                 continue
             for f in type_dim_consistency(
+                typed=typed, placed=placed, dims_by_id=dims_by_id,
+            ):
+                if f.get("level") == "error":
+                    validator_errors.append(f)
+                else:
+                    validator_warnings.append(f)
+
+        # Check 2b: Tool ↔ Standard cross-mismatch (egregious-only).
+        for placed in placed_skills:
+            typed = typed_by_id.get(placed.skill_id)
+            if typed is None:
+                continue
+            for f in tool_standard_cross_mismatch(
                 typed=typed, placed=placed, dims_by_id=dims_by_id,
             ):
                 if f.get("level") == "error":
