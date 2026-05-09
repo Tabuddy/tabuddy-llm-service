@@ -878,81 +878,11 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     if req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
         role_hint_text = req.jd_role_hint.display_name.strip()
 
-    if unmatched_llm_skills:
-        try:
-            dimension_catalogue = await asyncio.to_thread(
-                fetch_dimensions_catalog_skill_library,
-                limit=400,
-            )
-        except Exception as exc:
-            logger.warning(
-                "skill-library dimensions lookup failed; v3 dim-gen will run without prior catalog: %s",
-                exc,
-            )
-            dimension_catalogue = []
-        # Cap and normalize skill-library dimension rows so the v3 prompt +
-        # overlap checker have the keys they expect
-        # (tentative_id, name, description).
-        if len(dimension_catalogue) > 40:
-            step = len(dimension_catalogue) // 40
-            dimension_catalogue = dimension_catalogue[::step][:40]
-        existing_dims_v3: list[dict] = []
-        for d in dimension_catalogue:
-            dim_id = str(d.get("tentative_id") or d.get("slug") or "").strip()
-            name = str(d.get("name") or d.get("display_name") or "").strip()
-            desc = str(d.get("description") or d.get("rationale") or "").strip()
-            if not dim_id or not name:
-                continue
-            existing_dims_v3.append({
-                "tentative_id": dim_id,
-                "name": name,
-                "description": desc,
-                "role_display": str(d.get("role_display") or "").strip(),
-            })
-
-        # Pull a small slice of canonical skills as the containment candidate
-        # pool. 200 keeps the embedder workload tiny while still giving the
-        # Stage 6 LLM useful similarity hints using embeddings.
-        candidate_skills_pool: list[dict] = []
-        try:
-            candidate_skills_pool = await asyncio.to_thread(
-                fetch_candidate_skills_pool_skill_library,
-                limit=200,
-            )
-        except Exception as exc:
-            logger.warning(
-                "skill-library canonical skills pool lookup failed; pool will be empty: %s",
-                exc,
-            )
-            candidate_skills_pool = []
-
-        async def _enrich_one(skill_name: str) -> tuple[str, NewSkillMetaV3 | None]:
-            try:
-                meta = await enrich_new_skill(
-                    skill_name=skill_name,
-                    role_hint=role_hint_text,
-                    existing_dims=existing_dims_v3,
-                    candidate_skills_pool=candidate_skills_pool,
-                    accumulator=cost_acc,
-                )
-                return skill_name, meta
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "v3 new-skill orchestrator failed for %r: %s",
-                    skill_name, exc,
-                )
-                return skill_name, None
-
-        # Run per-skill orchestrators concurrently. Each orchestrator already
-        # caps its own internal LLM calls; the JD pipeline rarely surfaces
-        # more than a handful of unknown skills so we don't add a semaphore.
-        results = await asyncio.gather(
-            *[_enrich_one(s) for s in unmatched_llm_skills],
-            return_exceptions=False,
-        )
-        for skill_name, meta in results:
-            if meta is not None:
-                new_skill_meta_by_skill[skill_name] = meta
+    # v3 per-skill orchestrator (dim-gen → type → containment → enrichment) is
+    # skipped here: it costs ~8 LLM calls per unknown skill and is only needed
+    # when actually persisting new skills to the DB (API 3). Since writes are
+    # currently gated off, running it adds no value to role inference.
+    # new_skill_meta_by_skill stays empty — re-enable when writes are live.
 
     # Backfill role labels on Stage 3 logs from DB dimension-role links.
     # Some logs can miss b_role/a_role depending on upstream payload shape.
