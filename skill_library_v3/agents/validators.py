@@ -121,6 +121,13 @@ _GENERIC_NOUN_STOPLIST: frozenset[str] = frozenset({
     "cost management", # Cost Management (Azure CLOUD_SERVICE — but also a
                        # generic responsibility area like "FinOps cost
                        # management"; multi-word stop-list entry).
+    "make",            # Make (GNU Make build TOOL — collides with English
+                       # verb. Prod 2026-05-09: Virtualization Engineer
+                       # charter failed on 'Make low-level kernel patches').
+    "business rules",  # Business Rules (FRAMEWORK — Business Rules Engine).
+                       # The phrase is a generic responsibility area
+                       # ('implement business rules'). Prod 2026-05-09:
+                       # Backend Developer charter failed.
     # Defense-in-depth for soft-nature words. These are filtered out at the
     # repository layer (get_alias_lookup_set), but listing them here keeps
     # the validator safe when alias_lookup is constructed by callers that
@@ -220,6 +227,49 @@ def no_skills_in_scope(
     return out
 
 
+def role_name_not_alias_of_existing_role(
+    charter: CharterOutput,
+    *,
+    approved_role_aliases: dict[str, str],
+) -> list[dict]:
+    """Refuse a Stage 0 charter when its ``role_name`` is already an
+    alias of some other approved role.
+
+    Catches the duplicate-role pattern where an admin types a name that
+    aliases an existing role (e.g., ``Backend Developer`` when
+    ``Backend Engineer`` already lists it as an alias). The catalog
+    should not end up with two near-duplicate roles.
+
+    ``approved_role_aliases`` maps every recognized role name (canonical
+    + alias, lowercased) to the canonical role's slug. The check fires
+    only when the slug differs from the charter's own ``role_id`` —
+    re-running an existing role's charter is allowed.
+    """
+    if not approved_role_aliases:
+        return []
+    name_lower = (charter.role_name or "").strip().lower()
+    canonical_slug = approved_role_aliases.get(name_lower)
+    if canonical_slug is None:
+        return []
+    if canonical_slug == charter.role_id:
+        return []
+    return [
+        {
+            "level": "error",
+            "code": "role_name_aliases_existing_role",
+            "location": "role_name",
+            "canonical_role_id": canonical_slug,
+            "message": (
+                f"role_name {charter.role_name!r} is already an alias of "
+                f"existing approved role {canonical_slug!r}. "
+                "Use the existing role instead of creating a near-duplicate. "
+                "If this role is genuinely distinct, change the canonical_name "
+                "to disambiguate (e.g., add a level or specialty qualifier)."
+            ),
+        }
+    ]
+
+
 def length_constraints(charter: CharterOutput) -> list[dict]:
     """Length sanity checks beyond what Pydantic already enforces."""
     out: list[dict] = []
@@ -251,14 +301,26 @@ def run_validators(
     *,
     approved_role_names: set[str],
     alias_lookup: set[str],
+    approved_role_aliases: dict[str, str] | None = None,
 ) -> dict:
     """Run every check, partition results into warnings/errors, return the
-    validator_log dict the runner serialises."""
+    validator_log dict the runner serialises.
+
+    ``approved_role_aliases`` (optional, default empty) maps every
+    recognized role name + alias (lowercased) to its canonical role slug
+    — used by the role-name alias-collision check. Older callers that
+    pass only ``approved_role_names`` and ``alias_lookup`` still work;
+    they just skip the new check.
+    """
     findings: list[dict] = []
     findings += adjacent_roles_in_catalog(charter, approved_role_names)
     findings += owned_by_in_catalog(charter, approved_role_names)
     findings += no_skills_in_scope(charter, alias_lookup)
     findings += length_constraints(charter)
+    findings += role_name_not_alias_of_existing_role(
+        charter,
+        approved_role_aliases=approved_role_aliases or {},
+    )
 
     warnings = [f for f in findings if f["level"] == "warning"]
     errors = [f for f in findings if f["level"] == "error"]

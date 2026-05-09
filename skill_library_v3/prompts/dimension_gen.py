@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-DIM_GEN_PROMPT_VERSION = "stage2_dim_gen_v1.1"
+DIM_GEN_PROMPT_VERSION = "stage2_dim_gen_v1.2"
 
 
 DIM_GEN_SYSTEM_PROMPT = """\
@@ -113,6 +113,25 @@ applies to EDR products, CNAPP tools, IAM products, MLOps platforms,
 data warehouses, etc.: a category with 3+ named offerings the role
 engages with is its own dimension, separate from any concepts dim that
 governs the same area.
+
+Vendor pairing rule (CRITICAL for Stage 6 containment to succeed). When
+a Vendor Product Family dim names commercial SaaS products, the
+exemplar_skills list MUST include the vendor itself as a STANDALONE
+exemplar — not just a sub-capability name. Examples of right vs wrong:
+
+  * RIGHT: ["Wiz", "Wiz Cloud Security Posture Management", "Lacework",
+    "Lacework Polygraph", "Prisma Cloud", "Prisma Cloud Compute"]
+  * WRONG: ["wiz-posture-review", "lacework-detections",
+    "prisma-cloud-policies"]
+    — these compound names omit the vendor itself, so when Stage 4
+    types them as Service, Stage 6 has no Platform parent to attach
+    them to (they are orphans).
+
+The same rule applies to AWS / Azure / GCP (the platforms must appear
+as standalone exemplars alongside any of their named services like
+"AWS KMS", "Azure Key Vault"), to identity vendors (Okta, Auth0 are
+standalone Platforms), and to chain platforms (Ethereum, Solana are
+standalone Platforms alongside chain-specific services).
 
 Don't force-fit irrelevant axes — if the role doesn't touch a bucket,
 omit it. A pure-concepts role legitimately has fewer Vendor Product
@@ -235,6 +254,16 @@ _SECURITY_HINTS = (
     "cutting Service-typed skills (KMS, GuardDuty, Defender for Cloud, "
     "Security Command Center) have a Platform parent to attach to in "
     "Stage 6 containment\n"
+    "\n"
+    "Vendor emission for security: every vendor named above must appear "
+    "as a STANDALONE exemplar_skill in the dim that uses it — not just "
+    "as a substring of a compound name. Required Platform-typed vendor "
+    "exemplars when their products are in_scope: AWS, Azure, GCP, Okta, "
+    "Auth0, Microsoft, Wiz, Qualys, Rapid7, Lacework, Prisma Cloud, "
+    "CyberArk, BeyondTrust, CrowdStrike, SentinelOne, Splunk, Microsoft "
+    "Sentinel. Pair each vendor with any of its named sub-services as "
+    "additional exemplars (e.g., AWS + AWS KMS + AWS GuardDuty, or Wiz "
+    "+ Wiz Cloud Security Posture Management).\n"
 )
 
 _BLOCKCHAIN_HINTS = (

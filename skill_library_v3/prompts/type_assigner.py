@@ -11,7 +11,7 @@ import json
 from skill_library_v3.schemas.typology import TYPOLOGY_DESCRIPTIONS, TYPOLOGY_VALUES
 
 
-TYPE_ASSIGNER_PROMPT_VERSION = "stage4_typing_v1.0"
+TYPE_ASSIGNER_PROMPT_VERSION = "stage4_typing_v1.1"
 
 
 TYPE_ASSIGNER_SYSTEM_PROMPT = """\
@@ -31,6 +31,17 @@ Disambiguation rules (apply these explicitly in your reasoning):
 
   * Service vs Platform: A Service lives INSIDE a Platform — it's a
     specific managed capability. AWS Lambda = Service. AWS itself = Platform.
+
+  * Vendor SaaS = Platform (NOT Tool). When the skill name is a
+    commercial SaaS vendor (Wiz, Datadog, Snowflake, Okta, Auth0,
+    Splunk Cloud, Lacework, Qualys, Rapid7, CyberArk, BeyondTrust,
+    CrowdStrike, SentinelOne, Microsoft Sentinel, Microsoft Defender
+    for Cloud), type it Platform — these are hosted multi-tenant
+    environments with APIs, fitting the Platform definition exactly.
+    Type Tool only for software a user runs themselves (Wireshark,
+    Nmap, Metasploit, Burp Suite Community Edition, self-hosted
+    Jenkins). The disambiguator is "do you run it yourself or do you
+    consume it via the vendor's hosted instance?".
 
   * Datastore vs Format: Does it persist data (Datastore) or specify
     how data is structured (Format)?  PostgreSQL = Datastore.

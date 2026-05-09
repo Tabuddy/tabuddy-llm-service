@@ -113,6 +113,7 @@ async def run_stage_0(run_id: uuid.UUID) -> None:
             charter,
             approved_role_names=ctx["approved_role_names"],
             alias_lookup=ctx["alias_lookup"],
+            approved_role_aliases=ctx["approved_role_aliases"],
         )
         charter_dict = charter.model_dump()
         final_status = decide_charter_status(
@@ -160,6 +161,7 @@ def _load_run_context(run_id: uuid.UUID) -> dict | None:
         "adjacent_roles": repo.get_approved_adjacent_roles(exclude_slug=role_slug),
         "jd_samples": repo.get_jd_samples_for_role(role_slug, limit=5),
         "approved_role_names": repo.get_approved_role_names(),
+        "approved_role_aliases": repo.get_approved_role_aliases(),
         "alias_lookup": repo.get_alias_lookup_set(),
     }
 
