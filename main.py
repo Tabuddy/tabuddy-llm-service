@@ -41,10 +41,17 @@ from jd_pipeline_run_repository import JdPipelineRunRepository
 from skill_library_v2.agents.planner import PlannerAgent
 from new_skill_orchestrator import (
     NewSkillMetaV3,
+    _derive_legacy_fields,
+    _run_enrichment,
     enrich_new_skill,
     fetch_candidate_skills_pool_skill_library,
     fetch_dimensions_catalog_skill_library,
     find_dimensions_by_identity_skill_library,
+)
+from skill_library_v3.schemas.typology import SkillType, TypedSkill
+from skill_library_v3.catalog_transform import (
+    map_maturity_to_volatility,
+    map_versioned_to_strategy,
 )
 from cost_tracker import CostAccumulator
 from pathlib import Path
@@ -54,7 +61,7 @@ import time
 from datetime import datetime
 import logging
 import asyncio
-from typing import Any
+from typing import Any, cast
 from pydantic import BaseModel, Field
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
@@ -601,17 +608,209 @@ def _append_canonical_skill_proposed_artifact(
     })
 
 
+def _apply_new_skill_v3_enrichment_to_db(
+    repo: SkillLibraryRepository,
+    *,
+    skill_id: int,
+    display_name: str,
+    meta: NewSkillMetaV3,
+    typical_lifespan: str,
+) -> bool:
+    """Persist Stage 7 enrichment + Stage 4 typing like ``catalog_transform`` + Stage 8 loader.
+
+    Returns True if ``canonical_skills`` enrichment columns were updated successfully.
+    """
+    enr = meta.enrichment
+    derived = meta.derived
+    typed = meta.typed
+
+    if enr and enr.maturity:
+        volatility = map_maturity_to_volatility(enr.maturity.maturity)
+    elif derived is not None:
+        volatility = str(derived.volatility or "STABLE")
+    else:
+        volatility = "STABLE"
+
+    vendor: str | None = None
+    license_value: str | None = None
+    year_introduced: int | None = None
+    maturity_reasoning: str | None = None
+    version_strategy = "NOT_APPLICABLE"
+    version_tag: str | None = None
+
+    if enr is not None:
+        vl = enr.vendor_license
+        vendor = (str(vl.vendor).strip() if vl.vendor else None) or None
+        if vl.license is not None:
+            license_value = str(getattr(vl.license, "value", vl.license)).strip().lower()
+        year_introduced = vl.year_introduced
+        if enr.maturity:
+            maturity_reasoning = enr.maturity.reasoning
+        ver = enr.versioning
+        version_strategy = map_versioned_to_strategy(bool(ver.versioned))
+        version_tag = (
+            str(ver.current_version).strip() if ver.current_version else None
+        )
+
+    confidence = float(typed.confidence) if typed is not None else 0.7
+    confidence = max(0.0, min(1.0, confidence))
+
+    tl = typical_lifespan
+    if derived is not None and getattr(derived, "typical_lifespan", None):
+        tl = str(derived.typical_lifespan)
+
+    enrichment_row_ok = False
+    try:
+        repo.update_canonical_skill_enrichment_v3(
+            skill_id,
+            volatility=volatility,
+            vendor=vendor,
+            license_value=license_value,
+            year_introduced=year_introduced,
+            maturity_reasoning=maturity_reasoning,
+            version_strategy=version_strategy,
+            version_tag=version_tag,
+            confidence=confidence,
+            typical_lifespan=tl,
+        )
+        enrichment_row_ok = True
+    except Exception as exc:
+        logger.warning(
+            "update_canonical_skill_enrichment_v3 failed for skill_id=%s: %s",
+            skill_id,
+            exc,
+        )
+
+    if enr is not None and enr.versioning and enr.versioning.version_aliases:
+        disp_lc = display_name.strip().lower()
+        va_keys: list[str] = []
+        for k in enr.versioning.version_aliases.keys():
+            kk = str(k).strip()
+            if not kk or kk.lower() == disp_lc:
+                continue
+            va_keys.append(kk)
+        if va_keys:
+            try:
+                repo.add_aliases(
+                    [(skill_id, k) for k in va_keys],
+                    alias_type="VERSION",
+                    match_strategy="CASE_INSENSITIVE",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "VERSION aliases insert failed skill_id=%s: %s",
+                    skill_id,
+                    exc,
+                )
+
+    if enr is not None and enr.context_keywords and enr.context_keywords.context_keywords:
+        try:
+            repo.add_skill_tags(skill_id, list(enr.context_keywords.context_keywords))
+        except Exception as exc:
+            logger.warning("skill_tags insert failed skill_id=%s: %s", skill_id, exc)
+
+    return enrichment_row_ok
+
+
+def _typology_type_from_skill_nature(skill_nature: str | None) -> SkillType:
+    from skill_library_v3.catalog_transform import map_type_to_skill_nature
+    from skill_library_v3.schemas.typology import TYPOLOGY_VALUES
+
+    target = (skill_nature or "").strip().upper()
+    for label in TYPOLOGY_VALUES:
+        if map_type_to_skill_nature(label) == target:
+            return cast(SkillType, label)
+    return "Concept"
+
+
+def _primary_dimension_slug_for_library_skill(sd: SkillDetail) -> str:
+    for dd in sd.dimensions or []:
+        dim = dd.dimension
+        if dim is None:
+            continue
+        slug = (dim.slug or "").strip()
+        if slug:
+            return slug
+    return "general"
+
+
+async def _backfill_existing_skill_catalog_enrichment(
+    repo: SkillLibraryRepository,
+    sd: SkillDetail,
+    cost_acc: CostAccumulator,
+) -> bool:
+    """Stage 7 + v3 persist when the skill has no catalog context tags (``skill_tags``)."""
+    if sd.canonical is None or sd.canonical.id is None:
+        return False
+    sid = int(sd.canonical.id)
+    detail = await asyncio.to_thread(repo.get_skill_detail, sid)
+    if not detail:
+        return False
+    slug = str(detail.get("slug") or "").strip()
+    display_name = str(detail.get("display_name") or sd.input_skill).strip()
+    if not slug or not display_name:
+        return False
+    type_label = _typology_type_from_skill_nature(detail.get("skill_nature"))
+    skill_payload = {
+        "skill_id": slug,
+        "name": display_name,
+        "type": type_label,
+        "subtype": "general",
+        "primary_dimension": _primary_dimension_slug_for_library_skill(sd),
+    }
+    enrichment, warnings = await _run_enrichment(skill_payload, accumulator=cost_acc)
+    if enrichment is None:
+        return False
+    conf = detail.get("confidence")
+    try:
+        confidence = float(conf) if conf is not None else 0.85
+    except (TypeError, ValueError):
+        confidence = 0.85
+    confidence = max(0.0, min(1.0, confidence))
+    typed = TypedSkill(
+        skill_id=slug,
+        name=display_name,
+        type=type_label,
+        subtype="general",
+        confidence=confidence,
+        reasoning=(
+            "API 3 backfill: existing canonical skill had no catalog context tags "
+            "(skill_tags); ran Stage 7 enrichment to populate tags and related fields."
+        ),
+        alternatives_considered=[],
+    )
+    derived = _derive_legacy_fields(typed=typed, enrichment=enrichment)
+    meta = NewSkillMetaV3(
+        skill_id=typed.skill_id,
+        typed=typed,
+        enrichment=enrichment,
+        derived=derived,
+        warnings=list(warnings),
+    )
+    tl = str(derived.typical_lifespan or "EVERGREEN")
+    return _apply_new_skill_v3_enrichment_to_db(
+        repo,
+        skill_id=sid,
+        display_name=display_name,
+        meta=meta,
+        typical_lifespan=tl,
+    )
+
+
 def _try_create_new_canonical_skill_sync(
     repo: SkillLibraryRepository,
     sd: SkillDetail,
-) -> tuple[int | None, str | None]:
-    """Insert canonical skill + primary alias for one v3-shaped LLM skill."""
+) -> tuple[int | None, str | None, bool]:
+    """Insert canonical skill + primary alias for one v3-shaped LLM skill.
+
+    Third tuple element is True when enrichment columns were updated on ``canonical_skills``.
+    """
     meta = sd.new_skill_meta
     if meta is None or not _has_v3_meta_for_new_skill_persist(meta):
-        return None, "no_persistable_v3_meta"
+        return None, "no_persistable_v3_meta", False
     display_name = sd.input_skill.strip()
     if not display_name:
-        return None, "empty_display_name"
+        return None, "empty_display_name", False
     try:
         derived = meta.derived
         typed = meta.typed
@@ -656,9 +855,16 @@ def _try_create_new_canonical_skill_sync(
             alias_type="CANONICAL",
             match_strategy="CASE_INSENSITIVE",
         )
-        return sid, None
+        enrichment_ok = _apply_new_skill_v3_enrichment_to_db(
+            repo,
+            skill_id=sid,
+            display_name=display_name,
+            meta=meta,
+            typical_lifespan=typical_lifespan,
+        )
+        return sid, None, enrichment_ok
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        return None, f"{type(exc).__name__}: {exc}", False
 
 
 def _extra_dimension_rows_from_skills_detail(
@@ -943,6 +1149,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         jd_text=jd_text,
         api1_response=response,
         jd_role_hint_display=None,
+        llm_cost_usd=cost_acc.total_cost_usd,
     )
     response.run_id = run_id
     return response
@@ -1703,7 +1910,12 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     # ── History persistence (only if API 1 minted a run_id) ────
     if req.run_id:
         history_repo = JdPipelineRunRepository()
-        await asyncio.to_thread(history_repo.attach_api2, req.run_id, response)
+        await asyncio.to_thread(
+            history_repo.attach_api2,
+            req.run_id,
+            response,
+            llm_cost_usd=cost_acc.total_cost_usd,
+        )
         if persisted_alias_pairs:
             artifact_items = [
                 {
@@ -1767,6 +1979,25 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     return response
 
 
+def _log_jd_pipeline_llm_cost_sum(
+    logger: logging.Logger,
+    costs: tuple[float | None, float | None, float | None],
+    run_id: str,
+) -> None:
+    c1, c2, c3 = costs
+    a = float(c1) if c1 is not None else 0.0
+    b = float(c2) if c2 is not None else 0.0
+    c = float(c3) if c3 is not None else 0.0
+    logger.info(
+        "[JD pipeline] LLM cost total (API1+API2+API3) api1=$%.6f api2=$%.6f api3=$%.6f sum=$%.6f run_id=%s",
+        a,
+        b,
+        c,
+        a + b + c,
+        run_id,
+    )
+
+
 @app.post("/skills/final-role-output", response_model=FinalRoleOutputResponse)
 async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     api3_started_at = time.monotonic()
@@ -1799,6 +2030,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             run_id=req.run_id,
             chosen_role_resolution=None,
         )
+        cost_acc.log_summary("skills/final-role-output", logger)
         if history_repo is not None:
             duration_ms = int((time.monotonic() - api3_started_at) * 1000)
             await asyncio.to_thread(
@@ -1809,7 +2041,13 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 chosen_role_id=None,
                 final_skills=req.input_final_skills,
                 duration_ms=duration_ms,
+                llm_cost_usd=cost_acc.total_cost_usd,
             )
+            costs = await asyncio.to_thread(
+                history_repo.get_run_llm_costs_usd, req.run_id
+            )
+            if costs is not None:
+                _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
         return empty_response
 
     # 2) Resolve role in DB. Optional auto-create only when
@@ -1930,6 +2168,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         and sd.input_skill.lower() not in skill_id_by_input_lower
     }
     skills_created_this_run: set[str] = set()
+    skill_enrichment_saved_count = 0
+    existing_skill_catalog_backfill_count = 0
 
     # 3.5) New (canonical-miss) LLM skills: insert canonical + primary alias
     # when v3 meta has locked dimensions and/or merge targets; else artifact only.
@@ -1949,7 +2189,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         artifacts, sd.input_skill, meta
                     )
                 continue
-            sid, err = await asyncio.to_thread(
+            sid, err, enrichment_ok = await asyncio.to_thread(
                 _try_create_new_canonical_skill_sync, repo, sd
             )
             if sid is not None:
@@ -1957,6 +2197,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 skill_id_by_input_lower[sd.input_skill.lower()] = sid
                 skills_created_this_run.add(sd.input_skill.strip().lower())
                 persistence.new_skills_created += 1
+                if enrichment_ok:
+                    skill_enrichment_saved_count += 1
                 artifacts.append({
                     "kind": "canonical_skill_added",
                     "artifact_id": sid,
@@ -1982,6 +2224,39 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             )
         else:
             meta_merge_by_skill_lower.setdefault(key, {})
+
+    # 3.6) Existing library skills with zero context tags (skill_tags): run Stage 7 + save.
+    if _API3_writes_enabled and os.getenv(
+        "API3_BACKFILL_LIBRARY_ENRICHMENT", "1"
+    ).strip().lower() in ("1", "true", "yes"):
+        for sd in req.skills_detail:
+            if sd.source_tag != "db" or sd.canonical is None or sd.canonical.id is None:
+                continue
+            sid = int(sd.canonical.id)
+            try:
+                missing = await asyncio.to_thread(
+                    repo.canonical_skill_missing_catalog_enrichment, sid
+                )
+            except Exception:
+                missing = False
+            if not missing:
+                continue
+            try:
+                ok = await _backfill_existing_skill_catalog_enrichment(repo, sd, cost_acc)
+            except Exception as exc:
+                logger.warning(
+                    "API3 existing-skill catalog enrichment backfill failed skill_id=%s: %s",
+                    sid,
+                    exc,
+                )
+                ok = False
+            if ok:
+                existing_skill_catalog_backfill_count += 1
+                artifacts.append({
+                    "kind": "library_enrichment_backfilled",
+                    "artifact_id": sid,
+                    "artifact_text": (sd.input_skill or "")[:500],
+                })
 
     # 4) Persist per (skill, dimension):
     # - always attempt skill-dimension for DB-backed skills
@@ -2327,11 +2602,25 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             chosen_role_id=chosen_role_id_for_history,
             final_skills=req.input_final_skills,
             duration_ms=duration_ms,
+            llm_cost_usd=cost_acc.total_cost_usd,
         )
         if artifacts:
             await asyncio.to_thread(
                 history_repo.record_artifacts_bulk, req.run_id, artifacts
             )
+
+    logger.info(
+        "API3_SUCCESS new_skill_enrichment_saved=%s existing_skill_catalog_backfill=%s run_id=%s",
+        skill_enrichment_saved_count,
+        existing_skill_catalog_backfill_count,
+        req.run_id or "",
+    )
+    if history_repo is not None and req.run_id:
+        costs = await asyncio.to_thread(
+            history_repo.get_run_llm_costs_usd, req.run_id
+        )
+        if costs is not None:
+            _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
 
     return response
 
@@ -2526,6 +2815,19 @@ def _build_jd_history_view(
             if isinstance(dv, dict):
                 orchestrator_derived = dv
 
+        library_aliases_snapshot: list[dict[str, Any]] = []
+        for a in sd.get("aliases_in_db") or []:
+            if not isinstance(a, dict):
+                continue
+            library_aliases_snapshot.append(
+                {
+                    "alias_text": a.get("alias_text"),
+                    "alias_type": a.get("alias_type"),
+                    "is_primary": a.get("is_primary"),
+                    "match_strategy": a.get("match_strategy"),
+                }
+            )
+
         skills_out.append(
             {
                 "skill_name": name,
@@ -2555,6 +2857,7 @@ def _build_jd_history_view(
                 "orchestrator_enrichment": orchestrator_enrichment,
                 "orchestrator_typed": orchestrator_typed,
                 "orchestrator_derived": orchestrator_derived,
+                "library_aliases_snapshot": library_aliases_snapshot,
             }
         )
 
@@ -2585,6 +2888,44 @@ def _build_jd_history_view(
     }
 
 
+def _merge_history_library_skill_details(
+    history_view: dict[str, Any],
+    repo: SkillLibraryRepository,
+) -> None:
+    """Attach live catalog aliases, tags, and enrichment columns for library-matched skills."""
+    skills = history_view.get("skills") or []
+    for s in skills:
+        if str(s.get("source_tag") or "") != "db":
+            continue
+        cid = s.get("canonical_id")
+        if cid is None:
+            continue
+        try:
+            detail = repo.get_skill_detail(int(cid))
+        except Exception as exc:
+            logger.debug(
+                "history merge skipped for canonical_id=%s: %s",
+                cid,
+                exc,
+            )
+            continue
+        if not detail:
+            continue
+        s["library_db_aliases"] = detail.get("aliases") or []
+        s["library_db_tags"] = detail.get("tags") or []
+        s["library_db_enrichment"] = {
+            "vendor": detail.get("vendor"),
+            "license": detail.get("license"),
+            "year_introduced": detail.get("year_introduced"),
+            "maturity_reasoning": detail.get("maturity_reasoning"),
+            "confidence": detail.get("confidence"),
+            "version_tag": detail.get("version_tag"),
+            "version_strategy": detail.get("version_strategy"),
+            "category_display": detail.get("category_display"),
+            "sub_category_display": detail.get("sub_category_display"),
+        }
+
+
 @app.get("/skills/runs/{run_id}", response_model=JdRunDetail)
 async def get_jd_pipeline_run(run_id: str):
     """Return the full row for one run, including artifacts."""
@@ -2605,6 +2946,8 @@ async def get_jd_pipeline_run(run_id: str):
         row.get("api2_response"),
         row.get("api3_response"),
     )
+    lib_repo = SkillLibraryRepository()
+    await asyncio.to_thread(_merge_history_library_skill_details, history_view, lib_repo)
     return JdRunDetail(**row, artifacts=artifacts, history_view=history_view)
 
 

@@ -793,6 +793,126 @@ class SkillLibraryRepository:
             conn.commit()
         return dict(zip(cols, row))
 
+    def canonical_skill_missing_catalog_enrichment(self, skill_id: int) -> bool:
+        """True when the canonical skill has no catalog context tags (``skill_tags`` rows).
+
+        If there are zero context tags, we treat enrichment as missing and API 3 may run
+        Stage 7 + persist for that existing skill. Returns False if the skill id is unknown
+        or the query fails (e.g. ``skill_tags`` table missing)
+        so basically we do ths when an exsisting skill doesnt have skill enrichment.
+        (its a minor fallback so our data stays rich)
+        """
+        sid = int(skill_id)
+        sql = f"""
+            SELECT
+                EXISTS(
+                    SELECT 1 FROM {self.schema}.canonical_skills cs WHERE cs.id = %s
+                ) AS skill_exists,
+                COALESCE((
+                    SELECT COUNT(*)::int FROM {self.schema}.skill_tags st
+                    WHERE st.skill_id = %s
+                ), 0) AS tag_n
+        """
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (sid, sid))
+                    row = cur.fetchone()
+            if not row:
+                return False
+            skill_exists, tag_n = bool(row[0]), int(row[1] or 0)
+        except Exception:
+            return False
+        return bool(skill_exists and tag_n < 1)
+
+    def update_canonical_skill_enrichment_v3(
+        self,
+        skill_id: int,
+        *,
+        volatility: str,
+        vendor: str | None,
+        license_value: str | None,
+        year_introduced: int | None,
+        maturity_reasoning: str | None,
+        version_strategy: str,
+        version_tag: str | None,
+        confidence: float,
+        typical_lifespan: str,
+    ) -> None:
+        """Align JD-created skills with library v3 Stage 8 columns (cf. canonical_loader._upsert_skills).
+
+        Requires ``schema_v2_additions`` (vendor, license, maturity_reasoning on canonical_skills).
+        """
+        lic = None
+        if license_value is not None and str(license_value).strip():
+            lic = str(license_value).strip().lower()
+
+        sql = f"""
+            UPDATE {self.schema}.canonical_skills
+               SET volatility = %s::skill_volatility,
+                   vendor = %s,
+                   license = %s::license_type,
+                   year_introduced = %s,
+                   maturity_reasoning = %s,
+                   version_strategy = %s::version_strategy,
+                   version_tag = %s,
+                   confidence = %s,
+                   typical_lifespan = %s::skill_lifespan,
+                   updated_at = NOW()
+             WHERE id = %s
+        """
+        conf = max(0.0, min(1.0, float(confidence)))
+        params = (
+            volatility,
+            vendor if vendor and str(vendor).strip() else None,
+            lic,
+            year_introduced,
+            maturity_reasoning if maturity_reasoning and str(maturity_reasoning).strip() else None,
+            version_strategy,
+            version_tag if version_tag and str(version_tag).strip() else None,
+            conf,
+            typical_lifespan,
+            int(skill_id),
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+
+    def add_skill_tags(self, skill_id: int, tags: Sequence[str]) -> int:
+        """Insert tags for a skill (context keywords). Idempotent per (skill_id, tag)."""
+        if not tags:
+            return 0
+        rows = []
+        seen: set[str] = set()
+        for raw in tags:
+            t = (str(raw) or "").strip()
+            if not t:
+                continue
+            if len(t) > 80:
+                t = t[:80]
+            k = t.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            rows.append((int(skill_id), t))
+        if not rows:
+            return 0
+        sql = f"""
+            INSERT INTO {self.schema}.skill_tags (skill_id, tag)
+            VALUES (%s, %s)
+            ON CONFLICT (skill_id, tag) DO NOTHING
+        """
+        inserted = 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for sid_i, tag in rows:
+                    cur.execute(sql, (sid_i, tag))
+                    if cur.rowcount and cur.rowcount > 0:
+                        inserted += 1
+            conn.commit()
+        return inserted
+
     # ── Browse helpers for the /canonical-skill UI ──────────────────────────
     # Read-only queries used by canonical_skill_api.py to power the
     # three-pane Roles / Dimensions / Skills browser. All methods respect
@@ -1172,6 +1292,10 @@ class SkillLibraryRepository:
                         cs.source::text           AS source,
                         cs.parent_skill_id,
                         cs.version_parent_id,
+                        cs.vendor,
+                        cs.license::text          AS license,
+                        cs.year_introduced,
+                        cs.maturity_reasoning,
                         c.id  AS category_id,
                         c.slug AS category_slug,
                         c.display_name AS category_display,
