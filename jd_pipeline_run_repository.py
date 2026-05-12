@@ -1,12 +1,17 @@
 """Repository for JD pipeline run history.
 
-One row per end-to-end run of the 3-API JD pipeline:
-  POST /skills/extract-from-jd  → INSERT (status: extract_from_jd_done)
-  POST /skills/extract-details  → UPDATE (status: extract_details_done)
-  POST /skills/final-role-output → UPDATE (status: completed; denormalized fields)
+One row per end-to-end run of the current 3-step JD skill pipeline:
 
-A small jd_run_artifacts log captures what each run added to the library
-(non_skills, aliases, canonical_skills, dimensions, roles, link rows).
+  1. ``POST /skills/extract-from-jd`` — LLM extracts ``final_skills`` from JD text;
+     ``start_run`` inserts a row (``status=extract_from_jd_done``) with ``api1_response``.
+  2. ``POST /skills/extract-details`` — alias + dimension catalogue + v3 new-skill
+     orchestration; ``attach_api2`` stores ``api2_response`` (``status=extract_details_done``).
+  3. ``POST /skills/final-role-output`` — persists links / new canonicals when enabled;
+     ``attach_api3`` stores ``api3_response`` (``status=completed``) plus denormalized
+     role and skill list fields.
+
+``jd_run_artifacts`` records concrete inserts (aliases, canonicals, dimensions, links)
+and *proposed* rows when writes are skipped.
 
 """
 

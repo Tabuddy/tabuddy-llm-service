@@ -411,6 +411,8 @@ class JdRunDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     artifacts: list[JdRunArtifact] = Field(default_factory=list)
+    #: Denormalized view for history UIs (JD → skills → dims → API3 links).
+    history_view: dict[str, Any] | None = None
 
 
 class PdfLinkItem(BaseModel):
@@ -2359,6 +2361,230 @@ async def list_jd_pipeline_runs(
     )
 
 
+def _norm_skill_key_hist(s: str | None) -> str:
+    return (s or "").strip().lower()
+
+
+def _build_jd_history_view(
+    api1: dict[str, Any] | None,
+    api2: dict[str, Any] | None,
+    api3: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Shape stored API1–3 JSON into one object for history pages (no DB migration)."""
+    api1 = api1 or {}
+    api2 = api2 or {}
+    api3 = api3 or {}
+
+    persist_tag_by_skill: dict[str, str] = {}
+    for x in api3.get("final_input_skills") or []:
+        if isinstance(x, dict) and x.get("skill"):
+            persist_tag_by_skill[_norm_skill_key_hist(str(x["skill"]))] = str(
+                x.get("tag") or ""
+            )
+
+    detail_by_skill: dict[str, dict[str, Any]] = {}
+    for sd in api2.get("skills_detail") or []:
+        if isinstance(sd, dict) and sd.get("input_skill"):
+            detail_by_skill[_norm_skill_key_hist(str(sd["input_skill"]))] = sd
+
+    pers = api3.get("persistence")
+    raw_items: list[dict[str, Any]] = []
+    if isinstance(pers, dict):
+        for it in pers.get("items") or []:
+            if isinstance(it, dict):
+                raw_items.append(it)
+
+    persist_rows_by_skill: dict[str, list[dict[str, Any]]] = {}
+    for it in raw_items:
+        sk = str(it.get("input_skill") or "")
+        nk = _norm_skill_key_hist(sk)
+        if nk:
+            persist_rows_by_skill.setdefault(nk, []).append(it)
+
+    skills_out: list[dict[str, Any]] = []
+    for fs in api1.get("final_skills") or []:
+        if not isinstance(fs, dict):
+            continue
+        name = str(fs.get("skill_name") or "").strip()
+        if not name:
+            continue
+        nk = _norm_skill_key_hist(name)
+        sd = detail_by_skill.get(nk, {})
+        source_tag = str(sd.get("source_tag") or "")
+        canonical = sd.get("canonical") if isinstance(sd.get("canonical"), dict) else None
+        meta = sd.get("new_skill_meta") if isinstance(sd.get("new_skill_meta"), dict) else None
+
+        if not sd:
+            skill_row_kind = "incomplete"
+            skill_row_label = "No API 2 row (run stopped after API 1 or history missing)"
+        elif source_tag == "llm":
+            skill_row_kind = "new_skill"
+            skill_row_label = "New / unmatched skill (orchestrated in API 2)"
+        elif source_tag == "unmatched":
+            skill_row_kind = "unmatched"
+            skill_row_label = "Unmatched (no library row)"
+        else:
+            skill_row_kind = "library_skill"
+            skill_row_label = "Existing skill (matched library)"
+
+        dims_out: list[dict[str, Any]] = []
+        for dd in sd.get("dimensions") or []:
+            if not isinstance(dd, dict):
+                continue
+            dim = dd.get("dimension") if isinstance(dd.get("dimension"), dict) else {}
+            did = dim.get("id")
+            src = str(dim.get("source") or "").lower()
+            if src == "db" and did is not None:
+                dim_kind = "library"
+                dim_kind_label = "Library dimension (catalog)"
+            elif src == "llm" or did is None:
+                dim_kind = "proposed"
+                dim_kind_label = "Proposed / LLM dimension (no DB id yet)"
+            else:
+                dim_kind = "other"
+                dim_kind_label = "Dimension"
+            dims_out.append(
+                {
+                    "display_name": dim.get("display_name"),
+                    "slug": dim.get("slug"),
+                    "source": dim.get("source"),
+                    "id": did,
+                    "dim_kind": dim_kind,
+                    "dim_kind_label": dim_kind_label,
+                    "roles_from_db": [
+                        str(r.get("display_name") or "")
+                        for r in (dd.get("roles_from_db") or [])
+                        if isinstance(r, dict)
+                    ],
+                }
+            )
+
+        locked_out: list[dict[str, Any]] = []
+        if meta:
+            for ld in meta.get("locked_dimensions") or []:
+                if not isinstance(ld, dict):
+                    continue
+                tid = str(ld.get("tentative_id") or "")
+                locked_out.append(
+                    {
+                        "tentative_id": tid,
+                        "name": ld.get("name"),
+                        "description": (str(ld.get("description") or ""))[:500],
+                        "placement_note": (
+                            "Reuses catalog slug"
+                            if tid and not tid.startswith(("d_init_", "d_merge_", "d_split_"))
+                            else "Pipeline tentative id"
+                        ),
+                    }
+                )
+
+        persist_tag = persist_tag_by_skill.get(nk, "")
+        link_rows: list[dict[str, Any]] = []
+        for it in persist_rows_by_skill.get(nk, []):
+            dim = it.get("dimension") if isinstance(it.get("dimension"), dict) else {}
+            link_rows.append(
+                {
+                    "dimension_name": dim.get("display_name"),
+                    "dimension_slug": dim.get("slug"),
+                    "dimension_id": dim.get("id"),
+                    "skill_dimension_saved": bool(it.get("skill_dimension_saved")),
+                    "role_dimension_saved": bool(it.get("role_dimension_saved")),
+                    "outcome_line": it.get("outcome_line"),
+                    "skipped_reason": it.get("skipped_reason"),
+                }
+            )
+
+        # Skill enrichment: library canonical profile vs v3 orchestrator enrichment.
+        enrichment_source: str | None = None
+        library_canonical_profile: dict[str, Any] | None = None
+        orchestrator_enrichment: dict[str, Any] | None = None
+        orchestrator_typed: dict[str, Any] | None = None
+        orchestrator_derived: dict[str, Any] | None = None
+        if source_tag == "db" and canonical:
+            enrichment_source = "library"
+            library_canonical_profile = {
+                "id": canonical.get("id"),
+                "slug": canonical.get("slug"),
+                "display_name": canonical.get("display_name"),
+                "category_id": canonical.get("category_id"),
+                "sub_category_id": canonical.get("sub_category_id"),
+                "skill_nature": canonical.get("skill_nature"),
+                "volatility": canonical.get("volatility"),
+                "typical_lifespan": canonical.get("typical_lifespan"),
+                "is_extractable": canonical.get("is_extractable"),
+                "is_also_category": canonical.get("is_also_category"),
+            }
+        elif source_tag == "llm":
+            enrichment_source = "orchestrator"
+            enr = meta.get("enrichment") if isinstance(meta, dict) else None
+            if isinstance(enr, dict):
+                orchestrator_enrichment = enr
+            ts = meta.get("typed") if isinstance(meta, dict) else None
+            if isinstance(ts, dict):
+                orchestrator_typed = ts
+            dv = meta.get("derived") if isinstance(meta, dict) else None
+            if isinstance(dv, dict):
+                orchestrator_derived = dv
+
+        skills_out.append(
+            {
+                "skill_name": name,
+                "is_primary": bool(fs.get("is_primary")),
+                "source_tag": source_tag,
+                "skill_row_kind": skill_row_kind,
+                "skill_row_label": skill_row_label,
+                "persist_tag": persist_tag,
+                "persist_tag_label": (
+                    "API 3: existing canonical (in_db)"
+                    if persist_tag == "in_db"
+                    else (
+                        "API 3: new canonical path (new)"
+                        if persist_tag == "new"
+                        else "API 3 not run or tag missing"
+                    )
+                ),
+                "canonical_id": (canonical or {}).get("id"),
+                "canonical_display_name": (canonical or {}).get("display_name"),
+                "canonical_slug": (canonical or {}).get("slug"),
+                "dimensions": dims_out,
+                "locked_dimensions": locked_out,
+                "has_new_skill_meta": meta is not None,
+                "api3_link_rows": link_rows,
+                "enrichment_source": enrichment_source,
+                "library_canonical_profile": library_canonical_profile,
+                "orchestrator_enrichment": orchestrator_enrichment,
+                "orchestrator_typed": orchestrator_typed,
+                "orchestrator_derived": orchestrator_derived,
+            }
+        )
+
+    cr = api3.get("chosen_role") or api2.get("chosen_role")
+    chosen = cr if isinstance(cr, dict) else None
+
+    pers_summary: dict[str, Any] = {}
+    if isinstance(pers, dict):
+        pers_summary = {
+            "new_skills_created": pers.get("new_skills_created", 0),
+            "skill_dimension_saved": pers.get("skill_dimension_saved", 0),
+            "role_dimension_saved": pers.get("role_dimension_saved", 0),
+            "skipped": pers.get("skipped", 0),
+        }
+
+    return {
+        "pipeline": {
+            "api1": "POST /skills/extract-from-jd",
+            "api2": "POST /skills/extract-details",
+            "api3": "POST /skills/final-role-output",
+        },
+        "chosen_role": chosen,
+        "chosen_role_resolution": api3.get("chosen_role_resolution"),
+        "persistence_summary": pers_summary,
+        "persistence_item_count": len(raw_items),
+        "persistence_items": raw_items,
+        "skills": skills_out,
+    }
+
+
 @app.get("/skills/runs/{run_id}", response_model=JdRunDetail)
 async def get_jd_pipeline_run(run_id: str):
     """Return the full row for one run, including artifacts."""
@@ -2374,7 +2600,12 @@ async def get_jd_pipeline_run(run_id: str):
         raise HTTPException(status_code=404, detail="run_id not found")
     artifacts_raw = row.pop("artifacts", []) or []
     artifacts = [JdRunArtifact(**a) for a in artifacts_raw]
-    return JdRunDetail(**row, artifacts=artifacts)
+    history_view = _build_jd_history_view(
+        row.get("api1_response"),
+        row.get("api2_response"),
+        row.get("api3_response"),
+    )
+    return JdRunDetail(**row, artifacts=artifacts, history_view=history_view)
 
 
 @app.post("/extract-pdf-links", response_model=PdfLinksResponse)
