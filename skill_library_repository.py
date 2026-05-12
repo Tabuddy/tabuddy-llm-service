@@ -8,16 +8,6 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-_alias_embedder = None
-
-
-def _get_alias_embedder():
-    global _alias_embedder
-    if _alias_embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _alias_embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    return _alias_embedder
-
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
@@ -67,8 +57,8 @@ def _quote_ident(ident: str) -> str:
 
 
 class SkillLibraryRepository:
-    """Read/write helpers for public.canonical_skills, public.skill_aliases,
-    public.dimensions, public.role_dimensions, public.roles."""
+    """Read/write helpers for canonical_skills, skill_aliases, dimensions,
+    role_dimensions, and roles in ``SKILL_LIBRARY_SCHEMA`` (quoted in SQL)."""
 
     def __init__(
         self,
@@ -88,11 +78,14 @@ class SkillLibraryRepository:
         self.db_user = os.getenv("DB_USER", "")
         self.db_password = os.getenv("DB_PASSWORD", "")
         raw_schema = (
-            schema if schema is not None else os.getenv("SKILL_LIBRARY_SCHEMA", "public")
-        )
+            (schema if schema is not None else os.getenv("SKILL_LIBRARY_SCHEMA", "public"))
+            or "public"
+        ).strip()
         # Keep schema SQL-safe for f-string composed queries (supports hyphenated
         # names like "skill-library").
         self.schema = _quote_ident(raw_schema)
+        # pgvector type lives in the catalogue schema (e.g. "skill-library".vector).
+        self._vector_type_sql = f"{self.schema}.vector"
 
         if not self.database_url and not (
             self.db_host and self.db_name and self.db_user and self.db_password
@@ -112,7 +105,7 @@ class SkillLibraryRepository:
             password=self.db_password,
             sslmode=os.getenv("DB_SSLMODE", "require"),
             connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "30")),
-            options="-c search_path=dev,public",
+            options=f"-c search_path={self.schema},public",
         )
 
     # ── Canonical skill / alias lookup ──────────────────────────────────────
@@ -206,16 +199,32 @@ class SkillLibraryRepository:
             return 0
 
         alias_texts = [r[1] for r in raw]
-        model = _get_alias_embedder()
-        vectors = model.encode(alias_texts, show_progress_bar=False)
+        vectors_out: list[list[float] | None] = []
+        try:
+            from skill_matcher import _azure_embed_sync
 
-        rows = [
-            (
-                skill_id, alias_text, atype, strategy,
-                "[" + ",".join(map(str, vec.tolist())) + "]",
-            )
-            for (skill_id, alias_text, atype, strategy), vec in zip(raw, vectors)
-        ]
+            batch = _azure_embed_sync(alias_texts)
+            if batch and len(batch) == len(alias_texts):
+                vectors_out = [list(v) if v else None for v in batch]
+            else:
+                vectors_out = [None] * len(raw)
+        except Exception:
+            vectors_out = [None] * len(raw)
+
+        rows: list[tuple] = []
+        for (skill_id, alias_text, atype, strategy), vec in zip(raw, vectors_out):
+            if vec is not None:
+                rows.append(
+                    (
+                        skill_id,
+                        alias_text,
+                        atype,
+                        strategy,
+                        "[" + ",".join(map(str, vec)) + "]",
+                    )
+                )
+            else:
+                rows.append((skill_id, alias_text, atype, strategy, None))
 
         sql = f"""
             INSERT INTO {self.schema}.skill_aliases
@@ -228,7 +237,7 @@ class SkillLibraryRepository:
             with conn.cursor() as cur:
                 returned = psycopg2.extras.execute_values(
                     cur, sql, rows,
-                    template="(%s, %s, %s, %s, %s::dev.vector)",
+                    template=f"(%s, %s, %s, %s, %s::{self._vector_type_sql})",
                     fetch=True,
                 )
                 inserted = len(returned or [])
@@ -392,11 +401,11 @@ class SkillLibraryRepository:
             SELECT id, slug, display_name,
                    skill_nature::text AS skill_nature,
                    typical_lifespan::text AS typical_lifespan,
-                   ROUND((1 - (name_embedding <=> %s::dev.vector))::numeric, 4) AS similarity
+                   ROUND((1 - (name_embedding <=> %s::{self._vector_type_sql}))::numeric, 4) AS similarity
             FROM {self.schema}.canonical_skills
             WHERE name_embedding IS NOT NULL
-              AND 1 - (name_embedding <=> %s::dev.vector) >= %s
-            ORDER BY name_embedding <=> %s::dev.vector
+              AND 1 - (name_embedding <=> %s::{self._vector_type_sql}) >= %s
+            ORDER BY name_embedding <=> %s::{self._vector_type_sql}
             LIMIT %s
         """
         with self._connect() as conn:
@@ -417,11 +426,11 @@ class SkillLibraryRepository:
         vec_str = "[" + ",".join(map(str, name_vec)) + "]"
         sql = f"""
             SELECT id, slug, display_name, rationale,
-                   ROUND((1 - (name_embedding <=> %s::dev.vector))::numeric, 4) AS similarity
+                   ROUND((1 - (name_embedding <=> %s::{self._vector_type_sql}))::numeric, 4) AS similarity
             FROM {self.schema}.dimensions
             WHERE name_embedding IS NOT NULL
-              AND 1 - (name_embedding <=> %s::dev.vector) >= %s
-            ORDER BY name_embedding <=> %s::dev.vector
+              AND 1 - (name_embedding <=> %s::{self._vector_type_sql}) >= %s
+            ORDER BY name_embedding <=> %s::{self._vector_type_sql}
             LIMIT %s
         """
         with self._connect() as conn:
@@ -442,11 +451,11 @@ class SkillLibraryRepository:
         vec_str = "[" + ",".join(map(str, name_vec)) + "]"
         sql = f"""
             SELECT id, slug, display_name, role_archetype,
-                   ROUND((1 - (name_embedding <=> %s::dev.vector))::numeric, 4) AS similarity
+                   ROUND((1 - (name_embedding <=> %s::{self._vector_type_sql}))::numeric, 4) AS similarity
             FROM {self.schema}.roles
             WHERE name_embedding IS NOT NULL
-              AND 1 - (name_embedding <=> %s::dev.vector) >= %s
-            ORDER BY name_embedding <=> %s::dev.vector
+              AND 1 - (name_embedding <=> %s::{self._vector_type_sql}) >= %s
+            ORDER BY name_embedding <=> %s::{self._vector_type_sql}
             LIMIT %s
         """
         with self._connect() as conn:
@@ -535,7 +544,7 @@ class SkillLibraryRepository:
             vec_str = "[" + ",".join(map(str, name_embedding)) + "]"
             sql = f"""
                 INSERT INTO {self.schema}.roles (slug, display_name, role_archetype, source, name_embedding)
-                VALUES (%s, %s, %s, %s, %s::dev.vector)
+                VALUES (%s, %s, %s, %s, %s::{self._vector_type_sql})
                 RETURNING id, slug, display_name, role_archetype
             """
             params = (str(slug).strip(), str(display_name).strip(), role_archetype, _normalize_entity_source(source), vec_str)
@@ -581,15 +590,20 @@ class SkillLibraryRepository:
                 rec_with_flag.setdefault("created", False)
                 return rec_with_flag
 
+        # difficulty_hint is not NULL; explicit NULL in INSERT bypasses DEFAULT.
+        hint = (difficulty_hint or "").strip() or "well_known"
+        if len(hint) > 20:
+            hint = hint[:20]
+
         if name_embedding is not None:
             vec_str = "[" + ",".join(map(str, name_embedding)) + "]"
             sql = f"""
                 INSERT INTO {self.schema}.dimensions
                     (slug, display_name, rationale, difficulty_hint, source, name_embedding)
-                VALUES (%s, %s, %s, %s, %s, %s::dev.vector)
+                VALUES (%s, %s, %s, %s, %s, %s::{self._vector_type_sql})
                 RETURNING id, slug, display_name, rationale, difficulty_hint
             """
-            params = (str(slug).strip(), str(display_name).strip(), rationale, difficulty_hint, _normalize_entity_source(source), vec_str)
+            params = (str(slug).strip(), str(display_name).strip(), rationale, hint, _normalize_entity_source(source), vec_str)
         else:
             sql = f"""
                 INSERT INTO {self.schema}.dimensions
@@ -597,7 +611,7 @@ class SkillLibraryRepository:
                 VALUES (%s, %s, %s, %s, %s)
                 RETURNING id, slug, display_name, rationale, difficulty_hint
             """
-            params = (str(slug).strip(), str(display_name).strip(), rationale, difficulty_hint, _normalize_entity_source(source))
+            params = (str(slug).strip(), str(display_name).strip(), rationale, hint, _normalize_entity_source(source))
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -751,7 +765,7 @@ class SkillLibraryRepository:
                 INSERT INTO {self.schema}.canonical_skills
                     (slug, display_name, category_id, sub_category_id,
                      skill_nature, typical_lifespan, source, confidence, name_embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::dev.vector)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::{self._vector_type_sql})
                 RETURNING id, slug, display_name, category_id, sub_category_id,
                           skill_nature::text, typical_lifespan::text
             """
@@ -782,8 +796,7 @@ class SkillLibraryRepository:
     # ── Browse helpers for the /canonical-skill UI ──────────────────────────
     # Read-only queries used by canonical_skill_api.py to power the
     # three-pane Roles / Dimensions / Skills browser. All methods respect
-    # self.schema (so SKILL_LIBRARY_SCHEMA=dev points at the prod-mirror
-    # without code change). Identifier args accept either an integer id or
+    # self.schema (SKILL_LIBRARY_SCHEMA, e.g. skill-library). Identifier args accept either an integer id or
     # a slug string; resolution uses _id_or_slug_clause below.
 
     @staticmethod

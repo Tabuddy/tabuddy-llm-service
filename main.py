@@ -322,6 +322,10 @@ class PersistenceItem(BaseModel):
     skill_dimension_saved: bool = False
     role_dimension_saved: bool = False
     skipped_reason: str | None = None
+    outcome_line: str | None = Field(
+        default=None,
+        description="Human-readable outcome for the Stage 03 UI (skill / dim / role-link).",
+    )
 
 
 class PersistenceReport(BaseModel):
@@ -351,6 +355,10 @@ class FinalRoleOutputResponse(BaseModel):
     persistence: PersistenceReport
     planner_output: PlannerGeneratedOutput | None = None
     run_id: str | None = None
+    # ``in_db`` — chosen role resolved to an existing DB row.
+    # ``human_review_required`` — chosen role not in DB; no auto-create (default).
+    # ``auto_created`` — missing role was inserted (API3_AUTO_CREATE_MISSING_ROLE=1).
+    chosen_role_resolution: str | None = None
 
 
 # ── JD Pipeline History models ───────────────────────────────────────────────
@@ -458,15 +466,301 @@ def _extract_jd_sentence(jd_text: str, word: str, max_chars: int = 180) -> str:
     return ""
 
 
-_embedder_model = None
+def _embed_for_skill_library_db(text: str) -> list[float] | None:
+    """1536-dim vectors for ``skill-library`` pgvector columns (Azure OpenAI).
+
+    Must match ``skill_matcher`` / existing ``canonical_skills.name_embedding``.
+    Returns None when the client is unavailable so inserts can omit embedding.
+    """
+    from skill_matcher import _azure_embed_sync
+
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return None
+    vecs = _azure_embed_sync([trimmed])
+    if not vecs or not vecs[0]:
+        return None
+    return list(vecs[0])
 
 
-def _embed_text(text: str) -> list[float]:
-    global _embedder_model
-    if _embedder_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedder_model.encode([(text or "").strip()], show_progress_bar=False)[0].tolist()
+# ── API 3: reconciliation-aware dimension + new-skill helpers ───────────────
+
+_PIPELINE_DIM_PREFIXES = ("d_init_", "d_merge_", "d_split_")
+
+
+def _is_pipeline_generated_dim_slug(slug: str | None) -> bool:
+    if not slug or not isinstance(slug, str):
+        return False
+    s = slug.strip().lower()
+    return any(s.startswith(p) for p in _PIPELINE_DIM_PREFIXES)
+
+
+def _catalog_slug_from_merge_log(
+    merge_log: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Map tentative / merge ``into`` ids (lower) -> catalog dimension slug.
+
+    When Stage 3 MERGE collapses a pipeline dim with an existing library
+    dimension, callers should persist links against the catalog row, not a
+    new ``d_merge_*`` row.
+    """
+    out: dict[str, str] = {}
+    for entry in merge_log or []:
+        merged_from = list(entry.get("merged_from") or [])
+        into = entry.get("into")
+        catalog_slugs: list[str] = []
+        for key in ("a_dim_id", "b_dim_id"):
+            val = entry.get(key)
+            if val is None:
+                continue
+            s = str(val).strip()
+            if s and not _is_pipeline_generated_dim_slug(s):
+                catalog_slugs.append(s)
+        if not catalog_slugs:
+            continue
+        catalog = catalog_slugs[0]
+        for tid in merged_from:
+            if tid is None:
+                continue
+            ts = str(tid).strip()
+            if ts:
+                out[ts.lower()] = catalog
+        if into:
+            out[str(into).strip().lower()] = catalog
+    return out
+
+
+def _resolve_dimension_id_from_reconciliation_sync(
+    repo: SkillLibraryRepository,
+    *,
+    dimension_slug: str | None,
+    merge_slug_map: dict[str, str],
+) -> int | None:
+    """Resolve ``dimensions.id`` using merge reconciliation when applicable."""
+    slug = (dimension_slug or "").strip()
+    if not slug:
+        return None
+    slug_lc = slug.lower()
+    if not _is_pipeline_generated_dim_slug(slug):
+        found = repo.find_dimensions_by_names(slugs=[slug])
+        rec = found.get(slug_lc)
+        if rec is None and found:
+            rec = next(iter(found.values()))
+        if rec and rec.get("id") is not None:
+            return int(rec["id"])
+        return None
+    catalog_slug = merge_slug_map.get(slug_lc)
+    if not catalog_slug:
+        return None
+    found = repo.find_dimensions_by_names(slugs=[catalog_slug])
+    cl = catalog_slug.strip().lower()
+    rec = found.get(cl)
+    if rec is None and found:
+        rec = next(iter(found.values()))
+    if rec and rec.get("id") is not None:
+        return int(rec["id"])
+    return None
+
+
+def _has_v3_meta_for_new_skill_persist(meta: NewSkillMetaV3 | None) -> bool:
+    if meta is None:
+        return False
+    if meta.locked_dimensions:
+        return True
+    for m in meta.merge_log or []:
+        for key in ("a_dim_id", "b_dim_id"):
+            val = m.get(key)
+            if val and not _is_pipeline_generated_dim_slug(str(val)):
+                return True
+    return False
+
+
+def _append_canonical_skill_proposed_artifact(
+    artifacts: list[dict[str, Any]],
+    skill_name: str,
+    meta: NewSkillMetaV3,
+) -> None:
+    derived = meta.derived
+    typed = meta.typed
+    if derived is not None:
+        artifact_text = (
+            f"{skill_name} | type={derived.category} subtype={derived.sub_category} "
+            f"nature={derived.skill_nature} lifespan={derived.typical_lifespan}"
+        )
+    elif typed is not None:
+        artifact_text = f"{skill_name} | type={typed.type} subtype={typed.subtype}"
+    else:
+        artifact_text = skill_name
+    if len(artifact_text) > 500:
+        artifact_text = artifact_text[:497] + "..."
+    artifacts.append({
+        "kind": "canonical_skill_proposed",
+        "artifact_text": artifact_text,
+    })
+
+
+def _try_create_new_canonical_skill_sync(
+    repo: SkillLibraryRepository,
+    sd: SkillDetail,
+) -> tuple[int | None, str | None]:
+    """Insert canonical skill + primary alias for one v3-shaped LLM skill."""
+    meta = sd.new_skill_meta
+    if meta is None or not _has_v3_meta_for_new_skill_persist(meta):
+        return None, "no_persistable_v3_meta"
+    display_name = sd.input_skill.strip()
+    if not display_name:
+        return None, "empty_display_name"
+    try:
+        derived = meta.derived
+        typed = meta.typed
+        if derived is not None:
+            cat_name = (derived.category or "General").strip() or "General"
+            sub_token = (derived.sub_category or "general").strip() or "general"
+            sub_name = sub_token.replace("_", " ").strip().title() or "General"
+            skill_nature = str(derived.skill_nature or "TOOL")
+            typical_lifespan = str(derived.typical_lifespan or "EVERGREEN")
+        elif typed is not None:
+            cat_name = (typed.type or "General").strip() or "General"
+            sub_token = (typed.subtype or "general").strip() or "general"
+            sub_name = sub_token.replace("_", " ").strip().title() or "General"
+            skill_nature = "TOOL"
+            typical_lifespan = "EVERGREEN"
+        else:
+            cat_name = "General"
+            sub_name = "General"
+            skill_nature = "TOOL"
+            typical_lifespan = "EVERGREEN"
+        if len(sub_name) > 120:
+            sub_name = sub_name[:120]
+
+        cat = repo.find_or_create_category(display_name=cat_name)
+        sub = repo.find_or_create_sub_category(
+            category_id=int(cat["id"]),
+            display_name=sub_name,
+        )
+        emb = _embed_for_skill_library_db(display_name)
+        row = repo.create_canonical_skill(
+            display_name=display_name,
+            category_id=int(cat["id"]),
+            sub_category_id=int(sub["id"]),
+            skill_nature=skill_nature,
+            typical_lifespan=typical_lifespan,
+            source="llm",
+            name_embedding=emb,
+        )
+        sid = int(row["id"])
+        repo.add_aliases(
+            [(sid, display_name)],
+            alias_type="CANONICAL",
+            match_strategy="CASE_INSENSITIVE",
+        )
+        return sid, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _extra_dimension_rows_from_skills_detail(
+    skills_detail: list[SkillDetail],
+) -> list[DimensionDetail]:
+    """Add locked / merge-only dimension rows missing from ``skills_detail.dimensions``."""
+    out: list[DimensionDetail] = []
+    keys: set[tuple[str, str]] = set()
+    for sd in skills_detail:
+        if sd.source_tag != "llm" or not sd.new_skill_meta:
+            continue
+        meta = sd.new_skill_meta
+        existing_slugs = {(d.dimension.slug or "").strip().lower() for d in sd.dimensions}
+        for ld in meta.locked_dimensions:
+            tid = (ld.tentative_id or "").strip()
+            if not tid:
+                continue
+            tlc = tid.lower()
+            if tlc in existing_slugs:
+                continue
+            key = (sd.input_skill.strip().lower(), tlc)
+            if key in keys:
+                continue
+            keys.add(key)
+            mat = meta.enrichment.maturity if meta.enrichment else None
+            diff = mat.maturity if mat else None
+            out.append(
+                DimensionDetail(
+                    input_skill=sd.input_skill,
+                    dimension=DimensionSummary(
+                        id=None,
+                        slug=tid,
+                        display_name=ld.name,
+                        rationale=ld.description,
+                        difficulty_hint=diff,
+                        source="llm",
+                    ),
+                    roles_from_db=[],
+                    llm_role=None,
+                )
+            )
+        if not meta.locked_dimensions and meta.merge_log:
+            seen_cat: set[str] = set()
+            for entry in meta.merge_log:
+                for key in ("a_dim_id", "b_dim_id"):
+                    val = entry.get(key)
+                    if not val or _is_pipeline_generated_dim_slug(str(val)):
+                        continue
+                    sl = str(val).strip()
+                    slc = sl.lower()
+                    if slc in seen_cat or slc in existing_slugs:
+                        continue
+                    seen_cat.add(slc)
+                    k2 = (sd.input_skill.strip().lower(), slc)
+                    if k2 in keys:
+                        continue
+                    keys.add(k2)
+                    disp = (
+                        entry.get("b_name")
+                        or entry.get("into_name")
+                        or sl.replace("-", " ").title()
+                    )
+                    out.append(
+                        DimensionDetail(
+                            input_skill=sd.input_skill,
+                            dimension=DimensionSummary(
+                                id=None,
+                                slug=sl,
+                                display_name=disp,
+                                rationale=entry.get("reasoning"),
+                                difficulty_hint=None,
+                                source="db",
+                            ),
+                            roles_from_db=[],
+                            llm_role=None,
+                        )
+                    )
+    return out
+
+
+def _merge_dimension_worklist(req: FinalRoleOutputRequest) -> list[DimensionDetail]:
+    """``req.dimensions`` plus locked / merge-only rows, de-duplicated by (skill, slug)."""
+    seen: set[tuple[str, str]] = set()
+    out: list[DimensionDetail] = []
+    for dd in req.dimensions:
+        sk = dd.input_skill.strip().lower()
+        sl = (dd.dimension.slug or "").strip().lower()
+        if sl:
+            key = (sk, sl)
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(dd)
+    for dd in _extra_dimension_rows_from_skills_detail(req.skills_detail):
+        sk = dd.input_skill.strip().lower()
+        sl = (dd.dimension.slug or "").strip().lower()
+        if not sl:
+            continue
+        key = (sk, sl)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dd)
+    return out
 
 
 def _norm_token(v: str | None) -> str:
@@ -857,32 +1151,84 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     # NewSkillMetaV3 payload kept on SkillDetail.new_skill_meta.
     new_skill_meta_by_skill: dict[str, NewSkillMetaV3] = {}
 
-    # Drop plain English dictionary words before paying for LLM calls.
-    # Real tech skills always have at least one of: uppercase, digit, hyphen,
-    # dot, slash, or are >1 word. Single all-lowercase words like "codes",
-    # "releases", "functionality" are noise from the JD extractor.
-    def _looks_like_skill(s: str) -> bool:
-        if any(ch in s for ch in ("-", ".", "/", "+")):
-            return True
-        if any(ch.isdigit() for ch in s):
-            return True
-        parts = s.split()
-        if len(parts) > 1:
-            return True
-        # Single token: require at least one uppercase letter
-        return any(ch.isupper() for ch in s)
-
-    unmatched_llm_skills = [s for s in unmatched_llm_skills if _looks_like_skill(s)]
+    # Run the orchestrator for every unmatched term that came from llm_skills.
+    # We intentionally do not pre-filter single lowercase tokens: extractors
+    # often emit brand names like "firebase" / "flutter" / "jetpack", which
+    # must still be enriched and dimension-placed.
 
     role_hint_text = ""
     if req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
         role_hint_text = req.jd_role_hint.display_name.strip()
 
-    # v3 per-skill orchestrator (dim-gen → type → containment → enrichment) is
-    # skipped here: it costs ~8 LLM calls per unknown skill and is only needed
-    # when actually persisting new skills to the DB (API 3). Since writes are
-    # currently gated off, running it adds no value to role inference.
-    # new_skill_meta_by_skill stays empty — re-enable when writes are live.
+    if unmatched_llm_skills:
+        try:
+            dimension_catalogue = await asyncio.to_thread(
+                fetch_dimensions_catalog_skill_library,
+                limit=400,
+            )
+        except Exception as exc:
+            logger.warning(
+                "skill-library dimensions lookup failed; v3 dim-gen will run without prior catalog: %s",
+                exc,
+            )
+            dimension_catalogue = []
+        # Cap and normalize skill-library dimension rows so the v3 prompt +
+        # overlap checker have the keys they expect
+        # (tentative_id, name, description).
+        if len(dimension_catalogue) > 40:
+            step = len(dimension_catalogue) // 40
+            dimension_catalogue = dimension_catalogue[::step][:40]
+        existing_dims_v3: list[dict] = []
+        for d in dimension_catalogue:
+            dim_id = str(d.get("tentative_id") or d.get("slug") or "").strip()
+            name = str(d.get("name") or d.get("display_name") or "").strip()
+            desc = str(d.get("description") or d.get("rationale") or "").strip()
+            if not dim_id or not name:
+                continue
+            existing_dims_v3.append({
+                "tentative_id": dim_id,
+                "name": name,
+                "description": desc,
+                "role_display": str(d.get("role_display") or "").strip(),
+            })
+
+        candidate_skills_pool: list[dict] = []
+        try:
+            candidate_skills_pool = await asyncio.to_thread(
+                fetch_candidate_skills_pool_skill_library,
+                limit=200,
+            )
+        except Exception as exc:
+            logger.warning(
+                "skill-library canonical skills pool lookup failed; pool will be empty: %s",
+                exc,
+            )
+            candidate_skills_pool = []
+
+        async def _enrich_one(skill_name: str) -> tuple[str, NewSkillMetaV3 | None]:
+            try:
+                meta = await enrich_new_skill(
+                    skill_name=skill_name,
+                    role_hint=role_hint_text,
+                    existing_dims=existing_dims_v3,
+                    candidate_skills_pool=candidate_skills_pool,
+                    accumulator=cost_acc,
+                )
+                return skill_name, meta
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "v3 new-skill orchestrator failed for %r: %s",
+                    skill_name, exc,
+                )
+                return skill_name, None
+
+        results = await asyncio.gather(
+            *[_enrich_one(s) for s in unmatched_llm_skills],
+            return_exceptions=False,
+        )
+        for skill_name, meta in results:
+            if meta is not None:
+                new_skill_meta_by_skill[skill_name] = meta
 
     # Backfill role labels on Stage 3 logs from DB dimension-role links.
     # Some logs can miss b_role/a_role depending on upstream payload shape.
@@ -1427,10 +1773,12 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     rev_planner = AzureReversePlannerLLM(accumulator=cost_acc)
     history_repo = JdPipelineRunRepository() if req.run_id else None
     artifacts: list[dict[str, Any]] = []
+    dimension_worklist = _merge_dimension_worklist(req)
 
-    # TODO: REMOVE COMMENT AFTER TESTING — API 3 skill-library INSERT/UPSERT (roles,
-    # dimensions, links). Set ``True`` to re-enable catalogue persistence below.
-    _API3_writes_enabled = False
+    # API 1 / API 2: alias + non-skill writes stay disabled for testing.
+    # API 3: catalogue persistence ON (canonical inserts for new v3 skills,
+    # dimension create only when not merged into an existing dim, links).
+    _API3_writes_enabled = True
 
     # 1) Build final input skills with in_db/new tags.
     final_input_skills = [
@@ -1447,6 +1795,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             persistence=persistence,
             planner_output=None,
             run_id=req.run_id,
+            chosen_role_resolution=None,
         )
         if history_repo is not None:
             duration_ms = int((time.monotonic() - api3_started_at) * 1000)
@@ -1461,7 +1810,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             )
         return empty_response
 
-    # 2) Resolve role in DB (or conditionally create when missing).
+    # 2) Resolve role in DB. Optional auto-create only when
+    # API3_AUTO_CREATE_MISSING_ROLE=1 (default: off — human review, no DB row).
     resolved_role = await asyncio.to_thread(
         repo.find_role_by_identity,
         role_id=chosen.id,
@@ -1470,15 +1820,18 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     )
     role_missing_initially = resolved_role is None
     planner_output: PlannerGeneratedOutput | None = None
+    role_auto_inserted = False
 
-    if role_missing_initially:
+    if role_missing_initially and os.getenv(
+        "API3_AUTO_CREATE_MISSING_ROLE", ""
+    ).strip().lower() in ("1", "true", "yes"):
         matched_rows = sum(
-            1 for dd in req.dimensions if _role_matches_chosen(dd, chosen)
+            1 for dd in dimension_worklist if _role_matches_chosen(dd, chosen)
         )
         should_create = _should_create_missing_role(
             chosen,
             matched_rows=matched_rows,
-            total_rows=len(req.dimensions),
+            total_rows=len(dimension_worklist),
         )
         if should_create:
             try:
@@ -1486,8 +1839,12 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     pass
                 else:
                     role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
-                    role_vec = await asyncio.to_thread(_embed_text, role_embed_text.strip())
-                    similar_roles = await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                    role_vec = await asyncio.to_thread(_embed_for_skill_library_db, role_embed_text.strip())
+                    similar_roles = (
+                        await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                        if role_vec is not None
+                        else []
+                    )
                     role_reused = False
                     if similar_roles:
                         dedup = await rev_planner.confirm_or_reuse_entity(
@@ -1514,6 +1871,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                             and resolved_role.get("id") is not None
                             and not role_reused
                         ):
+                            role_auto_inserted = True
                             artifacts.append({
                                 "kind": "role_created",
                                 "artifact_id": int(resolved_role["id"]),
@@ -1534,6 +1892,16 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             role_archetype=resolved_role.get("role_archetype") or chosen.role_archetype,
             rationale=chosen.rationale,
         )
+    elif chosen is not None:
+        # Chosen role not in DB: never mint a fake id — human review before insert.
+        chosen_role_out = ChosenRole(
+            source=chosen.source or "llm",
+            id=None,
+            slug=chosen.slug,
+            display_name=chosen.display_name,
+            role_archetype=chosen.role_archetype,
+            rationale=chosen.rationale,
+        )
 
     # 3) Map skill -> canonical id for persistence.
     skill_lookup = await asyncio.to_thread(
@@ -1552,12 +1920,6 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         s.lower(): sid for s, sid in skill_id_by_input.items()
     }
 
-    # 3.5) New (canonical-miss) LLM skills: The v3
-    # orchestrator already produced a NewSkillMetaV3 in API 2 with type,
-    # placement, containment, enrichment + derived legacy fields. We just
-    # emit a `canonical_skill_proposed` artifact carrying a compact snapshot
-    # for the history page; the full v3 payload is already in api2_response.
-    # TODO:— persist these to the dedicated skill-library DB schema.
     new_skill_metas = {
         sd.input_skill: sd.new_skill_meta
         for sd in req.skills_detail
@@ -1565,32 +1927,64 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         and sd.new_skill_meta is not None
         and sd.input_skill.lower() not in skill_id_by_input_lower
     }
-    for skill_name, meta in new_skill_metas.items():
-        derived = meta.derived
-        typed = meta.typed
-        if derived is not None:
-            artifact_text = (
-                f"{skill_name} | type={derived.category} subtype={derived.sub_category} "
-                f"nature={derived.skill_nature} lifespan={derived.typical_lifespan}"
+    skills_created_this_run: set[str] = set()
+
+    # 3.5) New (canonical-miss) LLM skills: insert canonical + primary alias
+    # when v3 meta has locked dimensions and/or merge targets; else artifact only.
+    if not _API3_writes_enabled:
+        for skill_name, meta in new_skill_metas.items():
+            _append_canonical_skill_proposed_artifact(artifacts, skill_name, meta)
+    else:
+        for sd in req.skills_detail:
+            if sd.source_tag != "llm":
+                continue
+            if sd.input_skill.lower() in skill_id_by_input_lower:
+                continue
+            meta = sd.new_skill_meta
+            if not _has_v3_meta_for_new_skill_persist(meta):
+                if meta is not None:
+                    _append_canonical_skill_proposed_artifact(
+                        artifacts, sd.input_skill, meta
+                    )
+                continue
+            sid, err = await asyncio.to_thread(
+                _try_create_new_canonical_skill_sync, repo, sd
             )
-        elif typed is not None:
-            artifact_text = f"{skill_name} | type={typed.type} subtype={typed.subtype}"
+            if sid is not None:
+                skill_id_by_input[sd.input_skill] = sid
+                skill_id_by_input_lower[sd.input_skill.lower()] = sid
+                skills_created_this_run.add(sd.input_skill.strip().lower())
+                persistence.new_skills_created += 1
+                artifacts.append({
+                    "kind": "canonical_skill_added",
+                    "artifact_id": sid,
+                    "artifact_text": sd.input_skill[:500],
+                })
+            else:
+                if meta is not None:
+                    _append_canonical_skill_proposed_artifact(
+                        artifacts, sd.input_skill, meta
+                    )
+                logger.warning(
+                    "API3 new canonical skill not created for %r: %s",
+                    sd.input_skill,
+                    err,
+                )
+
+    meta_merge_by_skill_lower: dict[str, dict[str, str]] = {}
+    for sd in req.skills_detail:
+        key = sd.input_skill.strip().lower()
+        if sd.new_skill_meta and sd.new_skill_meta.merge_log:
+            meta_merge_by_skill_lower[key] = _catalog_slug_from_merge_log(
+                sd.new_skill_meta.merge_log
+            )
         else:
-            artifact_text = skill_name
-        # `artifact_text` is bounded by jd_run_artifacts.artifact_text TEXT
-        # (no length cap in DDL) but we cap to keep history rows compact —
-        # full payload lives on jd_pipeline_runs.api2_response.
-        if len(artifact_text) > 500:
-            artifact_text = artifact_text[:497] + "..."
-        artifacts.append({
-            "kind": "canonical_skill_proposed",
-            "artifact_text": artifact_text,
-        })
+            meta_merge_by_skill_lower.setdefault(key, {})
 
     # 4) Persist per (skill, dimension):
     # - always attempt skill-dimension for DB-backed skills
     # - persist role-dimension only when row matches chosen role and role exists in DB
-    for dd in req.dimensions:
+    for dd in dimension_worklist:
         skill_name = dd.input_skill
         skill_id = skill_id_by_input_lower.get(skill_name.lower())
         skill_tag = "in_db" if skill_id is not None else "new"
@@ -1616,10 +2010,21 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
 
         if skill_id is None:
-            #  we no longer auto-create canonical_skills here. Emit proposed-artifact rows
-            # so the history page still shows what the v3 stack inferred
-            # for this (skill, dim) pair, but skip every legacy INSERT.
-            item.skipped_reason = "skill_not_in_db_v3_proposed"
+            meta_sd = next(
+                (
+                    x
+                    for x in req.skills_detail
+                    if x.input_skill.strip().lower() == skill_name.strip().lower()
+                ),
+                None,
+            )
+            meta = meta_sd.new_skill_meta if meta_sd else None
+            if _has_v3_meta_for_new_skill_persist(meta):
+                item.skipped_reason = "skill_not_in_db_create_failed"
+                item.outcome_line = "Skipped — new skill not created (see logs)"
+            else:
+                item.skipped_reason = "skill_not_in_db_v3_proposed"
+                item.outcome_line = "Skipped — no persistable v3 meta for new skill"
             persistence.skipped += 1
             if dim_id is None:
                 artifacts.append({
@@ -1635,8 +2040,6 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 and chosen_role_out is not None
                 and chosen_role_out.id is not None
             ):
-                # Same as above — when the chosen role IS in the DB but the
-                # dim isn't, emit the role-dim link as a proposal too.
                 artifacts.append({
                     "kind": "role_dimension_link_proposed",
                     "artifact_text": (
@@ -1650,15 +2053,44 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             item.skipped_reason = (
                 "TODO: REMOVE AFTER TESTING — api3_writes_enabled=False (writes disabled)"
             )
+            item.outcome_line = "Writes disabled"
             persistence.skipped += 1
             persistence.items.append(item)
             continue
 
         try:
+            merge_map = meta_merge_by_skill_lower.get(skill_name.strip().lower(), {})
+            slug_in = (dim_slug or "").strip()
+            slug_lc = slug_in.lower()
+            merge_val_slugs = {str(v).strip().lower() for v in merge_map.values() if v}
+            merge_reconciliation = False
+            catalog_slug_match = False
+            embedding_dedup = False
+            dim_row_created = False
+
+            if dim_id is None:
+                recon_id = await asyncio.to_thread(
+                    _resolve_dimension_id_from_reconciliation_sync,
+                    repo,
+                    dimension_slug=dim_slug,
+                    merge_slug_map=merge_map,
+                )
+                if recon_id is not None:
+                    dim_id = recon_id
+                    if slug_in and _is_pipeline_generated_dim_slug(slug_in) and merge_map.get(slug_lc):
+                        merge_reconciliation = True
+                    elif slug_in and slug_lc in merge_val_slugs:
+                        merge_reconciliation = True
+                    elif slug_in and not _is_pipeline_generated_dim_slug(slug_in):
+                        catalog_slug_match = True
             if dim_id is None:
                 dim_embed_text = (dim_name or "").strip() + " " + (dd.dimension.rationale or "").strip()
-                dim_vec = await asyncio.to_thread(_embed_text, dim_embed_text.strip())
-                similar_dims = await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, dim_vec)
+                dim_vec = await asyncio.to_thread(_embed_for_skill_library_db, dim_embed_text.strip())
+                similar_dims = (
+                    await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, dim_vec)
+                    if dim_vec is not None
+                    else []
+                )
                 if similar_dims:
                     dedup = await rev_planner.confirm_or_reuse_entity(
                         "dimension",
@@ -1667,6 +2099,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     )
                     if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
                         dim_id = dedup["existing_id"]
+                        embedding_dedup = True
                 if dim_id is None:
                     dim_row = await asyncio.to_thread(
                         repo.find_or_create_dimension,
@@ -1678,7 +2111,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         name_embedding=dim_vec,
                     )
                     created_id = int(dim_row["id"])
-                    if dim_row.get("created"):
+                    dim_row_created = bool(dim_row.get("created"))
+                    if dim_row_created:
                         artifacts.append({
                             "kind": "dimension_created",
                             "artifact_id": created_id,
@@ -1724,8 +2158,36 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 item.role_dimension_saved = True
             elif matched and (chosen_role_out is None or chosen_role_out.id is None):
                 item.skipped_reason = "chosen_role_not_resolved_in_db"
+
+            sk_lower = skill_name.strip().lower()
+            skill_bits: list[str] = []
+            if sk_lower in skills_created_this_run:
+                skill_bits.append("New skill saved")
+
+            if merge_reconciliation:
+                dim_bit = "Existing dimension (reconciliation merge)"
+            elif embedding_dedup:
+                dim_bit = "Existing dimension (embedding dedup)"
+            elif dim_row_created:
+                dim_bit = "New dimension saved (reconciliation separate)"
+            elif catalog_slug_match:
+                dim_bit = "Existing dimension (catalog slug)"
+            else:
+                dim_bit = "Existing dimension (library)"
+
+            if item.role_dimension_saved:
+                role_bit = "Role↔dimension saved"
+            elif matched and (chosen_role_out is None or chosen_role_out.id is None):
+                role_bit = "Role↔dimension not saved — chosen role not in DB (human review)"
+            elif not matched:
+                role_bit = "Role↔dimension skipped (dimension not under chosen role)"
+            else:
+                role_bit = "Role↔dimension unchanged (already linked)"
+
+            item.outcome_line = " · ".join([*skill_bits, dim_bit, role_bit])
         except Exception as exc:
             item.skipped_reason = f"db_error: {exc}"
+            item.outcome_line = f"Error: {exc}"
             persistence.skipped += 1
 
         persistence.items.append(item)
@@ -1772,10 +2234,16 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     )
                     existed = bool(dim_before)
                     planner_dim_embed_text = (d.dimension_name or "").strip() + " " + (d.rationale or "").strip()
-                    planner_dim_vec = await asyncio.to_thread(_embed_text, planner_dim_embed_text.strip())
+                    planner_dim_vec = await asyncio.to_thread(_embed_for_skill_library_db, planner_dim_embed_text.strip())
                     final_dim_id: int | None = None
                     if not existed:
-                        similar_dims = await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, planner_dim_vec)
+                        similar_dims = (
+                            await asyncio.to_thread(
+                                repo.find_similar_dimensions_by_embedding, planner_dim_vec
+                            )
+                            if planner_dim_vec is not None
+                            else []
+                        )
                         if similar_dims:
                             dedup = await rev_planner.confirm_or_reuse_entity(
                                 "dimension",
@@ -1824,12 +2292,20 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             planner_output.payload = {"error": str(exc)}
 
     cost_acc.log_summary("skills/final-role-output", logger)
+    if chosen_role_out is not None and chosen_role_out.id is not None:
+        if role_auto_inserted:
+            chosen_role_resolution = "auto_created"
+        else:
+            chosen_role_resolution = "in_db"
+    else:
+        chosen_role_resolution = "human_review_required"
     response = FinalRoleOutputResponse(
         chosen_role=chosen_role_out,
         final_input_skills=final_input_skills,
         persistence=persistence,
         planner_output=planner_output,
         run_id=req.run_id,
+        chosen_role_resolution=chosen_role_resolution,
     )
 
     # ── History persistence (only if API 1 minted a run_id) ────
