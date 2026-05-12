@@ -18,6 +18,8 @@ _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 FAST_MODEL = os.getenv("FAST_DEPLOYMENT", "gpt-4o-mini")
+NANO_MODEL = os.getenv("NANO_DEPLOYMENT", "gpt-4.1-nano")
+SKILL_MODEL = os.getenv("SKILL_DEPLOYMENT", "gpt-5.4-mini")
 REASONING_MODEL = os.getenv("REASONING_DEPLOYMENT", "o4-mini")
 GENERATION_MODEL = os.getenv("GENERATION_DEPLOYMENT", "gpt-5-mini")
 EMBEDDING_MODEL = os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")

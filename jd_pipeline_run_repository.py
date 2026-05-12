@@ -241,16 +241,18 @@ class JdPipelineRunRepository:
         *,
         jd_text: str,
         api1_response: Any,
+        api_parser_response: Any = None,
         jd_role_hint_display: str | None = None,
     ) -> str | None:
         """Insert a new run row with the API 1 response. Returns run_id or None."""
         try:
             payload = json.dumps(_json_safe(api1_response), ensure_ascii=False)
+            parser_payload = json.dumps(_json_safe(api_parser_response), ensure_ascii=False) if api_parser_response is not None else None
             stmt = sql.SQL(
                 """
                 INSERT INTO {schema}.{runs}
-                    (jd_text, status, api1_response, jd_role_hint_display)
-                VALUES (%s, %s, %s::jsonb, %s)
+                    (jd_text, status, api1_response, api_parser_response, jd_role_hint_display)
+                VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)
                 RETURNING id
                 """
             ).format(
@@ -265,6 +267,7 @@ class JdPipelineRunRepository:
                             jd_text,
                             "extract_from_jd_done",
                             payload,
+                            parser_payload,
                             jd_role_hint_display,
                         ),
                     )
@@ -579,6 +582,7 @@ class JdPipelineRunRepository:
             SELECT id::text                AS id,
                    jd_text,
                    status,
+                   api_parser_response,
                    api1_response,
                    api2_response,
                    api3_response,

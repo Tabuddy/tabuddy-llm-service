@@ -193,6 +193,8 @@ class FinalSkillItem(BaseModel):
 class JDSkillPipelineResponse(BaseModel):
     final_skills: list[FinalSkillItem] = Field(default_factory=list)
     run_id: str | None = None
+    jd_role: JdRoleHint | None = None
+    nano_parsed: dict | None = None
 
 
 # ── Skill Detail / Reverse Planner models ────────────────────────────────────
@@ -390,6 +392,7 @@ class JdRunDetail(BaseModel):
     id: str
     jd_text: str
     status: str
+    api_parser_response: dict[str, Any] | None = None
     api1_response: dict[str, Any] | None = None
     api2_response: dict[str, Any] | None = None
     api3_response: dict[str, Any] | None = None
@@ -537,16 +540,59 @@ async def normalize_skills_endpoint(req: SkillsRequest):
     )
 
 
-async def _llm_extract_skills_with_tags(
+def _extract_text(field) -> str:
+    """Safely extract .text from a nano field that may be a dict, list, or None."""
+    if isinstance(field, dict):
+        return (field.get("text") or "").strip()
+    if isinstance(field, list):
+        return "\n\n".join(
+            (item.get("text") or "").strip()
+            for item in field
+            if isinstance(item, dict) and item.get("text")
+        ).strip()
+    return ""
+
+
+async def _llm_parse_jd_nano(
     jd_text: str,
     cost_acc: "CostAccumulator | None" = None,
-) -> list[FinalSkillItem]:
-    """Send the full JD to the LLM and return skills with primary/secondary tags.
+) -> dict:
+    """Call gpt-4.1-nano with job_parser.txt prompt to extract structured JD fields."""
+    from llm_client import get_fast_client, NANO_MODEL
 
-    Each skill is tagged is_primary=True if it is a core/must-have requirement,
-    and is_primary=False if it is nice-to-have or supporting.
+    client = get_fast_client()
+    if client is None:
+        raise RuntimeError("LLM client unavailable — check AZURE_OPEN_AI_KEY")
+
+    system_prompt = (Path(__file__).parent / "job_parser.txt").read_text(encoding="utf-8")
+    resp = await client.chat.completions.create(
+        model=NANO_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Parse this job description:\n\n{jd_text}"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        timeout=90,
+    )
+    if cost_acc is not None and resp.usage is not None:
+        cost_acc.add(NANO_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    raw = resp.choices[0].message.content or "{}"
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+async def _llm_extract_skills_with_tags(
+    text: str,
+    cost_acc: "CostAccumulator | None" = None,
+) -> list[FinalSkillItem]:
+    """Extract skills with primary/secondary tags from the given text (R&R + tech requirements).
+
+    Role extraction is handled upstream by the nano parser — this function returns skills only.
     """
-    from llm_client import get_fast_client, FAST_MODEL
+    from llm_client import get_fast_client, SKILL_MODEL
 
     client = get_fast_client()
     if client is None:
@@ -584,21 +630,24 @@ async def _llm_extract_skills_with_tags(
         "Additional rules:\n"
         "  - Use the canonical short name (e.g. 'Node.js', 'PostgreSQL', 'AWS')\n"
         "  - Each skill is a separate entry — do not group\n"
-        "  - is_primary=true for core/required, false for nice-to-have\n"
-        "  - Return valid JSON only: {\"skills\": [{\"skill_name\": \"...\", \"is_primary\": true/false}, ...]}"
+        "  - is_primary=true for core/required, false for nice-to-have\n\n"
+        "Return valid JSON only:\n"
+        "{\n"
+        "  \"skills\": [{\"skill_name\": \"...\", \"is_primary\": true/false}, ...]\n"
+        "}"
     )
-    prompt = f"Extract all specific technical skills from this job description:\n\n{jd_text}"
     resp = await client.chat.completions.create(
-        model=FAST_MODEL,
+        model=SKILL_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": f"Extract all specific technical skills from this job description:\n\n{text}"},
         ],
         response_format={"type": "json_object"},
         temperature=0,
+        timeout=120,
     )
     if cost_acc is not None and resp.usage is not None:
-        cost_acc.add(FAST_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+        cost_acc.add(SKILL_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
     raw = json.loads(resp.choices[0].message.content or "{}")
     items = []
     for s in raw.get("skills", []):
@@ -616,20 +665,47 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     if not jd_text:
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
-    # ── LLM-based skill extraction (full JD → primary/secondary tags) ─────────
-    # SkillNer / spaCy pipeline commented out — kept for reference:
-    # stage1 = await asyncio.to_thread(process_jd, jd_text)
-    # initial_skills_raw = _clean_strings(stage1.get("skills"))
-    # unknown_words = _clean_strings(stage1.get("unknown_words"))
-    # repo = NonSkillRepository()
-    # filtered_unknown_words = await asyncio.to_thread(repo.filter_non_skills, unknown_words)
-    # cost_acc = CostAccumulator()
-    # classifier = AzureUnknownWordClassifier()
-    # items_with_context = [{"word": w, "sentence": _extract_jd_sentence(jd_text, w)} for w in all_candidates]
-    # llm_result = await classifier.classify_with_context(items_with_context, role_hint_excerpt=jd_text[:600], accumulator=cost_acc)
     cost_acc = CostAccumulator()
     try:
-        final_skills = await _llm_extract_skills_with_tags(jd_text, cost_acc=cost_acc)
+        # Stage 1 — nano parses JD structure (company, role, R&R, tech requirements)
+        nano_parsed = await _llm_parse_jd_nano(jd_text, cost_acc=cost_acc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Nano JD parsing failed: {exc}",
+        ) from exc
+
+    # Extract role from nano output
+    jd_role: JdRoleHint | None = None
+    nano_role = (nano_parsed.get("role") or "").strip()
+    if nano_role:
+        jd_role = JdRoleHint(
+            display_name=nano_role,
+            slug="",
+            role_archetype=(nano_parsed.get("role_archetype") or "").strip() or None,
+        )
+
+    # Build skill extractor input: role + technical_requirements + roles_and_responsibilities
+    _parts: list[str] = []
+    if nano_role:
+        _parts.append(f"Role: {nano_role}")
+    tech_req_text = _extract_text(nano_parsed.get("technical_requirements"))
+    if tech_req_text:
+        _parts.append(tech_req_text)
+    r_and_r_text = _extract_text(nano_parsed.get("roles_and_responsibilities"))
+    if r_and_r_text:
+        _parts.append(r_and_r_text)
+    skill_input = "\n\n".join(_parts) if _parts else jd_text
+
+    logger.info(
+        "[skills/extract-from-jd] skill_input → chars=%d  est_tokens=%d",
+        len(skill_input),
+        len(skill_input) // 4,
+    )
+
+    try:
+        # Stage 2 — skill extractor runs on structured text only (not full JD)
+        final_skills = await _llm_extract_skills_with_tags(skill_input, cost_acc=cost_acc)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -638,7 +714,11 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
     cost_acc.log_summary("skills/extract-from-jd", logger)
 
-    response = JDSkillPipelineResponse(final_skills=final_skills)
+    response = JDSkillPipelineResponse(
+        final_skills=final_skills,
+        jd_role=jd_role,
+        nano_parsed=nano_parsed,
+    )
 
     # ── History persistence ───────────────────────────────────────────────────
     history_repo = JdPipelineRunRepository()
@@ -646,7 +726,8 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         history_repo.start_run,
         jd_text=jd_text,
         api1_response=response,
-        jd_role_hint_display=None,
+        api_parser_response=nano_parsed,
+        jd_role_hint_display=jd_role.display_name if jd_role else None,
     )
     response.run_id = run_id
     return response
@@ -1208,7 +1289,17 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
     # ── Stage 6: pick a single chosen role ──────────────────────────────────
     chosen_role: ChosenRole | None = None
-    if len(candidate_roles) == 1:
+    if len(candidate_roles) == 0 and req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
+        h = req.jd_role_hint
+        chosen_role = ChosenRole(
+            source="llm",
+            id=None,
+            slug=h.slug or "",
+            display_name=h.display_name.strip(),
+            role_archetype=h.role_archetype,
+            rationale=h.rationale,
+        )
+    elif len(candidate_roles) == 1:
         c = candidate_roles[0]
         chosen_role = ChosenRole(
             source="single_candidate",
