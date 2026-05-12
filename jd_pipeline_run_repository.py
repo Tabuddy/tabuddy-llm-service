@@ -1,12 +1,17 @@
 """Repository for JD pipeline run history.
 
-One row per end-to-end run of the 3-API JD pipeline:
-  POST /skills/extract-from-jd  → INSERT (status: extract_from_jd_done)
-  POST /skills/extract-details  → UPDATE (status: extract_details_done)
-  POST /skills/final-role-output → UPDATE (status: completed; denormalized fields)
+One row per end-to-end run of the current 3-step JD skill pipeline:
 
-A small jd_run_artifacts log captures what each run added to the library
-(non_skills, aliases, canonical_skills, dimensions, roles, link rows).
+  1. ``POST /skills/extract-from-jd`` — LLM extracts ``final_skills`` from JD text;
+     ``start_run`` inserts a row (``status=extract_from_jd_done``) with ``api1_response``.
+  2. ``POST /skills/extract-details`` — alias + dimension catalogue + v3 new-skill
+     orchestration; ``attach_api2`` stores ``api2_response`` (``status=extract_details_done``).
+  3. ``POST /skills/final-role-output`` — persists links / new canonicals when enabled;
+     ``attach_api3`` stores ``api3_response`` (``status=completed``) plus denormalized
+     role and skill list fields.
+
+``jd_run_artifacts`` records concrete inserts (aliases, canonicals, dimensions, links)
+and *proposed* rows when writes are skipped.
 
 """
 
@@ -68,6 +73,7 @@ _VALID_ARTIFACT_KINDS = {
     "non_skill_added",
     "alias_added",
     "canonical_skill_added",
+    "library_enrichment_backfilled",
     "dimension_created",
     "role_created",
     "dimension_skill_link",
@@ -218,6 +224,17 @@ class JdPipelineRunRepository:
                     cur.execute(artifacts_ddl)
                     cur.execute(artifacts_idx_run)
                     cur.execute(artifacts_idx_kind)
+                    for alter in (
+                        "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS llm_cost_api1_usd DOUBLE PRECISION",
+                        "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS llm_cost_api2_usd DOUBLE PRECISION",
+                        "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS llm_cost_api3_usd DOUBLE PRECISION",
+                    ):
+                        cur.execute(
+                            sql.SQL(alter).format(
+                                schema=sql.Identifier(self.schema),
+                                runs=sql.Identifier(self.runs_table),
+                            )
+                        )
                 conn.commit()
             log.info(
                 "[JD pipeline / history] schema ensured for %s.%s + %s.%s",
@@ -243,6 +260,7 @@ class JdPipelineRunRepository:
         api1_response: Any,
         api_parser_response: Any = None,
         jd_role_hint_display: str | None = None,
+        llm_cost_usd: float | None = None,
     ) -> str | None:
         """Insert a new run row with the API 1 response. Returns run_id or None."""
         try:
@@ -269,6 +287,7 @@ class JdPipelineRunRepository:
                             payload,
                             parser_payload,
                             jd_role_hint_display,
+                            float(llm_cost_usd) if llm_cost_usd is not None else None,
                         ),
                     )
                     row = cur.fetchone()
@@ -285,6 +304,8 @@ class JdPipelineRunRepository:
         self,
         run_id: str | UUID | None,
         api2_response: Any,
+        *,
+        llm_cost_usd: float | None = None,
     ) -> bool:
         """Update the row with API 2 response and bump status."""
         rid = _coerce_uuid(run_id)
@@ -297,6 +318,7 @@ class JdPipelineRunRepository:
                 UPDATE {schema}.{runs}
                    SET api2_response = %s::jsonb,
                        status = %s,
+                       llm_cost_api2_usd = COALESCE(%s, llm_cost_api2_usd),
                        updated_at = NOW()
                  WHERE id = %s::uuid
                 """
@@ -306,7 +328,15 @@ class JdPipelineRunRepository:
             )
             with self._connect() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(stmt, (payload, "extract_details_done", rid))
+                    cur.execute(
+                        stmt,
+                        (
+                            payload,
+                            "extract_details_done",
+                            float(llm_cost_usd) if llm_cost_usd is not None else None,
+                            rid,
+                        ),
+                    )
                     rowcount = cur.rowcount
                 conn.commit()
             if rowcount == 0:
@@ -333,6 +363,7 @@ class JdPipelineRunRepository:
         chosen_role_id: int | None = None,
         final_skills: Iterable[str] | None = None,
         duration_ms: int | None = None,
+        llm_cost_usd: float | None = None,
     ) -> bool:
         """Mark a run completed with the API 3 response and denormalized fields."""
         rid = _coerce_uuid(run_id)
@@ -356,6 +387,7 @@ class JdPipelineRunRepository:
                        final_skills = COALESCE(%s, final_skills),
                        final_skills_count = COALESCE(%s, final_skills_count),
                        duration_ms = COALESCE(%s, duration_ms),
+                       llm_cost_api3_usd = COALESCE(%s, llm_cost_api3_usd),
                        updated_at = NOW()
                  WHERE id = %s::uuid
                 """
@@ -375,6 +407,7 @@ class JdPipelineRunRepository:
                             skills_list,
                             skills_count,
                             duration_ms,
+                            float(llm_cost_usd) if llm_cost_usd is not None else None,
                             rid,
                         ),
                     )
@@ -394,6 +427,39 @@ class JdPipelineRunRepository:
                 exc,
             )
             return False
+
+    def get_run_llm_costs_usd(
+        self, run_id: str | UUID | None
+    ) -> tuple[float | None, float | None, float | None] | None:
+        """Return stored per-API LLM costs for a run, or None if row/columns unavailable."""
+        rid = _coerce_uuid(run_id)
+        if not rid:
+            return None
+        stmt = sql.SQL(
+            """
+            SELECT llm_cost_api1_usd, llm_cost_api2_usd, llm_cost_api3_usd
+              FROM {schema}.{runs}
+             WHERE id = %s::uuid
+            """
+        ).format(
+            schema=sql.Identifier(self.schema),
+            runs=sql.Identifier(self.runs_table),
+        )
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(stmt, (rid,))
+                    row = cur.fetchone()
+            if not row:
+                return None
+            def _f(v: Any) -> float | None:
+                if v is None:
+                    return None
+                return float(v)
+
+            return (_f(row[0]), _f(row[1]), _f(row[2]))
+        except Exception:
+            return None
 
     def mark_failed(
         self,

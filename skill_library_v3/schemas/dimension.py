@@ -32,12 +32,17 @@ class OverlapFlag(BaseModel):
 class CandidateDimension(BaseModel):
     """One candidate dimension. Stage 3 may merge, split, or keep-separate."""
 
-    tentative_id: str = Field(pattern=r"^d_init_\d{2,3}$")
+    # Stage 2 uses d_init_*; Stage 3 apply_decisions emits d_merge_* / d_split_*_*;
+    # catalog rows mixed into reconciliation use slug-shaped tentative_id values.
+    tentative_id: str = Field(
+        pattern=r"^(d_init_\d{2,3}|d_merge_\d{2,3}|d_split_\d{2}_\d{2}|[a-z][a-z0-9-]{0,126})$"
+    )
     name: str = Field(min_length=3, max_length=80)
     description: str = Field(min_length=20, max_length=600)
     in_scope: str = Field(min_length=10, max_length=600)
     out_of_scope: str = Field(min_length=10, max_length=600)
-    exemplar_skills: list[str] = Field(min_length=3, max_length=15)
+    # Merged dims concatenate exemplars; SPLIT rows may start empty before reassignment.
+    exemplar_skills: list[str] = Field(min_length=0, max_length=30)
     overlap_flags: list[OverlapFlag] = Field(default_factory=list)
 
 

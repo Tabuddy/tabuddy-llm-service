@@ -53,6 +53,49 @@ from skill_library_v3.skill_similarity import top_k_similar_skills
 
 logger = logging.getLogger(__name__)
 
+_MIN_DIM_DESC = 20
+_MIN_DIM_SCOPE = 10
+
+
+def _normalize_locked_dimension_dict(d: dict) -> dict:
+    """Pad missing / short fields so ``CandidateDimension`` accepts catalog-only
+    rows and Stage-3 merge outputs (catalog dims have no in_scope/out_of_scope).
+
+    Without this, merged rows can have empty ``in_scope`` and silently fail
+    validation in the orchestrator, yielding empty ``locked_dimensions``.
+    """
+    out = dict(d)
+    name = (out.get("name") or "Dimension").strip() or "Dimension"
+    desc = (out.get("description") or "").strip()
+    if len(desc) < _MIN_DIM_DESC:
+        desc = (
+            f"{name}: skill-library dimension cluster used for job-description "
+            f"skill placement and overlap reconciliation."
+        )[:600]
+    inn = (out.get("in_scope") or "").strip()
+    if len(inn) < _MIN_DIM_SCOPE:
+        inn = (
+            f"Skills, tools, and practices that belong under {name} for the "
+            f"target role, including items implied by the dimension rationale."
+        )[:600]
+    out_scope = (out.get("out_of_scope") or "").strip()
+    if len(out_scope) < _MIN_DIM_SCOPE:
+        out_scope = (
+            f"Adjacent clusters explicitly not owned by {name}, including "
+            f"unrelated platforms, roles, and skill families per library policy."
+        )[:600]
+    ex = list(out.get("exemplar_skills") or [])
+    ex = [str(x).strip() for x in ex if str(x).strip()]
+    if not ex:
+        ex = [name]
+    out["name"] = name[:80]
+    out["description"] = desc[:600]
+    out["in_scope"] = inn[:600]
+    out["out_of_scope"] = out_scope[:600]
+    out["exemplar_skills"] = ex[:30]
+    out.setdefault("overlap_flags", [])
+    return out
+
 
 class DerivedLegacyFields(BaseModel):
     category: str
@@ -211,13 +254,22 @@ def _derive_placed_from_locked_dims(
     """Stage 5 placer omitted for JD flow: dims already come from skill-driven
     gen + Stage 3 lock. Anchor primary to the first locked dim; extras (max 2)
     become secondary_dimensions when skill-driven produced 2-3 dims.
+
+    Dim-gen may reuse the same catalog ``tentative_id`` on multiple rows; we
+    must never put ``primary_dimension`` into ``secondary_dimensions`` or
+    :class:`PlacedSkill` validation fails and the whole orchestrator aborts.
     """
-    primary = locked_dims[0].tentative_id
+    primary = str(locked_dims[0].tentative_id).strip()
     secondaries: list[str] = []
-    if len(locked_dims) >= 2:
-        secondaries.append(locked_dims[1].tentative_id)
-    if len(locked_dims) >= 3:
-        secondaries.append(locked_dims[2].tentative_id)
+    used: set[str] = {primary}
+    for dim in locked_dims[1:]:
+        tid = str(dim.tentative_id).strip()
+        if not tid or tid in used:
+            continue
+        secondaries.append(tid)
+        used.add(tid)
+        if len(secondaries) >= 2:
+            break
     n = len(locked_dims)
     reasoning = (
         f"Deterministic JD placement: locked_dimensions has {n} dimension(s) "
@@ -358,6 +410,14 @@ async def enrich_new_skill(
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"stage2_dim_gen_failed: {type(exc).__name__}: {exc}")
 
+    # Skill-driven dim-gen only ever emits 1–3 rows (sometimes reusing a catalog
+    # slug as tentative_id). Stage 3 passes ``catalog`` alongside those rows into
+    # ``apply_decisions`` so MERGE/SPLIT can resolve pairs, but ``dim_apply`` also
+    # appends *every untouched* entry from that combined list. Without filtering,
+    # the whole catalog sample (~40) becomes "locked" and explodes skill↔dim
+    # links. Keep focal rows + reconciliation outputs only.
+    focal_tentative_ids = {d.tentative_id for d in candidate_dims}
+
     locked_dims_dicts: list[dict] = [d.model_dump() for d in candidate_dims]
     keep_log: list[dict[str, Any]] = []
     merge_log: list[dict] = []
@@ -402,6 +462,24 @@ async def enrich_new_skill(
                         candidate_dims=[d.model_dump() for d in candidate_dims] + list(catalog),
                         pair_decisions=pair_decisions,
                     )
+                    before_n = len(apply_result.locked_dimensions)
+
+                    def _keep_locked_after_stage3(d: dict) -> bool:
+                        tid = str((d or {}).get("tentative_id") or "")
+                        if tid.startswith("d_merge_") or tid.startswith("d_split_"):
+                            return True
+                        return tid in focal_tentative_ids
+
+                    apply_result.locked_dimensions = [
+                        d for d in apply_result.locked_dimensions if _keep_locked_after_stage3(d)
+                    ]
+                    after_n = len(apply_result.locked_dimensions)
+                    if after_n < before_n:
+                        warnings.append(
+                            "stage3_post_filter_dropped_catalog_only_locked_dims:"
+                            f"{before_n}->{after_n}"
+                        )
+
                     keep_log = [
                         {
                             "a_dim_id": pair.get("a_tentative_id") or "",
@@ -426,9 +504,18 @@ async def enrich_new_skill(
     locked_dims: list[CandidateDimension] = []
     for d in locked_dims_dicts:
         try:
-            locked_dims.append(CandidateDimension.model_validate(d))
-        except Exception:  # noqa: BLE001
-            continue
+            norm = _normalize_locked_dimension_dict(dict(d))
+            locked_dims.append(CandidateDimension.model_validate(norm))
+        except Exception as exc:  # noqa: BLE001
+            tid = (d or {}).get("tentative_id")
+            warnings.append(
+                f"locked_dimension_validate_failed:{tid}:{type(exc).__name__}:{exc}"
+            )
+            logger.warning(
+                "locked_dimension_validate_failed tentative_id=%r: %s",
+                tid,
+                exc,
+            )
 
     typed: TypedSkill | None = None
     try:
