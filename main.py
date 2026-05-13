@@ -41,10 +41,17 @@ from jd_pipeline_run_repository import JdPipelineRunRepository
 from skill_library_v2.agents.planner import PlannerAgent
 from new_skill_orchestrator import (
     NewSkillMetaV3,
+    _derive_legacy_fields,
+    _run_enrichment,
     enrich_new_skill,
     fetch_candidate_skills_pool_skill_library,
     fetch_dimensions_catalog_skill_library,
     find_dimensions_by_identity_skill_library,
+)
+from skill_library_v3.schemas.typology import SkillType, TypedSkill
+from skill_library_v3.catalog_transform import (
+    map_maturity_to_volatility,
+    map_versioned_to_strategy,
 )
 from cost_tracker import CostAccumulator
 from pathlib import Path
@@ -54,7 +61,7 @@ import time
 from datetime import datetime
 import logging
 import asyncio
-from typing import Any
+from typing import Any, cast
 from pydantic import BaseModel, Field
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
@@ -193,6 +200,8 @@ class FinalSkillItem(BaseModel):
 class JDSkillPipelineResponse(BaseModel):
     final_skills: list[FinalSkillItem] = Field(default_factory=list)
     run_id: str | None = None
+    jd_role: JdRoleHint | None = None
+    nano_parsed: dict | None = None
 
 
 # ── Skill Detail / Reverse Planner models ────────────────────────────────────
@@ -322,6 +331,10 @@ class PersistenceItem(BaseModel):
     skill_dimension_saved: bool = False
     role_dimension_saved: bool = False
     skipped_reason: str | None = None
+    outcome_line: str | None = Field(
+        default=None,
+        description="Human-readable outcome for the Stage 03 UI (skill / dim / role-link).",
+    )
 
 
 class PersistenceReport(BaseModel):
@@ -351,6 +364,10 @@ class FinalRoleOutputResponse(BaseModel):
     persistence: PersistenceReport
     planner_output: PlannerGeneratedOutput | None = None
     run_id: str | None = None
+    # ``in_db`` — chosen role resolved to an existing DB row.
+    # ``human_review_required`` — chosen role not in DB; no auto-create (default).
+    # ``auto_created`` — missing role was inserted (API3_AUTO_CREATE_MISSING_ROLE=1).
+    chosen_role_resolution: str | None = None
 
 
 # ── JD Pipeline History models ───────────────────────────────────────────────
@@ -390,6 +407,7 @@ class JdRunDetail(BaseModel):
     id: str
     jd_text: str
     status: str
+    api_parser_response: dict[str, Any] | None = None
     api1_response: dict[str, Any] | None = None
     api2_response: dict[str, Any] | None = None
     api3_response: dict[str, Any] | None = None
@@ -403,6 +421,8 @@ class JdRunDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     artifacts: list[JdRunArtifact] = Field(default_factory=list)
+    #: Denormalized view for history UIs (JD → skills → dims → API3 links).
+    history_view: dict[str, Any] | None = None
 
 
 class PdfLinkItem(BaseModel):
@@ -458,15 +478,500 @@ def _extract_jd_sentence(jd_text: str, word: str, max_chars: int = 180) -> str:
     return ""
 
 
-_embedder_model = None
+def _embed_for_skill_library_db(text: str) -> list[float] | None:
+    """1536-dim vectors for ``skill-library`` pgvector columns (Azure OpenAI).
+
+    Must match ``skill_matcher`` / existing ``canonical_skills.name_embedding``.
+    Returns None when the client is unavailable so inserts can omit embedding.
+    """
+    from skill_matcher import _azure_embed_sync
+
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return None
+    vecs = _azure_embed_sync([trimmed])
+    if not vecs or not vecs[0]:
+        return None
+    return list(vecs[0])
 
 
-def _embed_text(text: str) -> list[float]:
-    global _embedder_model
-    if _embedder_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedder_model.encode([(text or "").strip()], show_progress_bar=False)[0].tolist()
+# ── API 3: reconciliation-aware dimension + new-skill helpers ───────────────
+
+_PIPELINE_DIM_PREFIXES = ("d_init_", "d_merge_", "d_split_")
+
+
+def _is_pipeline_generated_dim_slug(slug: str | None) -> bool:
+    if not slug or not isinstance(slug, str):
+        return False
+    s = slug.strip().lower()
+    return any(s.startswith(p) for p in _PIPELINE_DIM_PREFIXES)
+
+
+def _catalog_slug_from_merge_log(
+    merge_log: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Map tentative / merge ``into`` ids (lower) -> catalog dimension slug.
+
+    When Stage 3 MERGE collapses a pipeline dim with an existing library
+    dimension, callers should persist links against the catalog row, not a
+    new ``d_merge_*`` row.
+    """
+    out: dict[str, str] = {}
+    for entry in merge_log or []:
+        merged_from = list(entry.get("merged_from") or [])
+        into = entry.get("into")
+        catalog_slugs: list[str] = []
+        for key in ("a_dim_id", "b_dim_id"):
+            val = entry.get(key)
+            if val is None:
+                continue
+            s = str(val).strip()
+            if s and not _is_pipeline_generated_dim_slug(s):
+                catalog_slugs.append(s)
+        if not catalog_slugs:
+            continue
+        catalog = catalog_slugs[0]
+        for tid in merged_from:
+            if tid is None:
+                continue
+            ts = str(tid).strip()
+            if ts:
+                out[ts.lower()] = catalog
+        if into:
+            out[str(into).strip().lower()] = catalog
+    return out
+
+
+def _resolve_dimension_id_from_reconciliation_sync(
+    repo: SkillLibraryRepository,
+    *,
+    dimension_slug: str | None,
+    merge_slug_map: dict[str, str],
+) -> int | None:
+    """Resolve ``dimensions.id`` using merge reconciliation when applicable."""
+    slug = (dimension_slug or "").strip()
+    if not slug:
+        return None
+    slug_lc = slug.lower()
+    if not _is_pipeline_generated_dim_slug(slug):
+        found = repo.find_dimensions_by_names(slugs=[slug])
+        rec = found.get(slug_lc)
+        if rec is None and found:
+            rec = next(iter(found.values()))
+        if rec and rec.get("id") is not None:
+            return int(rec["id"])
+        return None
+    catalog_slug = merge_slug_map.get(slug_lc)
+    if not catalog_slug:
+        return None
+    found = repo.find_dimensions_by_names(slugs=[catalog_slug])
+    cl = catalog_slug.strip().lower()
+    rec = found.get(cl)
+    if rec is None and found:
+        rec = next(iter(found.values()))
+    if rec and rec.get("id") is not None:
+        return int(rec["id"])
+    return None
+
+
+def _has_v3_meta_for_new_skill_persist(meta: NewSkillMetaV3 | None) -> bool:
+    if meta is None:
+        return False
+    if meta.locked_dimensions:
+        return True
+    for m in meta.merge_log or []:
+        for key in ("a_dim_id", "b_dim_id"):
+            val = m.get(key)
+            if val and not _is_pipeline_generated_dim_slug(str(val)):
+                return True
+    return False
+
+
+def _append_canonical_skill_proposed_artifact(
+    artifacts: list[dict[str, Any]],
+    skill_name: str,
+    meta: NewSkillMetaV3,
+) -> None:
+    derived = meta.derived
+    typed = meta.typed
+    if derived is not None:
+        artifact_text = (
+            f"{skill_name} | type={derived.category} subtype={derived.sub_category} "
+            f"nature={derived.skill_nature} lifespan={derived.typical_lifespan}"
+        )
+    elif typed is not None:
+        artifact_text = f"{skill_name} | type={typed.type} subtype={typed.subtype}"
+    else:
+        artifact_text = skill_name
+    if len(artifact_text) > 500:
+        artifact_text = artifact_text[:497] + "..."
+    artifacts.append({
+        "kind": "canonical_skill_proposed",
+        "artifact_text": artifact_text,
+    })
+
+
+def _apply_new_skill_v3_enrichment_to_db(
+    repo: SkillLibraryRepository,
+    *,
+    skill_id: int,
+    display_name: str,
+    meta: NewSkillMetaV3,
+    typical_lifespan: str,
+) -> bool:
+    """Persist Stage 7 enrichment + Stage 4 typing like ``catalog_transform`` + Stage 8 loader.
+
+    Returns True if ``canonical_skills`` enrichment columns were updated successfully.
+    """
+    enr = meta.enrichment
+    derived = meta.derived
+    typed = meta.typed
+
+    if enr and enr.maturity:
+        volatility = map_maturity_to_volatility(enr.maturity.maturity)
+    elif derived is not None:
+        volatility = str(derived.volatility or "STABLE")
+    else:
+        volatility = "STABLE"
+
+    vendor: str | None = None
+    license_value: str | None = None
+    year_introduced: int | None = None
+    maturity_reasoning: str | None = None
+    version_strategy = "NOT_APPLICABLE"
+    version_tag: str | None = None
+
+    if enr is not None:
+        vl = enr.vendor_license
+        vendor = (str(vl.vendor).strip() if vl.vendor else None) or None
+        if vl.license is not None:
+            license_value = str(getattr(vl.license, "value", vl.license)).strip().lower()
+        year_introduced = vl.year_introduced
+        if enr.maturity:
+            maturity_reasoning = enr.maturity.reasoning
+        ver = enr.versioning
+        version_strategy = map_versioned_to_strategy(bool(ver.versioned))
+        version_tag = (
+            str(ver.current_version).strip() if ver.current_version else None
+        )
+
+    confidence = float(typed.confidence) if typed is not None else 0.7
+    confidence = max(0.0, min(1.0, confidence))
+
+    tl = typical_lifespan
+    if derived is not None and getattr(derived, "typical_lifespan", None):
+        tl = str(derived.typical_lifespan)
+
+    enrichment_row_ok = False
+    try:
+        repo.update_canonical_skill_enrichment_v3(
+            skill_id,
+            volatility=volatility,
+            vendor=vendor,
+            license_value=license_value,
+            year_introduced=year_introduced,
+            maturity_reasoning=maturity_reasoning,
+            version_strategy=version_strategy,
+            version_tag=version_tag,
+            confidence=confidence,
+            typical_lifespan=tl,
+        )
+        enrichment_row_ok = True
+    except Exception as exc:
+        logger.warning(
+            "update_canonical_skill_enrichment_v3 failed for skill_id=%s: %s",
+            skill_id,
+            exc,
+        )
+
+    if enr is not None and enr.versioning and enr.versioning.version_aliases:
+        disp_lc = display_name.strip().lower()
+        va_keys: list[str] = []
+        for k in enr.versioning.version_aliases.keys():
+            kk = str(k).strip()
+            if not kk or kk.lower() == disp_lc:
+                continue
+            va_keys.append(kk)
+        if va_keys:
+            try:
+                repo.add_aliases(
+                    [(skill_id, k) for k in va_keys],
+                    alias_type="VERSION",
+                    match_strategy="CASE_INSENSITIVE",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "VERSION aliases insert failed skill_id=%s: %s",
+                    skill_id,
+                    exc,
+                )
+
+    if enr is not None and enr.context_keywords and enr.context_keywords.context_keywords:
+        try:
+            repo.add_skill_tags(skill_id, list(enr.context_keywords.context_keywords))
+        except Exception as exc:
+            logger.warning("skill_tags insert failed skill_id=%s: %s", skill_id, exc)
+
+    return enrichment_row_ok
+
+
+def _typology_type_from_skill_nature(skill_nature: str | None) -> SkillType:
+    from skill_library_v3.catalog_transform import map_type_to_skill_nature
+    from skill_library_v3.schemas.typology import TYPOLOGY_VALUES
+
+    target = (skill_nature or "").strip().upper()
+    for label in TYPOLOGY_VALUES:
+        if map_type_to_skill_nature(label) == target:
+            return cast(SkillType, label)
+    return "Concept"
+
+
+def _primary_dimension_slug_for_library_skill(sd: SkillDetail) -> str:
+    for dd in sd.dimensions or []:
+        dim = dd.dimension
+        if dim is None:
+            continue
+        slug = (dim.slug or "").strip()
+        if slug:
+            return slug
+    return "general"
+
+
+async def _backfill_existing_skill_catalog_enrichment(
+    repo: SkillLibraryRepository,
+    sd: SkillDetail,
+    cost_acc: CostAccumulator,
+) -> bool:
+    """Stage 7 + v3 persist when the skill has no catalog context tags (``skill_tags``)."""
+    if sd.canonical is None or sd.canonical.id is None:
+        return False
+    sid = int(sd.canonical.id)
+    detail = await asyncio.to_thread(repo.get_skill_detail, sid)
+    if not detail:
+        return False
+    slug = str(detail.get("slug") or "").strip()
+    display_name = str(detail.get("display_name") or sd.input_skill).strip()
+    if not slug or not display_name:
+        return False
+    type_label = _typology_type_from_skill_nature(detail.get("skill_nature"))
+    skill_payload = {
+        "skill_id": slug,
+        "name": display_name,
+        "type": type_label,
+        "subtype": "general",
+        "primary_dimension": _primary_dimension_slug_for_library_skill(sd),
+    }
+    enrichment, warnings = await _run_enrichment(skill_payload, accumulator=cost_acc)
+    if enrichment is None:
+        return False
+    conf = detail.get("confidence")
+    try:
+        confidence = float(conf) if conf is not None else 0.85
+    except (TypeError, ValueError):
+        confidence = 0.85
+    confidence = max(0.0, min(1.0, confidence))
+    typed = TypedSkill(
+        skill_id=slug,
+        name=display_name,
+        type=type_label,
+        subtype="general",
+        confidence=confidence,
+        reasoning=(
+            "API 3 backfill: existing canonical skill had no catalog context tags "
+            "(skill_tags); ran Stage 7 enrichment to populate tags and related fields."
+        ),
+        alternatives_considered=[],
+    )
+    derived = _derive_legacy_fields(typed=typed, enrichment=enrichment)
+    meta = NewSkillMetaV3(
+        skill_id=typed.skill_id,
+        typed=typed,
+        enrichment=enrichment,
+        derived=derived,
+        warnings=list(warnings),
+    )
+    tl = str(derived.typical_lifespan or "EVERGREEN")
+    return _apply_new_skill_v3_enrichment_to_db(
+        repo,
+        skill_id=sid,
+        display_name=display_name,
+        meta=meta,
+        typical_lifespan=tl,
+    )
+
+
+def _try_create_new_canonical_skill_sync(
+    repo: SkillLibraryRepository,
+    sd: SkillDetail,
+) -> tuple[int | None, str | None, bool]:
+    """Insert canonical skill + primary alias for one v3-shaped LLM skill.
+
+    Third tuple element is True when enrichment columns were updated on ``canonical_skills``.
+    """
+    meta = sd.new_skill_meta
+    if meta is None or not _has_v3_meta_for_new_skill_persist(meta):
+        return None, "no_persistable_v3_meta", False
+    display_name = sd.input_skill.strip()
+    if not display_name:
+        return None, "empty_display_name", False
+    try:
+        derived = meta.derived
+        typed = meta.typed
+        if derived is not None:
+            cat_name = (derived.category or "General").strip() or "General"
+            sub_token = (derived.sub_category or "general").strip() or "general"
+            sub_name = sub_token.replace("_", " ").strip().title() or "General"
+            skill_nature = str(derived.skill_nature or "TOOL")
+            typical_lifespan = str(derived.typical_lifespan or "EVERGREEN")
+        elif typed is not None:
+            cat_name = (typed.type or "General").strip() or "General"
+            sub_token = (typed.subtype or "general").strip() or "general"
+            sub_name = sub_token.replace("_", " ").strip().title() or "General"
+            skill_nature = "TOOL"
+            typical_lifespan = "EVERGREEN"
+        else:
+            cat_name = "General"
+            sub_name = "General"
+            skill_nature = "TOOL"
+            typical_lifespan = "EVERGREEN"
+        if len(sub_name) > 120:
+            sub_name = sub_name[:120]
+
+        cat = repo.find_or_create_category(display_name=cat_name)
+        sub = repo.find_or_create_sub_category(
+            category_id=int(cat["id"]),
+            display_name=sub_name,
+        )
+        emb = _embed_for_skill_library_db(display_name)
+        row = repo.create_canonical_skill(
+            display_name=display_name,
+            category_id=int(cat["id"]),
+            sub_category_id=int(sub["id"]),
+            skill_nature=skill_nature,
+            typical_lifespan=typical_lifespan,
+            source="llm",
+            name_embedding=emb,
+        )
+        sid = int(row["id"])
+        repo.add_aliases(
+            [(sid, display_name)],
+            alias_type="CANONICAL",
+            match_strategy="CASE_INSENSITIVE",
+        )
+        enrichment_ok = _apply_new_skill_v3_enrichment_to_db(
+            repo,
+            skill_id=sid,
+            display_name=display_name,
+            meta=meta,
+            typical_lifespan=typical_lifespan,
+        )
+        return sid, None, enrichment_ok
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}", False
+
+
+def _extra_dimension_rows_from_skills_detail(
+    skills_detail: list[SkillDetail],
+) -> list[DimensionDetail]:
+    """Add locked / merge-only dimension rows missing from ``skills_detail.dimensions``."""
+    out: list[DimensionDetail] = []
+    keys: set[tuple[str, str]] = set()
+    for sd in skills_detail:
+        if sd.source_tag != "llm" or not sd.new_skill_meta:
+            continue
+        meta = sd.new_skill_meta
+        existing_slugs = {(d.dimension.slug or "").strip().lower() for d in sd.dimensions}
+        for ld in meta.locked_dimensions:
+            tid = (ld.tentative_id or "").strip()
+            if not tid:
+                continue
+            tlc = tid.lower()
+            if tlc in existing_slugs:
+                continue
+            key = (sd.input_skill.strip().lower(), tlc)
+            if key in keys:
+                continue
+            keys.add(key)
+            mat = meta.enrichment.maturity if meta.enrichment else None
+            diff = mat.maturity if mat else None
+            out.append(
+                DimensionDetail(
+                    input_skill=sd.input_skill,
+                    dimension=DimensionSummary(
+                        id=None,
+                        slug=tid,
+                        display_name=ld.name,
+                        rationale=ld.description,
+                        difficulty_hint=diff,
+                        source="llm",
+                    ),
+                    roles_from_db=[],
+                    llm_role=None,
+                )
+            )
+        if not meta.locked_dimensions and meta.merge_log:
+            seen_cat: set[str] = set()
+            for entry in meta.merge_log:
+                for key in ("a_dim_id", "b_dim_id"):
+                    val = entry.get(key)
+                    if not val or _is_pipeline_generated_dim_slug(str(val)):
+                        continue
+                    sl = str(val).strip()
+                    slc = sl.lower()
+                    if slc in seen_cat or slc in existing_slugs:
+                        continue
+                    seen_cat.add(slc)
+                    k2 = (sd.input_skill.strip().lower(), slc)
+                    if k2 in keys:
+                        continue
+                    keys.add(k2)
+                    disp = (
+                        entry.get("b_name")
+                        or entry.get("into_name")
+                        or sl.replace("-", " ").title()
+                    )
+                    out.append(
+                        DimensionDetail(
+                            input_skill=sd.input_skill,
+                            dimension=DimensionSummary(
+                                id=None,
+                                slug=sl,
+                                display_name=disp,
+                                rationale=entry.get("reasoning"),
+                                difficulty_hint=None,
+                                source="db",
+                            ),
+                            roles_from_db=[],
+                            llm_role=None,
+                        )
+                    )
+    return out
+
+
+def _merge_dimension_worklist(req: FinalRoleOutputRequest) -> list[DimensionDetail]:
+    """``req.dimensions`` plus locked / merge-only rows, de-duplicated by (skill, slug)."""
+    seen: set[tuple[str, str]] = set()
+    out: list[DimensionDetail] = []
+    for dd in req.dimensions:
+        sk = dd.input_skill.strip().lower()
+        sl = (dd.dimension.slug or "").strip().lower()
+        if sl:
+            key = (sk, sl)
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(dd)
+    for dd in _extra_dimension_rows_from_skills_detail(req.skills_detail):
+        sk = dd.input_skill.strip().lower()
+        sl = (dd.dimension.slug or "").strip().lower()
+        if not sl:
+            continue
+        key = (sk, sl)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dd)
+    return out
 
 
 def _norm_token(v: str | None) -> str:
@@ -537,16 +1042,59 @@ async def normalize_skills_endpoint(req: SkillsRequest):
     )
 
 
-async def _llm_extract_skills_with_tags(
+def _extract_text(field) -> str:
+    """Safely extract .text from a nano field that may be a dict, list, or None."""
+    if isinstance(field, dict):
+        return (field.get("text") or "").strip()
+    if isinstance(field, list):
+        return "\n\n".join(
+            (item.get("text") or "").strip()
+            for item in field
+            if isinstance(item, dict) and item.get("text")
+        ).strip()
+    return ""
+
+
+async def _llm_parse_jd_nano(
     jd_text: str,
     cost_acc: "CostAccumulator | None" = None,
-) -> list[FinalSkillItem]:
-    """Send the full JD to the LLM and return skills with primary/secondary tags.
+) -> dict:
+    """Call fast tier (FAST_MODEL, default gpt-4o-mini) with job_parser.txt to extract structured JD fields."""
+    from llm_client import FAST_MODEL, get_fast_client
 
-    Each skill is tagged is_primary=True if it is a core/must-have requirement,
-    and is_primary=False if it is nice-to-have or supporting.
+    client = get_fast_client()
+    if client is None:
+        raise RuntimeError("LLM client unavailable — check AZURE_OPEN_AI_KEY")
+
+    system_prompt = (Path(__file__).parent / "job_parser.txt").read_text(encoding="utf-8")
+    resp = await client.chat.completions.create(
+        model=FAST_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Parse this job description:\n\n{jd_text}"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        timeout=90,
+    )
+    if cost_acc is not None and resp.usage is not None:
+        cost_acc.add(FAST_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    raw = resp.choices[0].message.content or "{}"
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+async def _llm_extract_skills_with_tags(
+    text: str,
+    cost_acc: "CostAccumulator | None" = None,
+) -> list[FinalSkillItem]:
+    """Extract skills with primary/secondary tags from the given text (R&R + tech requirements).
+
+    Role extraction is handled upstream by the nano parser — this function returns skills only.
     """
-    from llm_client import get_fast_client, FAST_MODEL
+    from llm_client import get_fast_client, SKILL_MODEL
 
     client = get_fast_client()
     if client is None:
@@ -584,22 +1132,41 @@ async def _llm_extract_skills_with_tags(
         "Additional rules:\n"
         "  - Use the canonical short name (e.g. 'Node.js', 'PostgreSQL', 'AWS')\n"
         "  - Each skill is a separate entry — do not group\n"
-        "  - is_primary=true for core/required, false for nice-to-have\n"
-        "  - Return valid JSON only: {\"skills\": [{\"skill_name\": \"...\", \"is_primary\": true/false}, ...]}"
+        "  - is_primary=true for core/required, false for nice-to-have\n\n"
+        "Return valid JSON only:\n"
+        "{\n"
+        "  \"skills\": [{\"skill_name\": \"...\", \"is_primary\": true/false}, ...]\n"
+        "}"
     )
-    prompt = f"Extract all specific technical skills from this job description:\n\n{jd_text}"
+    user_message = f"Extract all specific technical skills from this job description:\n\n{text}"
+    logger.info(
+        "[skills/classifier] model=%s user_message_chars=%d (raw skill slice chars=%d)",
+        SKILL_MODEL,
+        len(user_message),
+        len(text),
+    )
+    logger.info(
+        "[skills/classifier] USER_MESSAGE_BEGIN\n%s\n[skills/classifier] USER_MESSAGE_END",
+        user_message,
+    )
     resp = await client.chat.completions.create(
-        model=FAST_MODEL,
+        model=SKILL_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_message},
         ],
         response_format={"type": "json_object"},
         temperature=0,
+        timeout=120,
     )
     if cost_acc is not None and resp.usage is not None:
-        cost_acc.add(FAST_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
-    raw = json.loads(resp.choices[0].message.content or "{}")
+        cost_acc.add(SKILL_MODEL, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+    raw_str = resp.choices[0].message.content or "{}"
+    logger.info(
+        "[skills/classifier] RAW_MESSAGE_CONTENT_BEGIN\n%s\n[skills/classifier] RAW_MESSAGE_CONTENT_END",
+        raw_str,
+    )
+    raw = json.loads(raw_str)
     items = []
     for s in raw.get("skills", []):
         if isinstance(s, dict) and (s.get("skill_name") or "").strip():
@@ -607,6 +1174,11 @@ async def _llm_extract_skills_with_tags(
                 skill_name=str(s["skill_name"]).strip(),
                 is_primary=bool(s.get("is_primary", False)),
             ))
+    logger.info(
+        "[skills/classifier] parsed_skills count=%d names=%s",
+        len(items),
+        [i.skill_name for i in items],
+    )
     return items
 
 
@@ -616,20 +1188,58 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     if not jd_text:
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
-    # ── LLM-based skill extraction (full JD → primary/secondary tags) ─────────
-    # SkillNer / spaCy pipeline commented out — kept for reference:
-    # stage1 = await asyncio.to_thread(process_jd, jd_text)
-    # initial_skills_raw = _clean_strings(stage1.get("skills"))
-    # unknown_words = _clean_strings(stage1.get("unknown_words"))
-    # repo = NonSkillRepository()
-    # filtered_unknown_words = await asyncio.to_thread(repo.filter_non_skills, unknown_words)
-    # cost_acc = CostAccumulator()
-    # classifier = AzureUnknownWordClassifier()
-    # items_with_context = [{"word": w, "sentence": _extract_jd_sentence(jd_text, w)} for w in all_candidates]
-    # llm_result = await classifier.classify_with_context(items_with_context, role_hint_excerpt=jd_text[:600], accumulator=cost_acc)
     cost_acc = CostAccumulator()
     try:
-        final_skills = await _llm_extract_skills_with_tags(jd_text, cost_acc=cost_acc)
+        # Stage 1 — FAST_MODEL parses JD structure (job_parser.txt): company, role, R&R, etc.
+        nano_parsed = await _llm_parse_jd_nano(jd_text, cost_acc=cost_acc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Nano JD parsing failed: {exc}",
+        ) from exc
+
+    # Extract role from nano output
+    jd_role: JdRoleHint | None = None
+    nano_role = (nano_parsed.get("role") or "").strip()
+    if nano_role:
+        jd_role = JdRoleHint(
+            display_name=nano_role,
+            slug="",
+            role_archetype=(nano_parsed.get("role_archetype") or "").strip() or None,
+        )
+
+    # Build skill extractor input: role + technical_requirements + roles_and_responsibilities
+    _parts: list[str] = []
+    if nano_role:
+        _parts.append(f"Role: {nano_role}")
+    tech_req_text = _extract_text(nano_parsed.get("technical_requirements"))
+    if tech_req_text:
+        _parts.append(tech_req_text)
+    r_and_r_text = _extract_text(nano_parsed.get("roles_and_responsibilities"))
+    if r_and_r_text:
+        _parts.append(r_and_r_text)
+    skill_input = "\n\n".join(_parts) if _parts else jd_text
+    skill_input_source = "structured_composite" if _parts else "full_jd_fallback"
+
+    logger.info(
+        "[skills/extract-from-jd] skill_input_source=%s JD_type=%s has_role=%s tech_req_chars=%d r_and_r_chars=%d skill_input_chars=%d jd_chars=%d",
+        skill_input_source,
+        nano_parsed.get("JD_type"),
+        bool(nano_role),
+        len(tech_req_text),
+        len(r_and_r_text),
+        len(skill_input),
+        len(jd_text),
+    )
+    logger.info(
+        "[skills/extract-from-jd] skill_input → chars=%d  est_tokens=%d",
+        len(skill_input),
+        len(skill_input) // 4,
+    )
+
+    try:
+        # Stage 2 — skill extractor runs on structured text only (not full JD)
+        final_skills = await _llm_extract_skills_with_tags(skill_input, cost_acc=cost_acc)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -638,7 +1248,11 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
     cost_acc.log_summary("skills/extract-from-jd", logger)
 
-    response = JDSkillPipelineResponse(final_skills=final_skills)
+    response = JDSkillPipelineResponse(
+        final_skills=final_skills,
+        jd_role=jd_role,
+        nano_parsed=nano_parsed,
+    )
 
     # ── History persistence ───────────────────────────────────────────────────
     history_repo = JdPipelineRunRepository()
@@ -646,7 +1260,9 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         history_repo.start_run,
         jd_text=jd_text,
         api1_response=response,
-        jd_role_hint_display=None,
+        api_parser_response=nano_parsed,
+        jd_role_hint_display=jd_role.display_name if jd_role else None,
+        llm_cost_usd=cost_acc.total_cost_usd,
     )
     response.run_id = run_id
     return response
@@ -857,22 +1473,10 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     # NewSkillMetaV3 payload kept on SkillDetail.new_skill_meta.
     new_skill_meta_by_skill: dict[str, NewSkillMetaV3] = {}
 
-    # Drop plain English dictionary words before paying for LLM calls.
-    # Real tech skills always have at least one of: uppercase, digit, hyphen,
-    # dot, slash, or are >1 word. Single all-lowercase words like "codes",
-    # "releases", "functionality" are noise from the JD extractor.
-    def _looks_like_skill(s: str) -> bool:
-        if any(ch in s for ch in ("-", ".", "/", "+")):
-            return True
-        if any(ch.isdigit() for ch in s):
-            return True
-        parts = s.split()
-        if len(parts) > 1:
-            return True
-        # Single token: require at least one uppercase letter
-        return any(ch.isupper() for ch in s)
-
-    unmatched_llm_skills = [s for s in unmatched_llm_skills if _looks_like_skill(s)]
+    # Run the orchestrator for every unmatched term that came from llm_skills.
+    # We intentionally do not pre-filter single lowercase tokens: extractors
+    # often emit brand names like "firebase" / "flutter" / "jetpack", which
+    # must still be enriched and dimension-placed.
 
     role_hint_text = ""
     if req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
@@ -910,9 +1514,6 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 "role_display": str(d.get("role_display") or "").strip(),
             })
 
-        # Pull a small slice of canonical skills as the containment candidate
-        # pool. 200 keeps the embedder workload tiny while still giving the
-        # Stage 6 LLM useful similarity hints using embeddings.
         candidate_skills_pool: list[dict] = []
         try:
             candidate_skills_pool = await asyncio.to_thread(
@@ -943,9 +1544,6 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
                 )
                 return skill_name, None
 
-        # Run per-skill orchestrators concurrently. Each orchestrator already
-        # caps its own internal LLM calls; the JD pipeline rarely surfaces
-        # more than a handful of unknown skills so we don't add a semaphore.
         results = await asyncio.gather(
             *[_enrich_one(s) for s in unmatched_llm_skills],
             return_exceptions=False,
@@ -1278,7 +1876,17 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
     # ── Stage 6: pick a single chosen role ──────────────────────────────────
     chosen_role: ChosenRole | None = None
-    if len(candidate_roles) == 1:
+    if len(candidate_roles) == 0 and req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
+        h = req.jd_role_hint
+        chosen_role = ChosenRole(
+            source="llm",
+            id=None,
+            slug=h.slug or "",
+            display_name=h.display_name.strip(),
+            role_archetype=h.role_archetype,
+            rationale=h.rationale,
+        )
+    elif len(candidate_roles) == 1:
         c = candidate_roles[0]
         chosen_role = ChosenRole(
             source="single_candidate",
@@ -1425,7 +2033,12 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     # ── History persistence (only if API 1 minted a run_id) ────
     if req.run_id:
         history_repo = JdPipelineRunRepository()
-        await asyncio.to_thread(history_repo.attach_api2, req.run_id, response)
+        await asyncio.to_thread(
+            history_repo.attach_api2,
+            req.run_id,
+            response,
+            llm_cost_usd=cost_acc.total_cost_usd,
+        )
         if persisted_alias_pairs:
             artifact_items = [
                 {
@@ -1489,6 +2102,25 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     return response
 
 
+def _log_jd_pipeline_llm_cost_sum(
+    logger: logging.Logger,
+    costs: tuple[float | None, float | None, float | None],
+    run_id: str,
+) -> None:
+    c1, c2, c3 = costs
+    a = float(c1) if c1 is not None else 0.0
+    b = float(c2) if c2 is not None else 0.0
+    c = float(c3) if c3 is not None else 0.0
+    logger.info(
+        "[JD pipeline] LLM cost total (API1+API2+API3) api1=$%.6f api2=$%.6f api3=$%.6f sum=$%.6f run_id=%s",
+        a,
+        b,
+        c,
+        a + b + c,
+        run_id,
+    )
+
+
 @app.post("/skills/final-role-output", response_model=FinalRoleOutputResponse)
 async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     api3_started_at = time.monotonic()
@@ -1497,10 +2129,12 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     rev_planner = AzureReversePlannerLLM(accumulator=cost_acc)
     history_repo = JdPipelineRunRepository() if req.run_id else None
     artifacts: list[dict[str, Any]] = []
+    dimension_worklist = _merge_dimension_worklist(req)
 
-    # TODO: REMOVE COMMENT AFTER TESTING — API 3 skill-library INSERT/UPSERT (roles,
-    # dimensions, links). Set ``True`` to re-enable catalogue persistence below.
-    _API3_writes_enabled = False
+    # API 1 / API 2: alias + non-skill writes stay disabled for testing.
+    # API 3: catalogue persistence ON (canonical inserts for new v3 skills,
+    # dimension create only when not merged into an existing dim, links).
+    _API3_writes_enabled = True
 
     # 1) Build final input skills with in_db/new tags.
     final_input_skills = [
@@ -1517,7 +2151,9 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             persistence=persistence,
             planner_output=None,
             run_id=req.run_id,
+            chosen_role_resolution=None,
         )
+        cost_acc.log_summary("skills/final-role-output", logger)
         if history_repo is not None:
             duration_ms = int((time.monotonic() - api3_started_at) * 1000)
             await asyncio.to_thread(
@@ -1528,10 +2164,17 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 chosen_role_id=None,
                 final_skills=req.input_final_skills,
                 duration_ms=duration_ms,
+                llm_cost_usd=cost_acc.total_cost_usd,
             )
+            costs = await asyncio.to_thread(
+                history_repo.get_run_llm_costs_usd, req.run_id
+            )
+            if costs is not None:
+                _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
         return empty_response
 
-    # 2) Resolve role in DB (or conditionally create when missing).
+    # 2) Resolve role in DB. Optional auto-create only when
+    # API3_AUTO_CREATE_MISSING_ROLE=1 (default: off — human review, no DB row).
     resolved_role = await asyncio.to_thread(
         repo.find_role_by_identity,
         role_id=chosen.id,
@@ -1540,15 +2183,18 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
     )
     role_missing_initially = resolved_role is None
     planner_output: PlannerGeneratedOutput | None = None
+    role_auto_inserted = False
 
-    if role_missing_initially:
+    if role_missing_initially and os.getenv(
+        "API3_AUTO_CREATE_MISSING_ROLE", ""
+    ).strip().lower() in ("1", "true", "yes"):
         matched_rows = sum(
-            1 for dd in req.dimensions if _role_matches_chosen(dd, chosen)
+            1 for dd in dimension_worklist if _role_matches_chosen(dd, chosen)
         )
         should_create = _should_create_missing_role(
             chosen,
             matched_rows=matched_rows,
-            total_rows=len(req.dimensions),
+            total_rows=len(dimension_worklist),
         )
         if should_create:
             try:
@@ -1556,8 +2202,12 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     pass
                 else:
                     role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
-                    role_vec = await asyncio.to_thread(_embed_text, role_embed_text.strip())
-                    similar_roles = await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                    role_vec = await asyncio.to_thread(_embed_for_skill_library_db, role_embed_text.strip())
+                    similar_roles = (
+                        await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                        if role_vec is not None
+                        else []
+                    )
                     role_reused = False
                     if similar_roles:
                         dedup = await rev_planner.confirm_or_reuse_entity(
@@ -1584,6 +2234,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                             and resolved_role.get("id") is not None
                             and not role_reused
                         ):
+                            role_auto_inserted = True
                             artifacts.append({
                                 "kind": "role_created",
                                 "artifact_id": int(resolved_role["id"]),
@@ -1604,6 +2255,16 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             role_archetype=resolved_role.get("role_archetype") or chosen.role_archetype,
             rationale=chosen.rationale,
         )
+    elif chosen is not None:
+        # Chosen role not in DB: never mint a fake id — human review before insert.
+        chosen_role_out = ChosenRole(
+            source=chosen.source or "llm",
+            id=None,
+            slug=chosen.slug,
+            display_name=chosen.display_name,
+            role_archetype=chosen.role_archetype,
+            rationale=chosen.rationale,
+        )
 
     # 3) Map skill -> canonical id for persistence.
     skill_lookup = await asyncio.to_thread(
@@ -1622,12 +2283,6 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         s.lower(): sid for s, sid in skill_id_by_input.items()
     }
 
-    # 3.5) New (canonical-miss) LLM skills: The v3
-    # orchestrator already produced a NewSkillMetaV3 in API 2 with type,
-    # placement, containment, enrichment + derived legacy fields. We just
-    # emit a `canonical_skill_proposed` artifact carrying a compact snapshot
-    # for the history page; the full v3 payload is already in api2_response.
-    # TODO:— persist these to the dedicated skill-library DB schema.
     new_skill_metas = {
         sd.input_skill: sd.new_skill_meta
         for sd in req.skills_detail
@@ -1635,32 +2290,101 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         and sd.new_skill_meta is not None
         and sd.input_skill.lower() not in skill_id_by_input_lower
     }
-    for skill_name, meta in new_skill_metas.items():
-        derived = meta.derived
-        typed = meta.typed
-        if derived is not None:
-            artifact_text = (
-                f"{skill_name} | type={derived.category} subtype={derived.sub_category} "
-                f"nature={derived.skill_nature} lifespan={derived.typical_lifespan}"
+    skills_created_this_run: set[str] = set()
+    skill_enrichment_saved_count = 0
+    existing_skill_catalog_backfill_count = 0
+
+    # 3.5) New (canonical-miss) LLM skills: insert canonical + primary alias
+    # when v3 meta has locked dimensions and/or merge targets; else artifact only.
+    if not _API3_writes_enabled:
+        for skill_name, meta in new_skill_metas.items():
+            _append_canonical_skill_proposed_artifact(artifacts, skill_name, meta)
+    else:
+        for sd in req.skills_detail:
+            if sd.source_tag != "llm":
+                continue
+            if sd.input_skill.lower() in skill_id_by_input_lower:
+                continue
+            meta = sd.new_skill_meta
+            if not _has_v3_meta_for_new_skill_persist(meta):
+                if meta is not None:
+                    _append_canonical_skill_proposed_artifact(
+                        artifacts, sd.input_skill, meta
+                    )
+                continue
+            sid, err, enrichment_ok = await asyncio.to_thread(
+                _try_create_new_canonical_skill_sync, repo, sd
             )
-        elif typed is not None:
-            artifact_text = f"{skill_name} | type={typed.type} subtype={typed.subtype}"
+            if sid is not None:
+                skill_id_by_input[sd.input_skill] = sid
+                skill_id_by_input_lower[sd.input_skill.lower()] = sid
+                skills_created_this_run.add(sd.input_skill.strip().lower())
+                persistence.new_skills_created += 1
+                if enrichment_ok:
+                    skill_enrichment_saved_count += 1
+                artifacts.append({
+                    "kind": "canonical_skill_added",
+                    "artifact_id": sid,
+                    "artifact_text": sd.input_skill[:500],
+                })
+            else:
+                if meta is not None:
+                    _append_canonical_skill_proposed_artifact(
+                        artifacts, sd.input_skill, meta
+                    )
+                logger.warning(
+                    "API3 new canonical skill not created for %r: %s",
+                    sd.input_skill,
+                    err,
+                )
+
+    meta_merge_by_skill_lower: dict[str, dict[str, str]] = {}
+    for sd in req.skills_detail:
+        key = sd.input_skill.strip().lower()
+        if sd.new_skill_meta and sd.new_skill_meta.merge_log:
+            meta_merge_by_skill_lower[key] = _catalog_slug_from_merge_log(
+                sd.new_skill_meta.merge_log
+            )
         else:
-            artifact_text = skill_name
-        # `artifact_text` is bounded by jd_run_artifacts.artifact_text TEXT
-        # (no length cap in DDL) but we cap to keep history rows compact —
-        # full payload lives on jd_pipeline_runs.api2_response.
-        if len(artifact_text) > 500:
-            artifact_text = artifact_text[:497] + "..."
-        artifacts.append({
-            "kind": "canonical_skill_proposed",
-            "artifact_text": artifact_text,
-        })
+            meta_merge_by_skill_lower.setdefault(key, {})
+
+    # 3.6) Existing library skills with zero context tags (skill_tags): run Stage 7 + save.
+    if _API3_writes_enabled and os.getenv(
+        "API3_BACKFILL_LIBRARY_ENRICHMENT", "1"
+    ).strip().lower() in ("1", "true", "yes"):
+        for sd in req.skills_detail:
+            if sd.source_tag != "db" or sd.canonical is None or sd.canonical.id is None:
+                continue
+            sid = int(sd.canonical.id)
+            try:
+                missing = await asyncio.to_thread(
+                    repo.canonical_skill_missing_catalog_enrichment, sid
+                )
+            except Exception:
+                missing = False
+            if not missing:
+                continue
+            try:
+                ok = await _backfill_existing_skill_catalog_enrichment(repo, sd, cost_acc)
+            except Exception as exc:
+                logger.warning(
+                    "API3 existing-skill catalog enrichment backfill failed skill_id=%s: %s",
+                    sid,
+                    exc,
+                )
+                ok = False
+            if ok:
+                existing_skill_catalog_backfill_count += 1
+                artifacts.append({
+                    "kind": "library_enrichment_backfilled",
+                    "artifact_id": sid,
+                    "artifact_text": (sd.input_skill or "")[:500],
+                })
 
     # 4) Persist per (skill, dimension):
     # - always attempt skill-dimension for DB-backed skills
     # - persist role-dimension only when row matches chosen role and role exists in DB
-    for dd in req.dimensions:
+    for dd in dimension_worklist:
         skill_name = dd.input_skill
         skill_id = skill_id_by_input_lower.get(skill_name.lower())
         skill_tag = "in_db" if skill_id is not None else "new"
@@ -1686,10 +2410,21 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
 
         if skill_id is None:
-            #  we no longer auto-create canonical_skills here. Emit proposed-artifact rows
-            # so the history page still shows what the v3 stack inferred
-            # for this (skill, dim) pair, but skip every legacy INSERT.
-            item.skipped_reason = "skill_not_in_db_v3_proposed"
+            meta_sd = next(
+                (
+                    x
+                    for x in req.skills_detail
+                    if x.input_skill.strip().lower() == skill_name.strip().lower()
+                ),
+                None,
+            )
+            meta = meta_sd.new_skill_meta if meta_sd else None
+            if _has_v3_meta_for_new_skill_persist(meta):
+                item.skipped_reason = "skill_not_in_db_create_failed"
+                item.outcome_line = "Skipped — new skill not created (see logs)"
+            else:
+                item.skipped_reason = "skill_not_in_db_v3_proposed"
+                item.outcome_line = "Skipped — no persistable v3 meta for new skill"
             persistence.skipped += 1
             if dim_id is None:
                 artifacts.append({
@@ -1705,8 +2440,6 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 and chosen_role_out is not None
                 and chosen_role_out.id is not None
             ):
-                # Same as above — when the chosen role IS in the DB but the
-                # dim isn't, emit the role-dim link as a proposal too.
                 artifacts.append({
                     "kind": "role_dimension_link_proposed",
                     "artifact_text": (
@@ -1720,15 +2453,44 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             item.skipped_reason = (
                 "TODO: REMOVE AFTER TESTING — api3_writes_enabled=False (writes disabled)"
             )
+            item.outcome_line = "Writes disabled"
             persistence.skipped += 1
             persistence.items.append(item)
             continue
 
         try:
+            merge_map = meta_merge_by_skill_lower.get(skill_name.strip().lower(), {})
+            slug_in = (dim_slug or "").strip()
+            slug_lc = slug_in.lower()
+            merge_val_slugs = {str(v).strip().lower() for v in merge_map.values() if v}
+            merge_reconciliation = False
+            catalog_slug_match = False
+            embedding_dedup = False
+            dim_row_created = False
+
+            if dim_id is None:
+                recon_id = await asyncio.to_thread(
+                    _resolve_dimension_id_from_reconciliation_sync,
+                    repo,
+                    dimension_slug=dim_slug,
+                    merge_slug_map=merge_map,
+                )
+                if recon_id is not None:
+                    dim_id = recon_id
+                    if slug_in and _is_pipeline_generated_dim_slug(slug_in) and merge_map.get(slug_lc):
+                        merge_reconciliation = True
+                    elif slug_in and slug_lc in merge_val_slugs:
+                        merge_reconciliation = True
+                    elif slug_in and not _is_pipeline_generated_dim_slug(slug_in):
+                        catalog_slug_match = True
             if dim_id is None:
                 dim_embed_text = (dim_name or "").strip() + " " + (dd.dimension.rationale or "").strip()
-                dim_vec = await asyncio.to_thread(_embed_text, dim_embed_text.strip())
-                similar_dims = await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, dim_vec)
+                dim_vec = await asyncio.to_thread(_embed_for_skill_library_db, dim_embed_text.strip())
+                similar_dims = (
+                    await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, dim_vec)
+                    if dim_vec is not None
+                    else []
+                )
                 if similar_dims:
                     dedup = await rev_planner.confirm_or_reuse_entity(
                         "dimension",
@@ -1737,6 +2499,7 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     )
                     if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
                         dim_id = dedup["existing_id"]
+                        embedding_dedup = True
                 if dim_id is None:
                     dim_row = await asyncio.to_thread(
                         repo.find_or_create_dimension,
@@ -1748,7 +2511,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                         name_embedding=dim_vec,
                     )
                     created_id = int(dim_row["id"])
-                    if dim_row.get("created"):
+                    dim_row_created = bool(dim_row.get("created"))
+                    if dim_row_created:
                         artifacts.append({
                             "kind": "dimension_created",
                             "artifact_id": created_id,
@@ -1794,8 +2558,36 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 item.role_dimension_saved = True
             elif matched and (chosen_role_out is None or chosen_role_out.id is None):
                 item.skipped_reason = "chosen_role_not_resolved_in_db"
+
+            sk_lower = skill_name.strip().lower()
+            skill_bits: list[str] = []
+            if sk_lower in skills_created_this_run:
+                skill_bits.append("New skill saved")
+
+            if merge_reconciliation:
+                dim_bit = "Existing dimension (reconciliation merge)"
+            elif embedding_dedup:
+                dim_bit = "Existing dimension (embedding dedup)"
+            elif dim_row_created:
+                dim_bit = "New dimension saved (reconciliation separate)"
+            elif catalog_slug_match:
+                dim_bit = "Existing dimension (catalog slug)"
+            else:
+                dim_bit = "Existing dimension (library)"
+
+            if item.role_dimension_saved:
+                role_bit = "Role↔dimension saved"
+            elif matched and (chosen_role_out is None or chosen_role_out.id is None):
+                role_bit = "Role↔dimension not saved — chosen role not in DB (human review)"
+            elif not matched:
+                role_bit = "Role↔dimension skipped (dimension not under chosen role)"
+            else:
+                role_bit = "Role↔dimension unchanged (already linked)"
+
+            item.outcome_line = " · ".join([*skill_bits, dim_bit, role_bit])
         except Exception as exc:
             item.skipped_reason = f"db_error: {exc}"
+            item.outcome_line = f"Error: {exc}"
             persistence.skipped += 1
 
         persistence.items.append(item)
@@ -1842,10 +2634,16 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                     )
                     existed = bool(dim_before)
                     planner_dim_embed_text = (d.dimension_name or "").strip() + " " + (d.rationale or "").strip()
-                    planner_dim_vec = await asyncio.to_thread(_embed_text, planner_dim_embed_text.strip())
+                    planner_dim_vec = await asyncio.to_thread(_embed_for_skill_library_db, planner_dim_embed_text.strip())
                     final_dim_id: int | None = None
                     if not existed:
-                        similar_dims = await asyncio.to_thread(repo.find_similar_dimensions_by_embedding, planner_dim_vec)
+                        similar_dims = (
+                            await asyncio.to_thread(
+                                repo.find_similar_dimensions_by_embedding, planner_dim_vec
+                            )
+                            if planner_dim_vec is not None
+                            else []
+                        )
                         if similar_dims:
                             dedup = await rev_planner.confirm_or_reuse_entity(
                                 "dimension",
@@ -1894,12 +2692,20 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             planner_output.payload = {"error": str(exc)}
 
     cost_acc.log_summary("skills/final-role-output", logger)
+    if chosen_role_out is not None and chosen_role_out.id is not None:
+        if role_auto_inserted:
+            chosen_role_resolution = "auto_created"
+        else:
+            chosen_role_resolution = "in_db"
+    else:
+        chosen_role_resolution = "human_review_required"
     response = FinalRoleOutputResponse(
         chosen_role=chosen_role_out,
         final_input_skills=final_input_skills,
         persistence=persistence,
         planner_output=planner_output,
         run_id=req.run_id,
+        chosen_role_resolution=chosen_role_resolution,
     )
 
     # ── History persistence (only if API 1 minted a run_id) ────
@@ -1919,11 +2725,25 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             chosen_role_id=chosen_role_id_for_history,
             final_skills=req.input_final_skills,
             duration_ms=duration_ms,
+            llm_cost_usd=cost_acc.total_cost_usd,
         )
         if artifacts:
             await asyncio.to_thread(
                 history_repo.record_artifacts_bulk, req.run_id, artifacts
             )
+
+    logger.info(
+        "API3_SUCCESS new_skill_enrichment_saved=%s existing_skill_catalog_backfill=%s run_id=%s",
+        skill_enrichment_saved_count,
+        existing_skill_catalog_backfill_count,
+        req.run_id or "",
+    )
+    if history_repo is not None and req.run_id:
+        costs = await asyncio.to_thread(
+            history_repo.get_run_llm_costs_usd, req.run_id
+        )
+        if costs is not None:
+            _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
 
     return response
 
@@ -1953,6 +2773,285 @@ async def list_jd_pipeline_runs(
     )
 
 
+def _norm_skill_key_hist(s: str | None) -> str:
+    return (s or "").strip().lower()
+
+
+def _build_jd_history_view(
+    api1: dict[str, Any] | None,
+    api2: dict[str, Any] | None,
+    api3: dict[str, Any] | None,
+    *,
+    api_parser_response: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shape stored API1–3 JSON into one object for history pages (no DB migration)."""
+    api1 = api1 or {}
+    api2 = api2 or {}
+    api3 = api3 or {}
+
+    persist_tag_by_skill: dict[str, str] = {}
+    for x in api3.get("final_input_skills") or []:
+        if isinstance(x, dict) and x.get("skill"):
+            persist_tag_by_skill[_norm_skill_key_hist(str(x["skill"]))] = str(
+                x.get("tag") or ""
+            )
+
+    detail_by_skill: dict[str, dict[str, Any]] = {}
+    for sd in api2.get("skills_detail") or []:
+        if isinstance(sd, dict) and sd.get("input_skill"):
+            detail_by_skill[_norm_skill_key_hist(str(sd["input_skill"]))] = sd
+
+    pers = api3.get("persistence")
+    raw_items: list[dict[str, Any]] = []
+    if isinstance(pers, dict):
+        for it in pers.get("items") or []:
+            if isinstance(it, dict):
+                raw_items.append(it)
+
+    persist_rows_by_skill: dict[str, list[dict[str, Any]]] = {}
+    for it in raw_items:
+        sk = str(it.get("input_skill") or "")
+        nk = _norm_skill_key_hist(sk)
+        if nk:
+            persist_rows_by_skill.setdefault(nk, []).append(it)
+
+    skills_out: list[dict[str, Any]] = []
+    for fs in api1.get("final_skills") or []:
+        if not isinstance(fs, dict):
+            continue
+        name = str(fs.get("skill_name") or "").strip()
+        if not name:
+            continue
+        nk = _norm_skill_key_hist(name)
+        sd = detail_by_skill.get(nk, {})
+        source_tag = str(sd.get("source_tag") or "")
+        canonical = sd.get("canonical") if isinstance(sd.get("canonical"), dict) else None
+        meta = sd.get("new_skill_meta") if isinstance(sd.get("new_skill_meta"), dict) else None
+
+        if not sd:
+            skill_row_kind = "incomplete"
+            skill_row_label = "No API 2 row (run stopped after API 1 or history missing)"
+        elif source_tag == "llm":
+            skill_row_kind = "new_skill"
+            skill_row_label = "New / unmatched skill (orchestrated in API 2)"
+        elif source_tag == "unmatched":
+            skill_row_kind = "unmatched"
+            skill_row_label = "Unmatched (no library row)"
+        else:
+            skill_row_kind = "library_skill"
+            skill_row_label = "Existing skill (matched library)"
+
+        dims_out: list[dict[str, Any]] = []
+        for dd in sd.get("dimensions") or []:
+            if not isinstance(dd, dict):
+                continue
+            dim = dd.get("dimension") if isinstance(dd.get("dimension"), dict) else {}
+            did = dim.get("id")
+            src = str(dim.get("source") or "").lower()
+            if src == "db" and did is not None:
+                dim_kind = "library"
+                dim_kind_label = "Library dimension (catalog)"
+            elif src == "llm" or did is None:
+                dim_kind = "proposed"
+                dim_kind_label = "Proposed / LLM dimension (no DB id yet)"
+            else:
+                dim_kind = "other"
+                dim_kind_label = "Dimension"
+            dims_out.append(
+                {
+                    "display_name": dim.get("display_name"),
+                    "slug": dim.get("slug"),
+                    "source": dim.get("source"),
+                    "id": did,
+                    "dim_kind": dim_kind,
+                    "dim_kind_label": dim_kind_label,
+                    "roles_from_db": [
+                        str(r.get("display_name") or "")
+                        for r in (dd.get("roles_from_db") or [])
+                        if isinstance(r, dict)
+                    ],
+                }
+            )
+
+        locked_out: list[dict[str, Any]] = []
+        if meta:
+            for ld in meta.get("locked_dimensions") or []:
+                if not isinstance(ld, dict):
+                    continue
+                tid = str(ld.get("tentative_id") or "")
+                locked_out.append(
+                    {
+                        "tentative_id": tid,
+                        "name": ld.get("name"),
+                        "description": (str(ld.get("description") or ""))[:500],
+                        "placement_note": (
+                            "Reuses catalog slug"
+                            if tid and not tid.startswith(("d_init_", "d_merge_", "d_split_"))
+                            else "Pipeline tentative id"
+                        ),
+                    }
+                )
+
+        persist_tag = persist_tag_by_skill.get(nk, "")
+        link_rows: list[dict[str, Any]] = []
+        for it in persist_rows_by_skill.get(nk, []):
+            dim = it.get("dimension") if isinstance(it.get("dimension"), dict) else {}
+            link_rows.append(
+                {
+                    "dimension_name": dim.get("display_name"),
+                    "dimension_slug": dim.get("slug"),
+                    "dimension_id": dim.get("id"),
+                    "skill_dimension_saved": bool(it.get("skill_dimension_saved")),
+                    "role_dimension_saved": bool(it.get("role_dimension_saved")),
+                    "outcome_line": it.get("outcome_line"),
+                    "skipped_reason": it.get("skipped_reason"),
+                }
+            )
+
+        # Skill enrichment: library canonical profile vs v3 orchestrator enrichment.
+        enrichment_source: str | None = None
+        library_canonical_profile: dict[str, Any] | None = None
+        orchestrator_enrichment: dict[str, Any] | None = None
+        orchestrator_typed: dict[str, Any] | None = None
+        orchestrator_derived: dict[str, Any] | None = None
+        if source_tag == "db" and canonical:
+            enrichment_source = "library"
+            library_canonical_profile = {
+                "id": canonical.get("id"),
+                "slug": canonical.get("slug"),
+                "display_name": canonical.get("display_name"),
+                "category_id": canonical.get("category_id"),
+                "sub_category_id": canonical.get("sub_category_id"),
+                "skill_nature": canonical.get("skill_nature"),
+                "volatility": canonical.get("volatility"),
+                "typical_lifespan": canonical.get("typical_lifespan"),
+                "is_extractable": canonical.get("is_extractable"),
+                "is_also_category": canonical.get("is_also_category"),
+            }
+        elif source_tag == "llm":
+            enrichment_source = "orchestrator"
+            enr = meta.get("enrichment") if isinstance(meta, dict) else None
+            if isinstance(enr, dict):
+                orchestrator_enrichment = enr
+            ts = meta.get("typed") if isinstance(meta, dict) else None
+            if isinstance(ts, dict):
+                orchestrator_typed = ts
+            dv = meta.get("derived") if isinstance(meta, dict) else None
+            if isinstance(dv, dict):
+                orchestrator_derived = dv
+
+        library_aliases_snapshot: list[dict[str, Any]] = []
+        for a in sd.get("aliases_in_db") or []:
+            if not isinstance(a, dict):
+                continue
+            library_aliases_snapshot.append(
+                {
+                    "alias_text": a.get("alias_text"),
+                    "alias_type": a.get("alias_type"),
+                    "is_primary": a.get("is_primary"),
+                    "match_strategy": a.get("match_strategy"),
+                }
+            )
+
+        skills_out.append(
+            {
+                "skill_name": name,
+                "is_primary": bool(fs.get("is_primary")),
+                "source_tag": source_tag,
+                "skill_row_kind": skill_row_kind,
+                "skill_row_label": skill_row_label,
+                "persist_tag": persist_tag,
+                "persist_tag_label": (
+                    "API 3: existing canonical (in_db)"
+                    if persist_tag == "in_db"
+                    else (
+                        "API 3: new canonical path (new)"
+                        if persist_tag == "new"
+                        else "API 3 not run or tag missing"
+                    )
+                ),
+                "canonical_id": (canonical or {}).get("id"),
+                "canonical_display_name": (canonical or {}).get("display_name"),
+                "canonical_slug": (canonical or {}).get("slug"),
+                "dimensions": dims_out,
+                "locked_dimensions": locked_out,
+                "has_new_skill_meta": meta is not None,
+                "api3_link_rows": link_rows,
+                "enrichment_source": enrichment_source,
+                "library_canonical_profile": library_canonical_profile,
+                "orchestrator_enrichment": orchestrator_enrichment,
+                "orchestrator_typed": orchestrator_typed,
+                "orchestrator_derived": orchestrator_derived,
+                "library_aliases_snapshot": library_aliases_snapshot,
+            }
+        )
+
+    cr = api3.get("chosen_role") or api2.get("chosen_role")
+    chosen = cr if isinstance(cr, dict) else None
+
+    pers_summary: dict[str, Any] = {}
+    if isinstance(pers, dict):
+        pers_summary = {
+            "new_skills_created": pers.get("new_skills_created", 0),
+            "skill_dimension_saved": pers.get("skill_dimension_saved", 0),
+            "role_dimension_saved": pers.get("role_dimension_saved", 0),
+            "skipped": pers.get("skipped", 0),
+        }
+
+    return {
+        "pipeline": {
+            "api1": "POST /skills/extract-from-jd",
+            "api2": "POST /skills/extract-details",
+            "api3": "POST /skills/final-role-output",
+        },
+        "api_parser_response": api_parser_response,
+        "chosen_role": chosen,
+        "chosen_role_resolution": api3.get("chosen_role_resolution"),
+        "persistence_summary": pers_summary,
+        "persistence_item_count": len(raw_items),
+        "persistence_items": raw_items,
+        "skills": skills_out,
+    }
+
+
+def _merge_history_library_skill_details(
+    history_view: dict[str, Any],
+    repo: SkillLibraryRepository,
+) -> None:
+    """Attach live catalog aliases, tags, and enrichment columns for library-matched skills."""
+    skills = history_view.get("skills") or []
+    for s in skills:
+        if str(s.get("source_tag") or "") != "db":
+            continue
+        cid = s.get("canonical_id")
+        if cid is None:
+            continue
+        try:
+            detail = repo.get_skill_detail(int(cid))
+        except Exception as exc:
+            logger.debug(
+                "history merge skipped for canonical_id=%s: %s",
+                cid,
+                exc,
+            )
+            continue
+        if not detail:
+            continue
+        s["library_db_aliases"] = detail.get("aliases") or []
+        s["library_db_tags"] = detail.get("tags") or []
+        s["library_db_enrichment"] = {
+            "vendor": detail.get("vendor"),
+            "license": detail.get("license"),
+            "year_introduced": detail.get("year_introduced"),
+            "maturity_reasoning": detail.get("maturity_reasoning"),
+            "confidence": detail.get("confidence"),
+            "version_tag": detail.get("version_tag"),
+            "version_strategy": detail.get("version_strategy"),
+            "category_display": detail.get("category_display"),
+            "sub_category_display": detail.get("sub_category_display"),
+        }
+
+
 @app.get("/skills/runs/{run_id}", response_model=JdRunDetail)
 async def get_jd_pipeline_run(run_id: str):
     """Return the full row for one run, including artifacts."""
@@ -1968,7 +3067,15 @@ async def get_jd_pipeline_run(run_id: str):
         raise HTTPException(status_code=404, detail="run_id not found")
     artifacts_raw = row.pop("artifacts", []) or []
     artifacts = [JdRunArtifact(**a) for a in artifacts_raw]
-    return JdRunDetail(**row, artifacts=artifacts)
+    history_view = _build_jd_history_view(
+        row.get("api1_response"),
+        row.get("api2_response"),
+        row.get("api3_response"),
+        api_parser_response=row.get("api_parser_response"),
+    )
+    lib_repo = SkillLibraryRepository()
+    await asyncio.to_thread(_merge_history_library_skill_details, history_view, lib_repo)
+    return JdRunDetail(**row, artifacts=artifacts, history_view=history_view)
 
 
 @app.post("/extract-pdf-links", response_model=PdfLinksResponse)
