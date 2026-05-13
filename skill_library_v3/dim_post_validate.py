@@ -19,7 +19,7 @@ matching the existing validator-log shape used by Stages 0/1/2.
 
 from __future__ import annotations
 
-from skill_library_v3.dim_apply import ApplyResult
+from skill_library_v3.dim_apply import ApplyResult, _split_csv
 from skill_library_v3.dim_embedder import DimensionEmbedder
 from skill_library_v3.dim_similarity import _cosine
 
@@ -72,6 +72,98 @@ def validate_exemplar_coverage(
                         ),
                     }
                 )
+    return errors
+
+
+def validate_merge_provenance(
+    *,
+    originals: list[dict],
+    locked_dimensions: list[dict],
+) -> list[dict]:
+    """Verify each merged dim's in_scope + exemplar_skills are a strict
+    subset of its source dims' content.
+
+    Each merged dim carries `_merge_provenance.source_dim_ids` (set by
+    ``apply_decisions``). We recompute the set of legitimate tokens from
+    those sources and flag any merged-dim token that didn't originate
+    there as content drift.
+
+    Failure modes caught:
+      * the merged dim absorbed content from a third dim (cascading
+        merge that the LLM smuggled in via the merge-into description)
+      * a future regression in ``apply_decisions`` that loses the strict-
+        union invariant
+      * a provenance row pointing at a source id that no longer exists
+        in the candidate set (``unknown_source_dim``)
+    """
+    by_id: dict[str, dict] = {d.get("tentative_id"): d for d in originals if d.get("tentative_id")}
+    errors: list[dict] = []
+
+    for merged in locked_dimensions:
+        prov = merged.get("_merge_provenance")
+        if not prov:
+            continue
+        source_ids = list(prov.get("source_dim_ids") or [])
+        if not source_ids:
+            continue
+
+        # Build the legitimate-token sets from valid sources only.
+        allowed_in_scope: set[str] = set()
+        allowed_exemplars: set[str] = set()
+        for sid in source_ids:
+            src = by_id.get(sid)
+            if src is None:
+                errors.append(
+                    {
+                        "level": "warning",
+                        "code": "unknown_source_dim",
+                        "dim_id": merged.get("tentative_id"),
+                        "missing_source_dim_id": sid,
+                        "message": (
+                            f"merged dim {merged.get('tentative_id')!r} provenance "
+                            f"references source id {sid!r} which is not in the "
+                            "candidate_dimensions list"
+                        ),
+                    }
+                )
+                continue
+            for tok in _split_csv(src.get("in_scope")):
+                allowed_in_scope.add(tok.lower())
+            for sk in src.get("exemplar_skills") or []:
+                if isinstance(sk, str) and sk.strip():
+                    allowed_exemplars.add(sk.strip().lower())
+
+        # Walk the merged dim's content and find tokens that aren't allowed.
+        foreign_in_scope: list[str] = []
+        for tok in _split_csv(merged.get("in_scope")):
+            if tok.lower() not in allowed_in_scope:
+                foreign_in_scope.append(tok)
+        foreign_exemplars: list[str] = []
+        for sk in merged.get("exemplar_skills") or []:
+            if not isinstance(sk, str) or not sk.strip():
+                continue
+            if sk.strip().lower() not in allowed_exemplars:
+                foreign_exemplars.append(sk.strip())
+
+        if foreign_in_scope or foreign_exemplars:
+            errors.append(
+                {
+                    "level": "error",
+                    "code": "merge_content_drift",
+                    "dim_id": merged.get("tentative_id"),
+                    "dim_name": merged.get("name"),
+                    "source_dim_ids": source_ids,
+                    "foreign_in_scope": foreign_in_scope,
+                    "foreign_exemplars": foreign_exemplars,
+                    "message": (
+                        f"merged dim {merged.get('name')!r} "
+                        f"({merged.get('tentative_id')!r}) contains content not "
+                        f"present in any source dim: "
+                        f"in_scope={foreign_in_scope!r}, exemplars={foreign_exemplars!r}"
+                    ),
+                }
+            )
+
     return errors
 
 

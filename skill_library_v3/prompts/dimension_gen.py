@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-DIM_GEN_PROMPT_VERSION = "stage2_dim_gen_v1.2"
+DIM_GEN_PROMPT_VERSION = "stage2_dim_gen_v1.4"
 
 
 DIM_GEN_SYSTEM_PROMPT = """\
@@ -137,6 +137,28 @@ Don't force-fit irrelevant axes — if the role doesn't touch a bucket,
 omit it. A pure-concepts role legitimately has fewer Vendor Product
 Families dims; a heavy-tooling role legitimately has more. Sweep the
 five buckets before finalising.
+
+Anti-overlap discriminator. If a vendor product (e.g., Vertex AI,
+SageMaker, Azure ML, MLflow, Kafka, Redis, Splunk, Microsoft Sentinel)
+plausibly fits TWO of your candidate dims, pick ONE primary dim that
+owns it and put it in the OTHER dim's out_of_scope as
+"<Product> (belongs to <other dim name>)". NEVER list the same product
+in in_scope of two dims you generate. Stage 3 reconciliation should
+not have to choose which of your two dims owns Vertex AI — the
+disambiguation is yours, made up-front, costing only a few tokens of
+out_of_scope rather than a full LLM merge call. The same rule applies
+to in_scope and exemplar_skills: a product name appears in at most
+one dim's in_scope and at most one dim's exemplar_skills across the
+role.
+
+Exemplar ordering. List each dim's ``exemplar_skills`` in defining-first
+order — the most central / canonical examples of the dim FIRST, peripheral
+examples LAST. Stage 3's cluster gate weights shared exemplars by
+inverse position (1/(rank+1)), so two dims sharing their #1 exemplar
+score far higher than two dims sharing a peripheral exemplar. Getting
+the order right tightens borderline merge decisions; getting it wrong
+either collapses dims that shouldn't merge or keeps dims separate that
+should.
 
 Emit a single JSON object matching the schema. No prose, no code fences.
 """
@@ -370,13 +392,37 @@ _DATA_ML_HINTS = (
     "  - Model Serving (TorchServe, TFServing, Triton, BentoML, "
     "Ray Serve)\n"
     "  - MLOps Platforms (Vertex AI, SageMaker, Azure ML, MLflow, "
-    "Kubeflow, Weights & Biases)\n"
+    "Kubeflow, Weights & Biases) — end-to-end managed ML platforms; "
+    "distinct from cloud compute runtimes (the latter belong in a "
+    "Cloud Compute Runtimes dim, not here)\n"
     "  - Experiment Tracking (MLflow, Weights & Biases, Neptune, "
-    "Comet)\n"
+    "Comet) — keep separate from Feature Stores; MLflow Tracking is "
+    "an experiment artifact, not a feature store concern\n"
     "  - BI & Visualization (Tableau, Power BI, Looker, Metabase, "
     "Superset)\n"
     "  - Data Quality & Lineage (Great Expectations, Monte Carlo, "
     "OpenLineage, dbt tests)\n"
+    # 2026 axes — first-class for MLOps / AI Engineer roles
+    "  - LLM Operations (vector databases — Pinecone, Weaviate, "
+    "Qdrant, Milvus, Chroma; LLM serving — vLLM, TGI, llama.cpp; "
+    "LLM evaluation & observability — LangSmith, Langfuse, Helicone; "
+    "prompt management — PromptLayer, Humanloop; LLM orchestration — "
+    "LangChain, LlamaIndex, DSPy)\n"
+    "  - Distributed Training (Ray Train, Horovod, DeepSpeed, FSDP, "
+    "PyTorch DDP, Megatron-LM)\n"
+    "  - Kubernetes for ML (KServe, Kubeflow Trainer, NVIDIA GPU "
+    "Operator, NVIDIA Device Plugin, Volcano scheduler)\n"
+    "  - Model & Data Versioning (DVC, lakeFS, Delta Lake, "
+    "Pachyderm) — distinct from MLflow Model Registry; this covers "
+    "data + model artifact versioning at the filesystem layer\n"
+    "  - AI Governance & Model Security (Model cards, NIST AI RMF, "
+    "EU AI Act readiness, model supply chain security, "
+    "Hugging Face safetensors)\n"
+    "\n"
+    "MLOps / AI Engineer sub-archetype note: for MLOps and AI Engineer "
+    "roles in 2026, the LLM Operations and Distributed Training axes "
+    "are first-class — most production ML systems include one or "
+    "both. Do not skip them as niche.\n"
 )
 
 _STORAGE_ENGINEER_HINTS = (

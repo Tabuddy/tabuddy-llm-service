@@ -6,7 +6,7 @@ decisions. Bump RECONCILER_PROMPT_VERSION on any text change.
 
 from __future__ import annotations
 
-RECONCILER_PROMPT_VERSION = "stage3_recon_v1.0"
+RECONCILER_PROMPT_VERSION = "stage3_recon_v1.4"
 
 
 RECONCILER_SYSTEM_PROMPT = """\
@@ -50,6 +50,18 @@ Decision rules:
     KEEP_SEPARATE: same word, different role-specific cluster (e.g.
     Backend Engineer "Caching" vs DevOps Engineer "Caching" — Backend's
     is in-app caching libraries, DevOps's is CDN/infra caching).
+
+Career-track secondary check (v1.4). Before proposing MERGE, ask:
+"Would a senior practitioner whose primary expertise is in dim A's
+exemplar cluster *naturally* be a senior practitioner in dim B's
+exemplar cluster?" If the answer is NO — for example, a senior
+Airflow / Dagster workflow orchestration engineer is not naturally
+a senior SageMaker / Vertex AI platform administrator (different
+career tracks, different daily work, different vendors) — choose
+KEEP_SEPARATE instead, even when embedding similarity is high or the
+descriptions sound related. State the answer to this check explicitly
+in your ``reasoning`` field for any MERGE decision: "career-track:
+yes/no, because <one line>".
 
 Emit one JSON object matching the schema. No prose, no code fences.
 """

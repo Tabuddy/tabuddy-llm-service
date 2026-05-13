@@ -17,8 +17,10 @@ import uuid
 from llm_client import GENERATION_MODEL
 from skill_library_v3.agents.charter import Stage0CharterAgent
 from skill_library_v3.agents.containment import Stage6ContainmentAgent
+from skill_library_v3.agents.dim_critic import Stage25CriticAgent
 from skill_library_v3.agents.dimension_gen import Stage2DimensionGeneratorAgent
 from skill_library_v3.agents.dimension_validators import run_dimension_validators
+from skill_library_v3.coverage_matrices import pick_matrix
 from skill_library_v3.agents.enrichment import (
     Stage7AmbiguityAgent,
     Stage7ContextKeywordsAgent,
@@ -44,10 +46,12 @@ from skill_library_v3.enrichment_validators import (
     validate_vendor_recognized,
 )
 from skill_library_v3.dim_apply import apply_decisions
+from skill_library_v3.dim_augment import augment_dim_set
 from skill_library_v3.dim_embedder import make_default_embedder
 from skill_library_v3.dim_overlap_pairs import compute_overlap_pairs
 from skill_library_v3.dim_post_validate import (
     validate_exemplar_coverage,
+    validate_merge_provenance,
     validate_no_near_duplicates,
 )
 from skill_library_v3.placement_validators import (
@@ -460,6 +464,51 @@ async def run_stage_2(role_slug: str) -> None:
             d.model_dump() for d in dim_list.candidate_dimensions
         ]
 
+        # Stage 2.5 (v1.4): coverage-matrix critic + deterministic
+        # structural augmentation. The critic runs one reasoning-tier
+        # LLM call against the role's coverage matrix; if it succeeds,
+        # its proposed_dims feed into augment_dim_set alongside the
+        # deterministic orphan-library + platform-cloud actions.
+        # If the critic fails (LLM error, schema mismatch), the
+        # deterministic-only augmentation still runs — the critic is a
+        # quality-boost, not a hard dependency.
+        critic_response: dict | None = None
+        try:
+            matrix = pick_matrix(
+                family=ctx["role_card"].get("family", ""),
+                canonical_name=ctx["role_card"].get(
+                    "canonical_name", role_display
+                ),
+            )
+            critic = Stage25CriticAgent()
+            critic_response = await critic.critique(
+                role_name=role_display,
+                role_card=ctx["role_card"],
+                current_dimensions=dimensions_payload,
+                matrix=matrix,
+            )
+            logger.info(
+                "[v3 stage2 run %s] critic for %s: covered=%d, "
+                "missing=%d, proposed=%d, dropped=%d",
+                stage2_run_id,
+                role_display,
+                len(critic_response.get("covered", [])),
+                len(critic_response.get("missing", [])),
+                len(critic_response.get("proposed_dims", [])),
+                len(critic_response.get("dropped", [])),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[v3 stage2 run %s] critic failed for %s; falling back "
+                "to deterministic-only augmentation",
+                stage2_run_id,
+                role_display,
+            )
+
+        dimensions_payload = augment_dim_set(
+            dimensions_payload, critic_response=critic_response,
+        )
+
         final_status = await asyncio.to_thread(
             repo.complete_dimensions_run,
             stage2_run_id,
@@ -689,6 +738,21 @@ async def run_stage_3(role_slug: str) -> None:
                 originals=ctx["candidate_dimensions"], result=apply_result,
             )
         )
+        # Merge content drift + cascading-merge are advisory: log them as
+        # warnings so the human reviewer sees them, but don't fail the
+        # pipeline. Mirrors near-duplicate handling below.
+        for err in validate_merge_provenance(
+            originals=ctx["candidate_dimensions"],
+            locked_dimensions=apply_result.locked_dimensions,
+        ):
+            warn = dict(err)
+            warn["level"] = "warning"
+            validator_warnings.append(warn)
+        validator_warnings.extend(apply_result.cascading_merge_warnings)
+        # v1.4 cluster-gate signals: hard-overridden merges + borderline
+        # merges that need human review.
+        validator_warnings.extend(apply_result.cluster_gate_overrides)
+        validator_warnings.extend(apply_result.borderline_merges)
         near_dup_errors = await validate_no_near_duplicates(
             locked_dimensions=apply_result.locked_dimensions, embedder=embedder,
         )
@@ -713,6 +777,8 @@ async def run_stage_3(role_slug: str) -> None:
             "merge_log": apply_result.merge_log,
             "split_log": apply_result.split_log,
             "unassigned_exemplars": apply_result.unassigned_exemplars,
+            "cluster_gate_overrides": apply_result.cluster_gate_overrides,
+            "borderline_merges": apply_result.borderline_merges,
         }
 
         await asyncio.to_thread(
@@ -886,6 +952,18 @@ async def run_stage_3_regenerate(new_run_id: uuid.UUID) -> None:
                 originals=ctx["candidate_dimensions"], result=apply_result,
             )
         )
+        for err in validate_merge_provenance(
+            originals=ctx["candidate_dimensions"],
+            locked_dimensions=apply_result.locked_dimensions,
+        ):
+            warn = dict(err)
+            warn["level"] = "warning"
+            validator_warnings.append(warn)
+        validator_warnings.extend(apply_result.cascading_merge_warnings)
+        # v1.4 cluster-gate signals: hard-overridden merges + borderline
+        # merges that need human review.
+        validator_warnings.extend(apply_result.cluster_gate_overrides)
+        validator_warnings.extend(apply_result.borderline_merges)
         for err in await validate_no_near_duplicates(
             locked_dimensions=apply_result.locked_dimensions, embedder=embedder,
         ):
@@ -902,6 +980,8 @@ async def run_stage_3_regenerate(new_run_id: uuid.UUID) -> None:
             "flagged_pairs": flagged_pairs,
             "decisions": pair_decision_audit,
             "locked_dimensions": apply_result.locked_dimensions,
+            "cluster_gate_overrides": apply_result.cluster_gate_overrides,
+            "borderline_merges": apply_result.borderline_merges,
             "merge_log": apply_result.merge_log,
             "split_log": apply_result.split_log,
             "unassigned_exemplars": apply_result.unassigned_exemplars,
