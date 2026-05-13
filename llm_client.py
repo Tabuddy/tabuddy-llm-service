@@ -1,7 +1,7 @@
 """Centralized Azure OpenAI client factory.
 
 Provides three client tiers:
-  - **fast** (gpt-4o-mini): block tagging, skill normalization, categorization
+  - **fast** (gpt-4o-mini): JD parse (`job_parser.txt`), block tagging, skill normalization, categorization
   - **reasoning** (o4-mini): JD atom extraction, role-fit scoring, section scoring
   - **generation** (gpt-5.4): skill Generator — needs current-world knowledge
 """

@@ -150,6 +150,7 @@ class JdPipelineRunRepository:
                 jd_text               TEXT         NOT NULL,
                 status                TEXT         NOT NULL,
                 api1_response         JSONB,
+                api_parser_response   JSONB,
                 api2_response         JSONB,
                 api3_response         JSONB,
                 chosen_role_display   TEXT,
@@ -225,6 +226,7 @@ class JdPipelineRunRepository:
                     cur.execute(artifacts_idx_run)
                     cur.execute(artifacts_idx_kind)
                     for alter in (
+                        "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS api_parser_response JSONB",
                         "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS llm_cost_api1_usd DOUBLE PRECISION",
                         "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS llm_cost_api2_usd DOUBLE PRECISION",
                         "ALTER TABLE {schema}.{runs} ADD COLUMN IF NOT EXISTS llm_cost_api3_usd DOUBLE PRECISION",
@@ -269,8 +271,8 @@ class JdPipelineRunRepository:
             stmt = sql.SQL(
                 """
                 INSERT INTO {schema}.{runs}
-                    (jd_text, status, api1_response, api_parser_response, jd_role_hint_display)
-                VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)
+                    (jd_text, status, api1_response, api_parser_response, jd_role_hint_display, llm_cost_api1_usd)
+                VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s)
                 RETURNING id
                 """
             ).format(

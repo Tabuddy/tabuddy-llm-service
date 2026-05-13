@@ -1,7 +1,7 @@
 """
 JD Parser Pipeline Test
 -----------------------
-Stage 1 : gpt-4.1-nano  → parse JD structure using job_parser.txt prompt
+Stage 1 : FAST_DEPLOYMENT (default gpt-4o-mini)  → parse JD structure using job_parser.txt prompt
 Stage 2 : gpt-5.4-mini  → extract skills + primary tags + role from nano output
           (same prompt as /skills/extract-from-jd API)
 
@@ -34,15 +34,15 @@ _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 _AZURE_API_VERSION = "2024-12-01-preview"
 _API_KEY = os.getenv("AZURE_OPEN_AI_KEY", "")
 
-# ── Stage 1: nano parser ──────────────────────────────────────────────────────
+# ── Stage 1: JD parse (same deployment as llm_client.FAST_MODEL / FAST_DEPLOYMENT) ─
 # Verify pricing at: https://azure.microsoft.com/pricing/details/cognitive-services/openai-service/
 
-NANO_MODEL        = os.getenv("NANO_MODEL", "gpt-4.1-nano")
-NANO_INPUT_COST   = 0.10   # $ per 1M tokens
-NANO_OUTPUT_COST  = 0.40
+JD_PARSE_MODEL    = os.getenv("FAST_DEPLOYMENT", "gpt-4o-mini")
+NANO_INPUT_COST   = 0.15   # $ per 1M tokens (gpt-4o-mini — verify in Azure portal)
+NANO_OUTPUT_COST  = 0.60
 
 # Other models tested but commented out (not deployed or not needed for this run):
-# "gpt-4o-mini"   input=0.15  output=0.60
+# "gpt-4.1-nano"   not suitable for this run bcz it doesnt obey the job_parser.txt prompt and output quality is poor
 # "gpt-4o"        input=2.50  output=10.00
 # "gpt-5-mini"    input=1.25  output=5.00   restricted — no temperature
 # "gpt-5.4-nano"  input=0.50  output=2.00   restricted — no temperature
@@ -135,7 +135,7 @@ async def _call_nano(client: AsyncAzureOpenAI, jd_text: str) -> dict:
     start = time.monotonic()
     try:
         resp = await client.chat.completions.create(
-            model=NANO_MODEL,
+            model=JD_PARSE_MODEL,
             messages=[
                 {"role": "system", "content": NANO_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Parse this job description:\n\n{jd_text}"},
@@ -213,12 +213,12 @@ async def main() -> None:
     print(f"\n{'=' * 72}")
     print(f"  JD Parser Pipeline")
     print(f"  JD      : {first_key}")
-    print(f"  Stage 1 : {NANO_MODEL}  (${NANO_INPUT_COST:.2f}/${NANO_OUTPUT_COST:.2f} per 1M)  → parse JD structure")
+    print(f"  Stage 1 : {JD_PARSE_MODEL}  (${NANO_INPUT_COST:.2f}/${NANO_OUTPUT_COST:.2f} per 1M)  → parse JD structure")
     print(f"  Stage 2 : {SKILL_MODEL}  (${SKILL_INPUT_COST:.2f}/${SKILL_OUTPUT_COST:.2f} per 1M)  → extract skills + role")
     print(f"{'=' * 72}\n")
 
     # ── Stage 1 ───────────────────────────────────────────────────────────────
-    print(f"  Stage 1 — {NANO_MODEL}")
+    print(f"  Stage 1 — {JD_PARSE_MODEL}")
     nano_result = await _call_nano(client, first_text.strip())
 
     status = "OK " if nano_result["error"] is None else "ERR"
@@ -276,11 +276,11 @@ async def main() -> None:
     total_cost = nano_result["cost_usd"] + skill_result["cost_usd"]
     total_in   = nano_result["input_tokens"] + skill_result["input_tokens"]
     total_out  = nano_result["output_tokens"] + skill_result["output_tokens"]
-    col = max(len(NANO_MODEL), len(SKILL_MODEL)) + 2
+    col = max(len(JD_PARSE_MODEL), len(SKILL_MODEL)) + 2
     print(f"  {'─' * 70}")
     print(f"  {'Stage':<{col}} {'In tok':>7}  {'Out tok':>7}  {'Cost':>12}  {'Time':>10}")
     print(f"  {'─' * 70}")
-    print(f"  {NANO_MODEL:<{col}} {nano_result['input_tokens']:>7}  "
+    print(f"  {JD_PARSE_MODEL:<{col}} {nano_result['input_tokens']:>7}  "
           f"{nano_result['output_tokens']:>7}  ${nano_result['cost_usd']:>11.6f}  "
           f"{_latency_str(nano_result['latency_s']):>10}")
     print(f"  {SKILL_MODEL:<{col}} {skill_result['input_tokens']:>7}  "
@@ -296,7 +296,7 @@ async def main() -> None:
         "run_at": ts,
         "jd_key": first_key,
         "pipeline": {
-            "stage1_nano": {"model": NANO_MODEL, **nano_result},
+            "stage1_jd_parse": {"model": JD_PARSE_MODEL, **nano_result},
             "stage2_skill_extractor": {"model": SKILL_MODEL, **skill_result},
         },
         "total_cost_usd": round(total_cost, 6),
