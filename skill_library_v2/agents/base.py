@@ -27,10 +27,12 @@ from tenacity import (
 from llm_client import (
     FAST_MODEL,
     GENERATION_MODEL,
+    NANO_MODEL,
     REASONING_MODEL,
     RESTRICTED_PARAM_MODELS,
     get_fast_client,
     get_generation_client,
+    get_nano_client,
     get_reasoning_client,
 )
 
@@ -84,6 +86,8 @@ class BaseLLMAgent:
             client = get_reasoning_client()
         elif self.tier == "generation":
             client = get_generation_client()
+        elif self.tier == "nano":
+            client = get_nano_client()
         else:
             client = get_fast_client()
         if client is None:
@@ -98,6 +102,8 @@ class BaseLLMAgent:
             return REASONING_MODEL
         if self.tier == "generation":
             return GENERATION_MODEL
+        if self.tier == "nano":
+            return NANO_MODEL
         return FAST_MODEL
 
     @property
@@ -108,7 +114,7 @@ class BaseLLMAgent:
         gpt-5-mini (reasoning) both run at tier="generation"."""
         if self.model_name in RESTRICTED_PARAM_MODELS:
             return False
-        return self.tier in ("fast", "generation")
+        return self.tier in ("fast", "generation", "nano")
 
     # ── Retry wrapper for a single JSON-returning completion call ────────
     async def call_json(

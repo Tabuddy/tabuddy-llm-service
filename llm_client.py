@@ -18,7 +18,7 @@ _AZURE_ENDPOINT = "https://tabuddy-azure-sponsor.openai.azure.com/"
 _AZURE_API_VERSION = "2024-12-01-preview"
 
 FAST_MODEL = os.getenv("FAST_DEPLOYMENT", "gpt-4o-mini")
-NANO_MODEL = os.getenv("NANO_DEPLOYMENT", "gpt-4.1-nano")
+NANO_MODEL = os.getenv("NANO_DEPLOYMENT", "gpt-5.4-nano")
 SKILL_MODEL = os.getenv("SKILL_DEPLOYMENT", "gpt-5.4-mini")
 REASONING_MODEL = os.getenv("REASONING_DEPLOYMENT", "o4-mini")
 GENERATION_MODEL = os.getenv("GENERATION_DEPLOYMENT", "gpt-5-mini")
@@ -36,6 +36,7 @@ RESTRICTED_PARAM_MODELS: frozenset[str] = frozenset({
 _fast_async: AsyncAzureOpenAI | None = None
 _reasoning_async: AsyncAzureOpenAI | None = None
 _generation_async: AsyncAzureOpenAI | None = None
+_nano_async: AsyncAzureOpenAI | None = None
 _embedding_async: AsyncAzureOpenAI | None = None
 _fast_sync: AzureOpenAI | None = None
 _embedding_sync: AzureOpenAI | None = None
@@ -93,6 +94,23 @@ def get_generation_client() -> AsyncAzureOpenAI | None:
         api_version=_AZURE_API_VERSION,
     )
     return _generation_async
+
+
+def get_nano_client() -> AsyncAzureOpenAI | None:
+    """Return async client for gpt-5.4-nano (cheapest gpt-5.x tier — used by
+    Stages 6 + 7 for high-volume per-skill calls)."""
+    global _nano_async
+    if _nano_async is not None:
+        return _nano_async
+    key = _api_key()
+    if not key:
+        return None
+    _nano_async = AsyncAzureOpenAI(
+        api_key=key,
+        azure_endpoint=_AZURE_ENDPOINT,
+        api_version=_AZURE_API_VERSION,
+    )
+    return _nano_async
 
 
 def get_embedding_client() -> AsyncAzureOpenAI | None:

@@ -40,9 +40,13 @@ from skill_library_v3.schemas.enrichment import (
 
 
 class Stage7VendorLicenseAgent(BaseLLMAgent):
-    """Agent 7a — vendor + license + year_introduced + confidence."""
+    """Agent 7a — vendor + license + year_introduced + confidence.
 
-    tier = "generation"
+    Runs on `fast` (gpt-4o-mini) — vendor identity is stable factual knowledge
+    and pattern-matching, doesn't need gpt-5.x reasoning depth.
+    """
+
+    tier = "fast"
 
     def __init__(self) -> None:
         super().__init__(
@@ -66,7 +70,14 @@ class Stage7VendorLicenseAgent(BaseLLMAgent):
 
 
 class Stage7MaturityAgent(BaseLLMAgent):
-    """Agent 7b — maturity level + reasoning + confidence."""
+    """Agent 7b — maturity level + reasoning + confidence.
+
+    Stays on `generation` tier (the rest of Stage 7 is on `nano`). Hybrid
+    eval against the v1.4 baseline showed nano shifts ~46% of maturity bands
+    by 2+ levels (e.g. Argo CD: well_known → emerging) — the maturity badge
+    is the most-visible Stage 7 field in the admin UI, so we trade ~$0.15
+    of nano savings to keep this one agent calibrated.
+    """
 
     tier = "generation"
 
@@ -92,9 +103,12 @@ class Stage7MaturityAgent(BaseLLMAgent):
 
 
 class Stage7ContextKeywordsAgent(BaseLLMAgent):
-    """Agent 7c — 8-15 distinctive co-occurring terms."""
+    """Agent 7c — 8-15 distinctive co-occurring terms.
 
-    tier = "generation"
+    Runs on `fast` (gpt-4o-mini) — pure recall/pattern task, no reasoning load.
+    """
+
+    tier = "fast"
 
     def __init__(self) -> None:
         super().__init__(
@@ -118,9 +132,16 @@ class Stage7ContextKeywordsAgent(BaseLLMAgent):
 
 
 class Stage7AmbiguityAgent(BaseLLMAgent):
-    """Agent 7d — ambiguity flag + confused_with skill_ids."""
+    """Agent 7d — ambiguity flag + confused_with skill_ids.
 
-    tier = "generation"
+    Runs on `nano` (gpt-5.4-nano). gpt-4o-mini blew up false positives
+    17x on this task in the v1.4 eval (2 baseline flags -> 34 flags),
+    hallucinating skill_ids and conflating umbrella/sub-service relations
+    (e.g. flagging "aws" as confused with "aws_lambda") with ambiguity.
+    Nano stays calibrated against the baseline.
+    """
+
+    tier = "nano"
 
     def __init__(self) -> None:
         super().__init__(
@@ -146,7 +167,7 @@ class Stage7AmbiguityAgent(BaseLLMAgent):
 class Stage7VersioningAgent(BaseLLMAgent):
     """Agent 7e — versioned flag + current_version + alias map."""
 
-    tier = "generation"
+    tier = "nano"
 
     def __init__(self) -> None:
         super().__init__(

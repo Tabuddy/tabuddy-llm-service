@@ -23,7 +23,7 @@ from skill_library_v3.schemas.typology import TypedSkill
 class Stage6ContainmentAgent(BaseLLMAgent):
     """One LLM call per skill. Returns SkillRelationships."""
 
-    tier = "generation"
+    tier = "nano"
 
     def __init__(self) -> None:
         super().__init__(
