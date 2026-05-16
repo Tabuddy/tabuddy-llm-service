@@ -97,6 +97,20 @@ class RoleAliasRow(BaseModel):
     is_primary: bool = False
 
 
+RoleKraSourceField = Literal["primary_responsibility", "distinguishing_task"]
+
+
+class RoleKraRow(BaseModel):
+    """One key responsibility area for a role, sourced from the Stage 1 role
+    card. Embedded by the Stage 8 loader so the role-classifier can match
+    JD responsibility bundles via cosine similarity (see role_kras table)."""
+
+    role_slug: str = Field(min_length=1)
+    source_field: RoleKraSourceField
+    position: int = Field(ge=0, le=255)
+    kra_text: str = Field(min_length=1, max_length=600)
+
+
 class RoleDimRow(BaseModel):
     role_slug: str = Field(min_length=1)
     dimension_slug: str = Field(min_length=1)
@@ -139,6 +153,7 @@ class CatalogPayload(BaseModel):
     skills: list[SkillRow] = Field(default_factory=list)
     aliases: list[AliasRow] = Field(default_factory=list)
     role_aliases: list[RoleAliasRow] = Field(default_factory=list)
+    role_kras: list[RoleKraRow] = Field(default_factory=list)
 
     role_dimensions: list[RoleDimRow] = Field(default_factory=list)
     dimension_skills: list[DimSkillRow] = Field(default_factory=list)

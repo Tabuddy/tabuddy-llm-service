@@ -89,7 +89,7 @@ _BATCH_RESUME_CONCURRENCY = max(
 )
 
 
-load_dotenv()
+load_dotenv(os.getenv("ENV_FILE", ".env"), override=True)
 
 logging.basicConfig(level=logging.INFO)
 

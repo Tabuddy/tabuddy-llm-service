@@ -42,6 +42,7 @@ from skill_library_v3.schemas.catalog import (
     RelRow,
     RoleAliasRow,
     RoleDimRow,
+    RoleKraRow,
     SkillRow,
     SubCategoryRow,
     TagRow,
@@ -62,6 +63,7 @@ class LoadResult:
     skills_written: int = 0
     aliases_written: int = 0
     role_aliases_written: int = 0
+    role_kras_written: int = 0
     role_dimensions_written: int = 0
     dimension_skills_written: int = 0
     dimension_categories_written: int = 0
@@ -82,6 +84,7 @@ class LoadResult:
             "skills_written": self.skills_written,
             "aliases_written": self.aliases_written,
             "role_aliases_written": self.role_aliases_written,
+            "role_kras_written": self.role_kras_written,
             "role_dimensions_written": self.role_dimensions_written,
             "dimension_skills_written": self.dimension_skills_written,
             "dimension_categories_written": self.dimension_categories_written,
@@ -139,15 +142,17 @@ async def load_catalog_for_role(payload: CatalogPayload) -> LoadResult:
     skill_texts = [s.display_name for s in payload.skills]
     alias_texts = [a.alias_text for a in payload.aliases]
     role_alias_texts = [ra.alias_text for ra in payload.role_aliases]
+    role_kra_texts = [k.kra_text for k in payload.role_kras]
 
     (cat_vecs, sub_vecs, dim_vecs, skill_vecs,
-     alias_vecs, role_alias_vecs) = await asyncio.gather(
+     alias_vecs, role_alias_vecs, role_kra_vecs) = await asyncio.gather(
         _embed_batch(cat_texts),
         _embed_batch(sub_texts),
         _embed_batch(dim_texts),
         _embed_batch(skill_texts),
         _embed_batch(alias_texts),
         _embed_batch(role_alias_texts),
+        _embed_batch(role_kra_texts),
     )
     embeddings = {
         "categories": dict(zip([c.slug for c in payload.categories], cat_vecs)),
@@ -160,6 +165,10 @@ async def load_catalog_for_role(payload: CatalogPayload) -> LoadResult:
                     for a, v in zip(payload.aliases, alias_vecs)},
         "role_aliases": {(ra.role_slug, ra.alias_text): v
                          for ra, v in zip(payload.role_aliases, role_alias_vecs)},
+        # KRAs are keyed by (source_field, position) within a role — both
+        # the role_id and the position are needed to disambiguate.
+        "role_kras": {(k.source_field, k.position): v
+                      for k, v in zip(payload.role_kras, role_kra_vecs)},
     }
     return await asyncio.to_thread(_persist_payload_sync, payload, embeddings)
 
@@ -177,6 +186,7 @@ def _persist_payload_sync(
     skill_emb = embeddings["skills"]
     alias_emb = embeddings["aliases"]
     role_alias_emb = embeddings.get("role_aliases", {})
+    role_kra_emb = embeddings.get("role_kras", {})
 
     with connect() as conn:
         with conn.cursor() as cur:
@@ -198,6 +208,9 @@ def _persist_payload_sync(
 
             result.role_aliases_written = _insert_role_aliases(
                 cur, payload.role_aliases, role_id, role_alias_emb,
+            )
+            result.role_kras_written = _insert_role_kras(
+                cur, payload.role_kras, role_id, role_kra_emb,
             )
 
             skill_id_by_slug = _upsert_skills(
@@ -568,6 +581,32 @@ def _insert_role_aliases(
                     alias_embedding = COALESCE(EXCLUDED.alias_embedding, role_aliases.alias_embedding)
             """,
             (role_id, r.alias_text, r.alias_type, r.is_primary, vec),
+        )
+        written += 1
+    return written
+
+
+def _insert_role_kras(
+    cur, rows: list[RoleKraRow], role_id: int,
+    embeddings: dict[tuple[str, int], list[float] | None],
+) -> int:
+    """Hard-replace this role's KRAs. Stage 1's responsibilities can
+    re-shuffle between runs; positions aren't meaningful across runs, so
+    we wipe the role's existing rows and re-insert the current set.
+    The role-classifier always reads the latest state.
+    """
+    cur.execute("DELETE FROM role_kras WHERE role_id = %s", (role_id,))
+    written = 0
+    for r in rows:
+        vec = _vec_literal(embeddings.get((r.source_field, r.position)))
+        cur.execute(
+            """
+            INSERT INTO role_kras (
+                role_id, source_field, position, kra_text, kra_embedding
+            )
+            VALUES (%s, %s, %s, %s, %s::vector)
+            """,
+            (role_id, r.source_field, r.position, r.kra_text, vec),
         )
         written += 1
     return written

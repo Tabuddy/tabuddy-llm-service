@@ -226,6 +226,25 @@
     table.runs tr.clickable { cursor: pointer; }
     table.runs tr.clickable:hover td { background: var(--surface2); }
 
+    /* pipeline-completion indicator (Stage 0 → 8) */
+    .pipeline-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 0.5rem;
+      vertical-align: middle;
+      flex-shrink: 0;
+    }
+    .pipeline-dot.complete {
+      background: var(--success);
+      box-shadow: 0 0 5px rgba(0, 184, 148, 0.55);
+    }
+    .pipeline-dot.pending {
+      background: transparent;
+      border: 1px solid var(--text-dim);
+    }
+
     /* recent runs pager */
     .runs-pager {
       display: flex;
@@ -513,8 +532,12 @@
         const tr = document.createElement("tr");
         tr.classList.add("clickable");
         tr.dataset.runId = r.run_id;
+        const dotClass = r.stage8_complete ? "complete" : "pending";
+        const dotTitle = r.stage8_complete
+          ? "Full pipeline complete — Stage 0 → 8 approved"
+          : "Charter approved; later stages still pending";
         tr.innerHTML = `
-          <td>${escape(r.role_display)}</td>
+          <td><span class="pipeline-dot ${dotClass}" title="${dotTitle}"></span>${escape(r.role_display)}</td>
           <td><span class="badge ${escape(r.status)}">${escape(r.status)}</span></td>
           <td style="color:var(--text-dim)">${fmtTime(r.started_at)}</td>
         `;

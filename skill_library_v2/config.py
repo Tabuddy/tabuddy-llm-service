@@ -7,14 +7,23 @@ optional and downstream code must degrade gracefully when it is absent.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Same convention as V3Settings — ENV_FILE overrides the default `.env`.
+_ENV_FILE = os.getenv("ENV_FILE", ".env")
+# Inject env file values into os.environ with override so they beat any
+# stale values inherited from the shell. See V3Settings for the long version.
+load_dotenv(_ENV_FILE, override=True)
 
 
 class V2Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,

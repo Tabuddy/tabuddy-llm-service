@@ -26,10 +26,44 @@ from skill_library_v3.schemas.catalog import (
     RelRow,
     RoleAliasRow,
     RoleDimRow,
+    RoleKraRow,
     SkillRow,
     SubCategoryRow,
     TagRow,
 )
+
+
+def _split_role_kras(s: str) -> list[str]:
+    """Split a semicolon-delimited KRA field from the Stage 1 role card.
+
+    Trims whitespace, drops empty fragments. Preserves order so the
+    resulting list index maps cleanly to the `position` column.
+    """
+    if not s:
+        return []
+    return [item.strip() for item in s.split(";") if item.strip()]
+
+
+def _build_role_kras(role_slug: str, role_card: dict) -> list[RoleKraRow]:
+    """Emit one RoleKraRow per responsibility/distinguishing-task entry.
+
+    Sources only the two highest-signal fields per the design decision:
+    `primary_responsibilities` (what the role does) and
+    `distinguishing_tasks` (what makes it different from adjacent roles).
+    """
+    rows: list[RoleKraRow] = []
+    for field_name, source_tag in (
+        ("primary_responsibilities", "primary_responsibility"),
+        ("distinguishing_tasks", "distinguishing_task"),
+    ):
+        for idx, text in enumerate(_split_role_kras(role_card.get(field_name) or "")):
+            rows.append(RoleKraRow(
+                role_slug=role_slug,
+                source_field=source_tag,
+                position=idx,
+                kra_text=text,
+            ))
+    return rows
 
 
 # ── role-alias type classifier ────────────────────────────────────────────
@@ -360,6 +394,8 @@ def build_catalog_payload(
                     relationship_type="CO_EVOLVES_WITH",
                 ))
 
+    role_kras = _build_role_kras(role_slug, role_card)
+
     return CatalogPayload(
         role_slug=role_slug,
         role_display=role_display,
@@ -369,6 +405,7 @@ def build_catalog_payload(
         skills=skills,
         aliases=aliases,
         role_aliases=role_aliases,
+        role_kras=role_kras,
         role_dimensions=role_dimensions,
         dimension_skills=dimension_skills,
         dimension_categories=dimension_categories,

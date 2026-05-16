@@ -1085,19 +1085,35 @@ def _fetch_latest_role_card_run(cur, role_slug: str) -> dict | None:
 
 
 def list_recent_runs(limit: int = 20) -> list[dict]:
-    """Last N Stage 0 runs for the UI's recent-runs lane."""
+    """Last N Stage 0 runs for the UI's recent-runs lane.
+
+    Each row also carries ``stage8_complete`` — True when the same role has
+    an approved Stage 8 (catalog-load) run, signalling the full pipeline
+    landed in the canonical catalog. The UI shows this as a small dot next
+    to the role name.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT run_id, role_id, role_display, status,
-                       started_at, completed_at
-                  FROM v2_run_log
-                 WHERE prompt_version LIKE %s
-                 ORDER BY started_at DESC NULLS LAST
+                SELECT v.run_id, v.role_id, v.role_display, v.status,
+                       v.started_at, v.completed_at,
+                       EXISTS (
+                           SELECT 1 FROM v2_run_log s8
+                            WHERE s8.role_id = v.role_id
+                              AND s8.prompt_version LIKE %s
+                              AND s8.status = 'approved'
+                       ) AS stage8_complete
+                  FROM v2_run_log v
+                 WHERE v.prompt_version LIKE %s
+                 ORDER BY v.started_at DESC NULLS LAST
                  LIMIT %s
                 """,
-                (CHARTER_PROMPT_VERSION_PREFIX + "%", int(limit)),
+                (
+                    STAGE8_PROMPT_VERSION_PREFIX + "%",
+                    CHARTER_PROMPT_VERSION_PREFIX + "%",
+                    int(limit),
+                ),
             )
             rows = _rows_to_dicts(cur, cur.fetchall())
     for r in rows:
@@ -1106,6 +1122,7 @@ def list_recent_runs(limit: int = 20) -> list[dict]:
             r["started_at"] = r["started_at"].isoformat()
         if r.get("completed_at"):
             r["completed_at"] = r["completed_at"].isoformat()
+        r["stage8_complete"] = bool(r.get("stage8_complete"))
     return rows
 
 
@@ -2289,6 +2306,49 @@ def complete_load_run(
             )
         conn.commit()
     return final_status
+
+
+def query_kras_by_embedding(
+    query_embedding: list[float],
+    *,
+    similarity_threshold: float = 0.65,
+    max_results: int = 20,
+) -> list[dict]:
+    """Top-N KRA matches for a query embedding (pgvector cosine).
+
+    Thin sync wrapper around the ``search_kras_by_embedding`` SQL function
+    defined in ``db/v3_additions_kras.sql``. The role-classifier's
+    Stage 3c calls this with one JD responsibility bundle at a time.
+
+    Returns a list of dicts with keys: role_id, role_slug, role_display_name,
+    kra_id, kra_text, source_field, similarity.
+    """
+    if not query_embedding:
+        return []
+    vec_literal = "[" + ",".join(f"{x:.7f}" for x in query_embedding) + "]"
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role_id, role_slug, role_display_name,
+                       kra_id, kra_text, source_field, similarity
+                  FROM search_kras_by_embedding(%s::vector, %s, %s)
+                """,
+                (vec_literal, similarity_threshold, max_results),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "role_id": r[0],
+            "role_slug": r[1],
+            "role_display_name": r[2],
+            "kra_id": r[3],
+            "kra_text": r[4],
+            "source_field": r[5],
+            "similarity": float(r[6]),
+        }
+        for r in rows
+    ]
 
 
 def get_latest_enrichment_for_role(role_slug: str) -> list[dict] | None:
