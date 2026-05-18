@@ -197,11 +197,28 @@ class FinalSkillItem(BaseModel):
     is_primary: bool
 
 
+class RoleSignalItem(BaseModel):
+    role_id: int
+    slug: str
+    display_name: str
+    score: float                   # 0.0–1.0 (× 100 = percentage)
+    matched_count: int | None = None   # skill_match only
+    total_count: int | None = None     # skill_match only
+
+
+class Stage3SignalsResponse(BaseModel):
+    skill_match_roles: list[RoleSignalItem] = Field(default_factory=list)
+    alias_match_roles: list[RoleSignalItem] = Field(default_factory=list)
+    kra_match_roles: list[RoleSignalItem] = Field(default_factory=list)
+    stage35_ran: bool = False      # True when LLM alias generation fired
+
+
 class JDSkillPipelineResponse(BaseModel):
     final_skills: list[FinalSkillItem] = Field(default_factory=list)
     run_id: str | None = None
     jd_role: JdRoleHint | None = None
     nano_parsed: dict | None = None
+    stage3_signals: Stage3SignalsResponse | None = None
 
 
 # ── Skill Detail / Reverse Planner models ────────────────────────────────────
@@ -1201,6 +1218,10 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     # Extract role from nano output
     jd_role: JdRoleHint | None = None
     nano_role = (nano_parsed.get("role") or "").strip()
+    nano_role_aliases: list[str] = [
+        a.strip() for a in (nano_parsed.get("role_aliases") or [])
+        if isinstance(a, str) and a.strip()
+    ]
     if nano_role:
         jd_role = JdRoleHint(
             display_name=nano_role,
@@ -1248,10 +1269,72 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
     cost_acc.log_summary("skills/extract-from-jd", logger)
 
+    # ── Stage 2 (R&R embedding) + Stage 3 (DB lookups) + Stage 3.5 (alias validator) ──
+    stage3_signals: Stage3SignalsResponse | None = None
+    try:
+        from jd_similarity_matcher import Stage3Result, run_stage2_and_stage3
+
+        skills_for_stage3 = [s.skill_name for s in final_skills]
+        s3: Stage3Result = await run_stage2_and_stage3(
+            r_and_r_text,
+            skills_for_stage3,
+            nano_role,
+            role_aliases=nano_role_aliases,
+            top_k=5,
+        )
+        stage3_signals = Stage3SignalsResponse(
+            skill_match_roles=[
+                RoleSignalItem(
+                    role_id=r.role_id,
+                    slug=r.slug,
+                    display_name=r.display_name,
+                    score=r.score,
+                    matched_count=r.matched_count,
+                    total_count=r.total_count,
+                )
+                for r in s3.skill_match_roles
+            ],
+            alias_match_roles=[
+                RoleSignalItem(role_id=r.role_id, slug=r.slug, display_name=r.display_name, score=r.score)
+                for r in s3.alias_match_roles
+            ],
+            kra_match_roles=[
+                RoleSignalItem(role_id=r.role_id, slug=r.slug, display_name=r.display_name, score=r.score)
+                for r in s3.kra_match_roles
+            ],
+            stage35_ran=s3.stage35_ran,
+        )
+        logger.info(
+            "[skills/extract-from-jd] stage3 skill_roles=%d alias_roles=%d kra_roles=%d stage35=%s",
+            len(s3.skill_match_roles),
+            len(s3.alias_match_roles),
+            len(s3.kra_match_roles),
+            s3.stage35_ran,
+        )
+        for r in s3.skill_match_roles:
+            logger.info(
+                "[stage3a/skill_match] role=%r slug=%s score=%.2f%% (%d/%d skills)",
+                r.display_name, r.slug, r.score * 100,
+                r.matched_count or 0, r.total_count or 0,
+            )
+        for r in s3.alias_match_roles:
+            logger.info(
+                "[stage3b/alias_match] role=%r slug=%s score=%.2f%%",
+                r.display_name, r.slug, r.score * 100,
+            )
+        for r in s3.kra_match_roles:
+            logger.info(
+                "[stage3c/kra_match]   role=%r slug=%s score=%.2f%%",
+                r.display_name, r.slug, r.score * 100,
+            )
+    except Exception as exc:
+        logger.warning("[skills/extract-from-jd] Stage 2/3 failed (non-fatal): %s", exc)
+
     response = JDSkillPipelineResponse(
         final_skills=final_skills,
         jd_role=jd_role,
         nano_parsed=nano_parsed,
+        stage3_signals=stage3_signals,
     )
 
     # ── History persistence ───────────────────────────────────────────────────
