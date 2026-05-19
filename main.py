@@ -190,6 +190,7 @@ class JdRoleHint(BaseModel):
     slug: str = ""
     role_archetype: str | None = None
     rationale: str | None = None
+    role_aliases: list[str] = Field(default_factory=list)
 
 
 class FinalSkillItem(BaseModel):
@@ -210,7 +211,7 @@ class Stage3SignalsResponse(BaseModel):
     skill_match_roles: list[RoleSignalItem] = Field(default_factory=list)
     alias_match_roles: list[RoleSignalItem] = Field(default_factory=list)
     kra_match_roles: list[RoleSignalItem] = Field(default_factory=list)
-    stage35_ran: bool = False      # True when LLM alias generation fired
+    alias_found: bool = False      # True when at least one alias_match_roles result returned
 
 
 class Stage4DecisionResponse(BaseModel):
@@ -456,9 +457,9 @@ class FinalRoleOutputResponse(BaseModel):
     persistence: PersistenceReport
     planner_output: PlannerGeneratedOutput | None = None
     run_id: str | None = None
-    # ``in_db`` — chosen role resolved to an existing DB row.
-    # ``human_review_required`` — chosen role not in DB; no auto-create (default).
-    # ``auto_created`` — missing role was inserted (API3_AUTO_CREATE_MISSING_ROLE=1).
+    # ``in_db`` — chosen role resolved to an existing DB row (roles or role_aliases).
+    # ``auto_created`` — role was not in DB; inserted after Stage 4 confirmed it.
+    # ``human_review_required`` — role absent; skipped insert (writes disabled).
     chosen_role_resolution: str | None = None
 
 
@@ -1365,7 +1366,13 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             display_name=nano_role,
             slug="",
             role_archetype=(nano_parsed.get("role_archetype") or "").strip() or None,
+            role_aliases=nano_role_aliases,
         )
+    logger.info(
+        "[skills/extract-from-jd] role=%r role_aliases=%s",
+        nano_role or "(none)",
+        nano_role_aliases or [],
+    )
 
     # Build skill extractor input: role + technical_requirements + roles_and_responsibilities
     _parts: list[str] = []
@@ -1441,14 +1448,14 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 RoleSignalItem(role_id=r.role_id, slug=r.slug, display_name=r.display_name, score=r.score)
                 for r in s3.kra_match_roles
             ],
-            stage35_ran=s3.stage35_ran,
+            alias_found=s3.alias_found,
         )
         logger.info(
-            "[skills/extract-from-jd] stage3 skill_roles=%d alias_roles=%d kra_roles=%d stage35=%s",
+            "[skills/extract-from-jd] stage3 skill_roles=%d alias_roles=%d kra_roles=%d alias_found=%s",
             len(s3.skill_match_roles),
             len(s3.alias_match_roles),
             len(s3.kra_match_roles),
-            s3.stage35_ran,
+            s3.alias_found,
         )
         for r in s3.skill_match_roles:
             logger.info(
@@ -1680,64 +1687,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         except Exception as exc:
             logger.warning("[skills/extract-from-jd] Stage 5 failed: %s", exc)
 
-    # ── Auto-trigger v3 pipeline for absolutely-new roles ────────────────────
-    # JD_V3_AUTO_TRIGGER=false short-circuits the actual pipeline kickoff so
-    # batch tests can record what WOULD have triggered without spending $3-5
-    # and 30-60min per role.
-    if decision is not None and s3 is not None:
-        try:
-            from jd_classifier import is_absolutely_new_role
-
-            # Belt-and-suspenders: re-check the archetype gate before firing
-            # v3. The endpoint already rejected non-tech JDs at Stage 1, but
-            # if any path bypasses that (custom callers, future refactors),
-            # we still won't spend $0.20-0.40 materializing a non-tech role.
-            is_tech_for_v3, _reason = _is_tech_jd(nano_parsed)
-            if (
-                is_tech_for_v3
-                and is_absolutely_new_role(decision, s3, stage1_resolved=stage1_resolved)
-            ):
-                auto_trigger_enabled = (
-                    os.getenv("JD_V3_AUTO_TRIGGER", "true").lower() != "false"
-                )
-                if auto_trigger_enabled:
-                    from skill_library_v3.runner import (
-                        create_initial_run, run_stage_0,
-                    )
-                    init = await asyncio.to_thread(create_initial_run, nano_role)
-                    v3_run_id = init.get("run_id")
-                    v3_role_slug = init.get("role_slug")
-                    asyncio.create_task(run_stage_0(v3_run_id))
-                    logger.info(
-                        "[stage4/auto-trigger] new role detected (%r); "
-                        "v3 kicked off run_id=%s slug=%s",
-                        nano_role, v3_run_id, v3_role_slug,
-                    )
-                    if response.stage5_updates is None:
-                        response.stage5_updates = Stage5UpdatesResponse()
-                    response.stage5_updates.v3_pipeline_triggered = True
-                    response.stage5_updates.v3_run_id = str(v3_run_id)
-                    response.stage5_updates.v3_role_slug = v3_role_slug
-                else:
-                    logger.info(
-                        "[stage4/auto-trigger] new role detected (%r); "
-                        "JD_V3_AUTO_TRIGGER=false -> skipped (would have fired)",
-                        nano_role,
-                    )
-                    if response.stage5_updates is None:
-                        response.stage5_updates = Stage5UpdatesResponse()
-                    response.stage5_updates.v3_pipeline_triggered = False
-                    response.stage5_updates.v3_run_id = "DRY_RUN"
-                    # derive a slug preview so the UI can show what would be created
-                    response.stage5_updates.v3_role_slug = (
-                        nano_role.lower().strip().replace(" ", "-")[:120]
-                    )
-        except Exception as exc:
-            logger.warning(
-                "[skills/extract-from-jd] v3 auto-trigger failed: %s", exc,
-            )
-
-    # Persist final api1_response (now with stage4/5 + v3 trigger fields)
+    # Persist final api1_response (now with stage4/5 fields)
     # back to jd_pipeline_runs so the history list + detail page can read
     # them. start_run captured an earlier snapshot; this overwrites with
     # the post-Stage-5/v3 state.
@@ -2708,21 +2658,30 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
                 _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
         return empty_response
 
-    # 2) Resolve role in DB. Optional auto-create only when
-    # API3_AUTO_CREATE_MISSING_ROLE=1 (default: off — human review, no DB row).
+    # 2) Resolve role in DB.
+    # Check roles table first (by id / slug / display_name), then fall back to
+    # role_aliases table. Only create a new role when absent from both tables.
     resolved_role = await asyncio.to_thread(
         repo.find_role_by_identity,
         role_id=chosen.id,
         slug=chosen.slug,
         display_name=chosen.display_name,
     )
+    if resolved_role is None:
+        resolved_role = await asyncio.to_thread(
+            repo.find_role_by_alias_name, chosen.display_name or ""
+        )
+        if resolved_role is not None:
+            logger.info(
+                "[final-role-output] chosen role %r resolved via role_aliases → id=%s slug=%s",
+                chosen.display_name, resolved_role.get("id"), resolved_role.get("slug"),
+            )
+
     role_missing_initially = resolved_role is None
     planner_output: PlannerGeneratedOutput | None = None
     role_auto_inserted = False
 
-    if role_missing_initially and os.getenv(
-        "API3_AUTO_CREATE_MISSING_ROLE", ""
-    ).strip().lower() in ("1", "true", "yes"):
+    if role_missing_initially and _API3_writes_enabled:
         matched_rows = sum(
             1 for dd in dimension_worklist if _role_matches_chosen(dd, chosen)
         )
@@ -2733,50 +2692,47 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
         if should_create:
             try:
-                if not _API3_writes_enabled:
-                    pass
-                else:
-                    role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
-                    role_vec = await asyncio.to_thread(_embed_for_skill_library_db, role_embed_text.strip())
-                    similar_roles = (
-                        await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
-                        if role_vec is not None
-                        else []
+                role_embed_text = (chosen.display_name or "").strip() + " " + (chosen.role_archetype or "").strip()
+                role_vec = await asyncio.to_thread(_embed_for_skill_library_db, role_embed_text.strip())
+                similar_roles = (
+                    await asyncio.to_thread(repo.find_similar_roles_by_embedding, role_vec)
+                    if role_vec is not None
+                    else []
+                )
+                role_reused = False
+                if similar_roles:
+                    dedup = await rev_planner.confirm_or_reuse_entity(
+                        "role",
+                        {"display_name": chosen.display_name, "role_archetype": chosen.role_archetype},
+                        similar_roles,
                     )
-                    role_reused = False
-                    if similar_roles:
-                        dedup = await rev_planner.confirm_or_reuse_entity(
-                            "role",
-                            {"display_name": chosen.display_name, "role_archetype": chosen.role_archetype},
-                            similar_roles,
-                        )
-                        if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
-                            resolved_role = await asyncio.to_thread(
-                                repo.find_role_by_identity, role_id=dedup["existing_id"]
-                            )
-                            role_reused = True
-                    if resolved_role is None:
+                    if dedup.get("action") == "use_existing" and isinstance(dedup.get("existing_id"), int):
                         resolved_role = await asyncio.to_thread(
-                            repo.create_role,
-                            slug=chosen.slug,
-                            display_name=chosen.display_name,
-                            role_archetype=chosen.role_archetype,
-                            source=chosen.source or "llm",
-                            name_embedding=role_vec,
+                            repo.find_role_by_identity, role_id=dedup["existing_id"]
                         )
-                        if (
-                            resolved_role is not None
-                            and resolved_role.get("id") is not None
-                            and not role_reused
-                        ):
-                            role_auto_inserted = True
-                            artifacts.append({
-                                "kind": "role_created",
-                                "artifact_id": int(resolved_role["id"]),
-                                "artifact_text": str(
-                                    resolved_role.get("display_name") or chosen.display_name
-                                ),
-                            })
+                        role_reused = True
+                if resolved_role is None:
+                    resolved_role = await asyncio.to_thread(
+                        repo.create_role,
+                        slug=chosen.slug,
+                        display_name=chosen.display_name,
+                        role_archetype=chosen.role_archetype,
+                        source=chosen.source or "llm",
+                        name_embedding=role_vec,
+                    )
+                    if (
+                        resolved_role is not None
+                        and resolved_role.get("id") is not None
+                        and not role_reused
+                    ):
+                        role_auto_inserted = True
+                        artifacts.append({
+                            "kind": "role_created",
+                            "artifact_id": int(resolved_role["id"]),
+                            "artifact_text": str(
+                                resolved_role.get("display_name") or chosen.display_name
+                            ),
+                        })
             except Exception as exc:
                 logger.warning("create_role failed for chosen role %r: %s", chosen.slug, exc)
 

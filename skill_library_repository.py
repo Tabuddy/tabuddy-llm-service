@@ -596,6 +596,32 @@ class SkillLibraryRepository:
                 return rows
 
     # ── Persistence helpers for final-role-output ────────────────────────────
+    def find_role_by_alias_name(self, display_name: str) -> dict | None:
+        """Resolve a role from role_aliases using exact case-insensitive match on display_name.
+
+        Returns the canonical roles row if the name matches any alias, else None.
+        This is the fallback after find_role_by_identity returns None, so role creation
+        is only triggered when the name is truly absent from both tables.
+        """
+        name_lower = (display_name or "").strip().lower()
+        if not name_lower:
+            return None
+        sql = f"""
+            SELECT r.id, r.slug, r.display_name, r.role_archetype
+              FROM {self.schema}.role_aliases ra
+              JOIN {self.schema}.roles r ON r.id = ra.role_id
+             WHERE ra.alias_lower = %s
+             LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (name_lower,))
+                row = cur.fetchone()
+                if row:
+                    cols = [c[0] for c in cur.description]
+                    return dict(zip(cols, row))
+        return None
+
     def find_role_by_identity(
         self,
         *,

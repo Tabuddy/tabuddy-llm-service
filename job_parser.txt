@@ -125,6 +125,21 @@ Classify the role into exactly one of the following archetypes based on the prim
 - If the role is ambiguous or hybrid, pick the archetype that represents the majority of described responsibilities.
 - If the JD_type is `fail` → this field does not exist in the output (stop at `{ "JD_type": "fail" }`).
 
+### 2.2c `role_aliases` *(array of strings)*
+
+2–4 common industry names or abbreviations for the role identified in `role`.
+
+**Rules:**
+- Derive aliases from the verbatim `role` value — do not invent unrelated titles.
+- Strip seniority prefixes (Senior, Lead, Principal, Jr., Staff, etc.) to produce the base canonical form.
+  - `"Senior Azure Data Engineer"` → `["Azure Data Engineer", "Data Engineer", "Cloud Data Engineer"]`
+  - `"Lead ML Engineer (Computer Vision)"` → `["ML Engineer", "Machine Learning Engineer", "Computer Vision Engineer"]`
+  - `"Staff Frontend Engineer"` → `["Frontend Engineer", "Frontend Developer", "UI Engineer"]`
+- Include common abbreviations when widely used in the industry (e.g. `"SWE"`, `"SRE"`, `"MLE"`).
+- Do **not** include the verbatim `role` value itself — it is already in `role`.
+- If `role` is `null` → `[]`.
+- Maximum 4 aliases. Prefer shorter, canonical forms over long descriptive ones.
+
 ### 2.3 `urls` *(array of objects)*
 Capture every URL present in the JD.
 ```json
@@ -467,6 +482,7 @@ Emit exactly one JSON object. No surrounding text, no markdown fences.
   "company_name": "<string | null>",
   "role": "<string | null>",
   "role_archetype": "<Engineering | Data | DevOps | Security | QA | Design | Product | Management | Research | Other | null>",
+  "role_aliases": ["<string>"],
   "urls": [ { "url": "<string>", "type": "<enum>" } ],
   "job_locations": [
     {
@@ -539,6 +555,7 @@ Run this mental checklist before producing output:
 - [ ] Is every schema key present, even nulls?
 - [ ] Is `role` extracted verbatim (no normalization)?
 - [ ] Is `role_archetype` set to exactly one value from the controlled list (or `null` only if JD_type is fail)?
+- [ ] Does `role_aliases` contain 2–4 canonical/abbreviated forms of `role`, excluding the verbatim title and seniority prefixes? Is it `[]` when `role` is `null`?
 - [ ] For `education`: one entry per education path, with `qualification` in `<DEGREE_FORMS> - <SPECIALIZATION>` format, `raw` preserved?
 - [ ] Did I capture every certification mentioned, preserving original phrasing? Did I exclude degrees, courses, and skill mentions?
 - [ ] **CRITICAL — For `roles_and_responsibilities`:** does the array contain ONE OBJECT per included block? Does every object have a non-empty `text` with the FULL verbatim body of that block? Does `bullet_count` match the actual number of bullets in `text`?
@@ -608,6 +625,7 @@ Liquidity Services (NASDAQ: LQDT) operates the world's largest B2B e-commerce ma
   "company_name": "Liquidity Services",
   "role": "Software Developer",
   "role_archetype": "Engineering",
+  "role_aliases": ["Software Engineer", "SWE", "Full Stack Developer"],
   "urls": [],
   "job_locations": [],
   "ctc": null,

@@ -4,7 +4,9 @@ Stage 2:   embed R&R verbatim text → 1536-dim vector
 Stage 3a:  skill match      – canonical_skills / skill_aliases → dimension → role scores
 Stage 3b:  role alias match – role_aliases / roles.display_name → direct role hit
 Stage 3c:  KRA vector match – cosine similarity vs role_kras embeddings → role scores
-Stage 3.5: alias validator  – if no alias hit, generate aliases via LLM and persist
+
+Stage 3 is read-only. If the role/alias is not found, it is logged as a new/unknown alias
+and role creation is deferred to after Stage 4 decides the canonical role.
 """
 
 from __future__ import annotations
@@ -72,7 +74,7 @@ class Stage3Result:
     skill_match_roles: list[RoleSignal]
     alias_match_roles: list[RoleSignal]
     kra_match_roles: list[RoleSignal]
-    stage35_ran: bool = False   # True when Stage 3.5 LLM alias generation fired
+    alias_found: bool = False   # True when at least one alias_match_roles result was returned
 
 
 # ── Legacy dataclass (kept for backward compat) ───────────────────────────────
@@ -293,6 +295,7 @@ def search_roles_by_kra_vector(
           FROM {qs}.role_kras rk
           JOIN {qs}.roles r ON r.id = rk.role_id
          WHERE rk.kra_embedding IS NOT NULL
+           AND rk.source_field = 'primary_responsibility'
          GROUP BY r.id, r.slug, r.display_name
          ORDER BY max_sim DESC
          LIMIT %s
@@ -318,113 +321,6 @@ def search_roles_by_kra_vector(
     ]
 
 
-# ── Stage 3.5: Alias Validator ────────────────────────────────────────────────
-
-def _find_role_id_by_name(role_name: str) -> int | None:
-    """Return role.id for an exact (case-insensitive) display_name match, or None."""
-    qs = _qs()
-    sql = f"""
-        SELECT id FROM {qs}.roles
-         WHERE LOWER(display_name) = LOWER(%s)
-         LIMIT 1
-    """
-    conn = _pg_connect()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (role_name.strip(),))
-                row = cur.fetchone()
-                return int(row[0]) if row else None
-    finally:
-        conn.close()
-
-
-def _store_role_aliases(role_id: int, aliases: list[str]) -> int:
-    """Insert LLM-generated aliases into role_aliases; skip duplicates. Returns insert count."""
-    if not aliases:
-        return 0
-
-    qs = _qs()
-    sql = f"""
-        INSERT INTO {qs}.role_aliases
-               (role_id, alias_text, alias_type, match_strategy, is_primary)
-        VALUES (%s, %s, 'COLLOQUIAL'::"alias_type", 'CASE_INSENSITIVE'::"match_strategy", false)
-        ON CONFLICT (role_id, alias_text) DO NOTHING
-    """
-    conn = _pg_connect()
-    inserted = 0
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                for alias in aliases:
-                    alias = alias.strip()[:200]
-                    if alias:
-                        cur.execute(sql, (role_id, alias))
-                        inserted += cur.rowcount
-    finally:
-        conn.close()
-    return inserted
-
-
-async def _stage35_generate_role_aliases(
-    role_name: str,
-    role_id: int,
-) -> list[str]:
-    """Call LLM to generate common aliases for an unrecognized role, then persist them.
-
-    Fires when Stage 3b returns no results and the role exists in the roles table.
-    """
-    try:
-        import json as _json
-        from llm_client import FAST_MODEL, get_fast_client
-    except ImportError:
-        logger.warning("[stage3.5] llm_client unavailable — skipping alias generation")
-        return []
-
-    client = get_fast_client()
-    if client is None:
-        return []
-
-    prompt = (
-        f'Given the job title "{role_name}", generate 3 to 5 common industry aliases '
-        "or alternative names used for this role. "
-        'Return a JSON object with key "aliases" containing an array of strings. '
-        'Example: {"aliases": ["Software Engineer", "SWE", "Backend Developer"]}'
-    )
-    try:
-        resp = await client.chat.completions.create(
-            model=FAST_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0,
-            timeout=30,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        data = _json.loads(raw)
-        if isinstance(data, list):
-            aliases = [str(a) for a in data if a]
-        elif isinstance(data, dict):
-            for key in ("aliases", "names", "alternatives", "titles", "result"):
-                if isinstance(data.get(key), list):
-                    aliases = [str(a) for a in data[key] if a]
-                    break
-            else:
-                aliases = []
-        else:
-            aliases = []
-    except Exception as exc:
-        logger.warning("[stage3.5] LLM alias generation failed for %r: %s", role_name, exc)
-        return []
-
-    if aliases:
-        stored = await asyncio.to_thread(_store_role_aliases, role_id, aliases)
-        logger.info(
-            "[stage3.5] role_id=%d (%r): generated %d aliases, stored %d",
-            role_id, role_name, len(aliases), stored,
-        )
-    return aliases
-
-
 # ── Main orchestrator ─────────────────────────────────────────────────────────
 
 async def run_stage2_and_stage3(
@@ -435,7 +331,10 @@ async def run_stage2_and_stage3(
     role_aliases: list[str] | None = None,
     top_k: int = 10,
 ) -> Stage3Result:
-    """Run Stage 2 + Stage 3 (parallel DB lookups) + Stage 3.5 (alias validator).
+    """Run Stage 2 (R&R embedding) + Stage 3 (parallel DB lookups).
+
+    Stage 3 is read-only. If no alias match is found, the result is passed through
+    as-is with alias_found=False. Role creation is deferred to after Stage 4.
 
     Args:
         r_and_r_text: R&R verbatim text from Stage 1 LLM output.
@@ -461,20 +360,8 @@ async def run_stage2_and_stage3(
         asyncio.to_thread(search_roles_by_alias, role_name, role_aliases, top_k=top_k),
         _kra(),
     )
-
-    # ── Stage 3.5: alias validator ────────────────────────────────────────────
-    # Fires when Stage 3b produced no alias hit but the role exists in the roles table.
-    stage35_ran = False
-    if not alias_roles and (role_name or "").strip():
-        role_id = await asyncio.to_thread(_find_role_id_by_name, role_name)
-        if role_id is not None:
-            await _stage35_generate_role_aliases(role_name, role_id)
-            stage35_ran = True
-        else:
-            logger.info(
-                "[stage3.5] %r not found in roles table — alias generation skipped",
-                role_name,
-            )
+    # Stage 3b logs "new/unknown alias" when alias_roles is empty (see search_roles_by_alias).
+    # Role creation is deferred — Stage 4 decides the canonical role first.
 
     # ── Stage 4 integration point ─────────────────────────────────────────────
     # TODO Stage 4: Decision Routing
@@ -508,7 +395,7 @@ async def run_stage2_and_stage3(
         skill_match_roles=skill_roles,
         alias_match_roles=alias_roles,
         kra_match_roles=kra_roles,
-        stage35_ran=stage35_ran,
+        alias_found=bool(alias_roles),
     )
 
 
