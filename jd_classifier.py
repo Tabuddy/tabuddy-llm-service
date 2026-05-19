@@ -448,6 +448,31 @@ async def stage4_route_decision(
                       detail="no KRA results")
     top_kra = kra[0]
     if top_kra.score < KRA_MIN_SCORE:
+        # Skill_top fallback: KRA is noisy but skill profile may clearly
+        # identify a canonical role. Generalize "designation" titles (e.g.,
+        # 'Applications Development Programmer Analyst' has skill_top=
+        # backend-engineer 0.27) into the skill_top role rather than queue
+        # → prevents v3 from firing for corporate-jargon titles.
+        if (
+            stage1_resolved is None
+            and top_skill is not None
+            and top_skill.score >= 0.20
+        ):
+            return Stage4Decision(
+                case="B",
+                chosen_role=top_skill,
+                confidence=top_skill.score,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"Stage 1 title '{role_name_input}' is unmapped "
+                    f"(designation?); KRA inconclusive "
+                    f"({top_kra.score:.2f}). Skill profile points at "
+                    f"{top_skill.slug} ({top_skill.score:.2f}) - generalize."
+                ),
+            )
         return _queue("E", reason="low_kra",
                       detail=f"top KRA {top_kra.score:.2f} < {KRA_MIN_SCORE}")
 
@@ -479,9 +504,14 @@ async def stage4_route_decision(
             # Prevents "Senior Java Backend Developer" → android-engineer
             # (KRA top wrong because Java is over-associated with android in
             # the canonical_skills catalog).
+            #
+            # Gate: max(0.20 absolute, 50% of kra_top.score). Combines a
+            # noise floor with a relative-strength check so it adapts to
+            # the catalog's actual scoring distribution.
+            skill_vs_kra_gate = max(0.20, 0.5 * top_kra_score)
             if (
                 top_skill is not None
-                and top_skill.score >= 0.30
+                and top_skill.score >= skill_vs_kra_gate
                 and top_skill.role_id != kra[0].role_id
             ):
                 return await _resolve_via_llm2(
@@ -504,6 +534,28 @@ async def stage4_route_decision(
                     f"Stage 1 title '{role_name_input}' not in catalog; "
                     f"KRA top-2 within margin -> classify into nearest "
                     f"neighbor {kra[0].slug} ({kra[0].score:.2f})"
+                ),
+            )
+        # Skill_top fallback (same generalization rule as the low_kra gate):
+        # if stage1 unresolved AND skill_top points at an existing role with
+        # decent confidence, classify by skill rather than queue + fire v3.
+        if (
+            stage1_resolved is None
+            and top_skill is not None
+            and top_skill.score >= 0.20
+        ):
+            return Stage4Decision(
+                case="B",
+                chosen_role=top_skill,
+                confidence=top_skill.score,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"Stage 1 title '{role_name_input}' is unmapped; "
+                    f"KRA margin too small. Skill profile points at "
+                    f"{top_skill.slug} ({top_skill.score:.2f}) - generalize."
                 ),
             )
         return _queue("E", reason="small_margin",
@@ -595,9 +647,13 @@ async def stage4_route_decision(
     # case fell through to the "top KRA stands" fallback and silently
     # picked KRA top, which routinely misclassified JDs like "Senior Java
     # Backend Developer" (skill=backend, kra=android because of Java).
+    #
+    # Gate: max(0.20 absolute, 50% of kra_top.score). See Case B' branch
+    # above for the same logic — adapts to sparse-catalog scoring.
+    skill_vs_kra_gate = max(0.20, 0.5 * kra[0].score)
     if (
         top_skill is not None
-        and top_skill.score >= 0.30
+        and top_skill.score >= skill_vs_kra_gate
         and top_skill.role_id != kra[0].role_id
     ):
         return await _resolve_via_llm2(
