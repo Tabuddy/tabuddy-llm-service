@@ -179,6 +179,132 @@ class SkillLibraryRepository:
                         out[key] = rec
         return out
 
+    def find_canonical_skills_by_alias_embedding(
+        self,
+        alias_texts: Iterable[str],
+        *,
+        threshold: float | None = None,
+    ) -> dict[str, dict]:
+        """After exact match fails, embed each term and resolve via pgvector.
+
+        Search order per term (first hit at or above ``threshold`` wins):
+          1. ``skill_aliases.alias_embedding`` (nearest neighbor)
+          2. ``canonical_skills.name_embedding`` (nearest neighbor)
+
+        Threshold defaults to env ``SKILL_EMBEDDING_MATCH_THRESHOLD`` (0.80).
+        """
+        terms = [str(v).strip() for v in alias_texts if v is not None and str(v).strip()]
+        if not terms:
+            return {}
+
+        thresh = (
+            float(threshold)
+            if threshold is not None
+            else float(os.getenv("SKILL_EMBEDDING_MATCH_THRESHOLD", "0.80"))
+        )
+
+        try:
+            from skill_matcher import _azure_embed_sync
+        except ImportError:
+            return {}
+
+        vectors = _azure_embed_sync(terms)
+        if not vectors or len(vectors) != len(terms):
+            return {}
+
+        vt = self._vector_type_sql
+        sch = self.schema
+
+        _select_alias = f"""
+            SELECT
+                cs.id AS skill_id,
+                cs.slug AS skill_slug,
+                cs.display_name AS skill_display_name,
+                cs.category_id,
+                cs.sub_category_id,
+                cs.skill_nature,
+                cs.volatility,
+                cs.is_extractable,
+                cs.is_also_category,
+                cs.typical_lifespan,
+                sa.id AS alias_id,
+                sa.alias_text,
+                sa.alias_type,
+                sa.match_strategy,
+                sa.is_primary,
+                ROUND((1 - (sa.alias_embedding <=> %s::{vt}))::numeric, 4) AS similarity
+            FROM {sch}.skill_aliases sa
+            JOIN {sch}.canonical_skills cs ON cs.id = sa.skill_id
+            WHERE sa.alias_embedding IS NOT NULL
+            ORDER BY sa.alias_embedding <=> %s::{vt}
+            LIMIT 1
+        """
+
+        _select_canonical = f"""
+            SELECT
+                cs.id AS skill_id,
+                cs.slug AS skill_slug,
+                cs.display_name AS skill_display_name,
+                cs.category_id,
+                cs.sub_category_id,
+                cs.skill_nature,
+                cs.volatility,
+                cs.is_extractable,
+                cs.is_also_category,
+                cs.typical_lifespan,
+                NULL::bigint AS alias_id,
+                NULL::varchar AS alias_text,
+                NULL AS alias_type,
+                NULL AS match_strategy,
+                NULL::boolean AS is_primary,
+                ROUND((1 - (cs.name_embedding <=> %s::{vt}))::numeric, 4) AS similarity
+            FROM {sch}.canonical_skills cs
+            WHERE cs.name_embedding IS NOT NULL
+            ORDER BY cs.name_embedding <=> %s::{vt}
+            LIMIT 1
+        """
+
+        out: dict[str, dict] = {}
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for term, vec in zip(terms, vectors):
+                    if not vec:
+                        continue
+                    key = term.lower()
+                    if key in out:
+                        continue
+                    vec_str = "[" + ",".join(map(str, vec)) + "]"
+
+                    best_rec: dict | None = None
+                    best_sim = 0.0
+                    best_via = ""
+
+                    cur.execute(_select_alias, (vec_str, vec_str))
+                    row = cur.fetchone()
+                    if row:
+                        cols = [c[0] for c in cur.description]
+                        rec = dict(zip(cols, row))
+                        sim = float(rec["similarity"])
+                        if sim >= thresh and sim > best_sim:
+                            best_rec, best_sim, best_via = rec, sim, "embedding_alias"
+
+                    cur.execute(_select_canonical, (vec_str, vec_str))
+                    row = cur.fetchone()
+                    if row:
+                        cols = [c[0] for c in cur.description]
+                        rec = dict(zip(cols, row))
+                        sim = float(rec["similarity"])
+                        if sim >= thresh and sim > best_sim:
+                            best_rec, best_sim, best_via = rec, sim, "embedding_display_name"
+
+                    if best_rec is not None:
+                        best_rec["lookup_key"] = key
+                        best_rec["embedding_similarity"] = best_sim
+                        best_rec["matched_via"] = best_via
+                        out[key] = best_rec
+
+        return out
+
     def add_aliases(
         self,
         records: Sequence[tuple[int, str]],

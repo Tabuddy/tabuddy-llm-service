@@ -375,7 +375,7 @@ class SkillDetail(BaseModel):
     source_tag: str
     was_in_llm_skills: bool
     canonical: CanonicalSkillSummary | None = None
-    matched_via: str | None = None  # "alias" | "display_name"
+    matched_via: str | None = None  # "alias" | "display_name" | "embedding_alias" | "embedding_display_name"
     aliases_in_db: list[AliasInfo] = Field(default_factory=list)
     new_alias_persisted: bool = False
     new_alias_text: str | None = None
@@ -1853,6 +1853,30 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         alias_lookup = await asyncio.to_thread(
             repo.find_canonical_skills_by_aliases, final_skills
         )
+        unmatched_after_exact = [
+            t for t in final_skills if t.strip().lower() not in alias_lookup
+        ]
+        if unmatched_after_exact:
+            emb_lookup = await asyncio.to_thread(
+                repo.find_canonical_skills_by_alias_embedding,
+                unmatched_after_exact,
+            )
+            for key, rec in emb_lookup.items():
+                alias_lookup[key] = rec
+            if emb_lookup:
+                logger.info(
+                    "[skills/extract-details] embedding_skill_match count=%d terms=%s",
+                    len(emb_lookup),
+                    [
+                        {
+                            "term": k,
+                            "canonical": v.get("skill_display_name"),
+                            "sim": v.get("embedding_similarity"),
+                            "via": v.get("matched_via"),
+                        }
+                        for k, v in emb_lookup.items()
+                    ],
+                )
 
     alias_matches: list[AliasMatch] = []
     unmatched_llm_skills: list[str] = []
@@ -1873,7 +1897,9 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         canonical = _canonical_summary_from_row(hit)
         existing_alias_id = hit.get("alias_id")
         existing_alias_text = hit.get("alias_text")
-        matched_via = "alias" if existing_alias_id is not None else "display_name"
+        matched_via = str(hit.get("matched_via") or "").strip()
+        if not matched_via:
+            matched_via = "alias" if existing_alias_id is not None else "display_name"
 
         matched_per_final[term] = {
             "canonical": canonical,
