@@ -474,6 +474,24 @@ async def stage4_route_decision(
         # the KRA top — the JD will get a best-effort answer for downstream
         # consumers, and v3 will independently materialize the real role.
         if stage1_resolved is None and top_kra_score >= KRA_MIN_SCORE:
+            # When skill_top has meaningful confidence AND disagrees with
+            # kra_top, route through LLM2 rather than blindly pick kra_top.
+            # Prevents "Senior Java Backend Developer" → android-engineer
+            # (KRA top wrong because Java is over-associated with android in
+            # the canonical_skills catalog).
+            if (
+                top_skill is not None
+                and top_skill.score >= 0.30
+                and top_skill.role_id != kra[0].role_id
+            ):
+                return await _resolve_via_llm2(
+                    case="D",
+                    tied_candidates=[top_skill, kra[0]],
+                    r_and_r_text=r_and_r_text,
+                    llm2_fn=llm2_fn,
+                    alias_collision=False,
+                    queue_reason="llm2_unsure",
+                )
             return Stage4Decision(
                 case="B",
                 chosen_role=kra[0],
@@ -570,8 +588,30 @@ async def stage4_route_decision(
             queue_reason="llm2_unsure",
         )
 
+    # Case D' (skill-vs-KRA disagreement) — when there's no usable alias
+    # signal AND skill_top points at a different role than kra_top with
+    # meaningful confidence, fire LLM2 with [skill_top, kra_top] so the
+    # skill-suggested role appears in the candidate set. Previously this
+    # case fell through to the "top KRA stands" fallback and silently
+    # picked KRA top, which routinely misclassified JDs like "Senior Java
+    # Backend Developer" (skill=backend, kra=android because of Java).
+    if (
+        top_skill is not None
+        and top_skill.score >= 0.30
+        and top_skill.role_id != kra[0].role_id
+    ):
+        return await _resolve_via_llm2(
+            case="D",
+            tied_candidates=[top_skill, kra[0]],
+            r_and_r_text=r_and_r_text,
+            llm2_fn=llm2_fn,
+            alias_collision=False,
+            queue_reason="llm2_unsure",
+        )
+
     # Fallback: top KRA stands but no other signal supports it. Treat as
     # weak Case A (auto-classify with a confidence haircut).
+    top_kra = kra[0]
     return Stage4Decision(
         case="A",
         chosen_role=top_kra,
