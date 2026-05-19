@@ -10,6 +10,7 @@ wheels/
 .venv
 .env
 .env.local
+.env.prod
 
 
 # set fit models
@@ -39,3 +40,5 @@ low_confidence_log.jsonl
 # Local-only run artifacts from migration / verification scripts
 *.bak
 uv.lock.bak
+
+backups

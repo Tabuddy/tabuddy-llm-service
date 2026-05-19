@@ -18,7 +18,8 @@ from pathlib import Path
 import psycopg2
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+_ENV_FILE = os.getenv("ENV_FILE") or str(Path(__file__).resolve().parent / ".env")
+load_dotenv(_ENV_FILE, override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -266,10 +267,12 @@ def search_roles_by_kra_vector(
     *,
     top_k: int = 10,
 ) -> list[RoleSignal]:
-    """Average cosine similarity of the R&R embedding against each role's KRA embeddings.
+    """MAX cosine similarity of the R&R embedding against each role's KRAs.
 
-    Uses a CTE to let the HNSW index serve the inner ORDER BY, then groups by role.
-    Score = average cosine similarity across the role's KRA entries.
+    For each role, score = best single KRA match (not average). Average over a
+    role's many KRAs dilutes the signal because the R&R rarely overlaps with
+    every KRA — typically it strongly matches 1-2 KRAs and weakly matches the
+    rest. MAX preserves that strong-match signal.
     """
     if not vec:
         return []
@@ -277,34 +280,28 @@ def search_roles_by_kra_vector(
     qs = _qs()
     vec_type = f"{qs}.vector(1536)"
     vec_str = "[" + ",".join(map(str, vec)) + "]"
-    inner_limit = top_k * 10  # fetch enough KRA rows to cover all candidate roles
 
+    # Per-role MAX similarity. The HNSW index serves each role's nearest-KRA
+    # lookup; pgvector returns ordered rows so DISTINCT ON gives us the best
+    # row per role for free.
     sql = f"""
-        WITH top_kras AS (
-            SELECT rk.role_id,
-                   1 - (rk.kra_embedding <=> %s::{vec_type}) AS sim
-              FROM {qs}.role_kras rk
-             WHERE rk.kra_embedding IS NOT NULL
-             ORDER BY rk.kra_embedding <=> %s::{vec_type}
-             LIMIT %s
-        )
         SELECT r.id           AS role_id,
                r.slug,
                r.display_name,
-               AVG(tk.sim)   AS avg_sim,
-               MAX(tk.sim)   AS max_sim,
-               COUNT(*)      AS kra_count
-          FROM top_kras tk
-          JOIN {qs}.roles r ON r.id = tk.role_id
+               MAX(1 - (rk.kra_embedding <=> %s::{vec_type})) AS max_sim,
+               COUNT(*)       AS kra_count
+          FROM {qs}.role_kras rk
+          JOIN {qs}.roles r ON r.id = rk.role_id
+         WHERE rk.kra_embedding IS NOT NULL
          GROUP BY r.id, r.slug, r.display_name
-         ORDER BY avg_sim DESC
+         ORDER BY max_sim DESC
          LIMIT %s
     """
     conn = _pg_connect()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (vec_str, vec_str, inner_limit, top_k))
+                cur.execute(sql, (vec_str, top_k))
                 rows = [dict(zip([c[0] for c in cur.description], row)) for row in cur.fetchall()]
     finally:
         conn.close()
@@ -314,7 +311,7 @@ def search_roles_by_kra_vector(
             role_id=int(r["role_id"]),
             slug=str(r["slug"]),
             display_name=str(r["display_name"]),
-            score=round(float(r["avg_sim"]), 4),
+            score=round(float(r["max_sim"]), 4),
             signal_type="kra_match",
         )
         for r in rows

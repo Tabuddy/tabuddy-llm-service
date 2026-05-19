@@ -302,6 +302,44 @@ class JdPipelineRunRepository:
             log.warning("[JD pipeline / history] start_run failed: %s", exc)
             return None
 
+    def update_api1_response(
+        self,
+        run_id: str | UUID | None,
+        api1_response: Any,
+    ) -> bool:
+        """Overwrite stored api1_response — used after Stage 4/5 finish so the
+        api1_response JSON in the DB matches what the endpoint actually
+        returned (including stage4_decision, stage5_updates, v3 trigger).
+        """
+        rid = _coerce_uuid(run_id)
+        if not rid:
+            return False
+        try:
+            payload = json.dumps(_json_safe(api1_response), ensure_ascii=False)
+            stmt = sql.SQL(
+                """
+                UPDATE {schema}.{runs}
+                   SET api1_response = %s::jsonb,
+                       updated_at = NOW()
+                 WHERE id = %s::uuid
+                """
+            ).format(
+                schema=sql.Identifier(self.schema),
+                runs=sql.Identifier(self.runs_table),
+            )
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(stmt, (payload, rid))
+                    rowcount = cur.rowcount
+                conn.commit()
+            return rowcount > 0
+        except Exception as exc:
+            log.warning(
+                "[JD pipeline / history] update_api1_response failed for run_id=%s: %s",
+                rid, exc,
+            )
+            return False
+
     def attach_api2(
         self,
         run_id: str | UUID | None,
@@ -623,7 +661,11 @@ class JdPipelineRunRepository:
                    duration_ms,
                    error_message,
                    LEFT(jd_text, 240)           AS jd_text_preview,
-                   LENGTH(jd_text)              AS jd_text_length
+                   LENGTH(jd_text)              AS jd_text_length,
+                   api1_response #>> '{{stage4_decision,case}}'              AS stage4_case,
+                   api1_response #>> '{{stage5_updates,v3_pipeline_triggered}}' AS v3_pipeline_triggered_raw,
+                   api1_response #>> '{{stage5_updates,v3_run_id}}'          AS v3_run_id,
+                   api1_response #>> '{{stage5_updates,v3_role_slug}}'       AS v3_role_slug
               FROM {schema}.{runs}
               {where}
               ORDER BY created_at DESC

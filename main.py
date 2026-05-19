@@ -213,12 +213,87 @@ class Stage3SignalsResponse(BaseModel):
     stage35_ran: bool = False      # True when LLM alias generation fired
 
 
+class Stage4DecisionResponse(BaseModel):
+    case: str
+    chosen_role: RoleSignalItem | None = None
+    confidence: float = 0.0
+    llm2_fired: bool = False
+    llm2_reasoning: str | None = None
+    alias_collision_detected: bool = False
+    queued: bool = False
+    reasoning: str = ""
+
+
+class CandidateSkillAttached(BaseModel):
+    skill_name: str
+    is_primary: bool = False
+    queue_id: int
+    role_display_name: str
+    role_slug: str
+    status: str = "pending"
+
+
+class CandidateKraAttached(BaseModel):
+    queue_id: int
+    role_display_name: str
+    role_slug: str
+    best_kra_similarity: float | None = None
+    r_and_r_preview: str = ""
+    status: str = "pending"
+
+
+class Stage5UpdatesResponse(BaseModel):
+    centroid_updated: bool = False
+    centroid_n_after: int | None = None
+    queue_entry_id: int | None = None
+    collision_log_id: int | None = None
+    new_skills_attached: list[CandidateSkillAttached] = Field(default_factory=list)
+    new_kra_attached: CandidateKraAttached | None = None
+    v3_pipeline_triggered: bool = False
+    v3_run_id: str | None = None
+    v3_role_slug: str | None = None
+
+
 class JDSkillPipelineResponse(BaseModel):
     final_skills: list[FinalSkillItem] = Field(default_factory=list)
     run_id: str | None = None
     jd_role: JdRoleHint | None = None
     nano_parsed: dict | None = None
     stage3_signals: Stage3SignalsResponse | None = None
+    stage4_decision: Stage4DecisionResponse | None = None
+    stage5_updates: Stage5UpdatesResponse | None = None
+    rejected: bool = False
+    rejection_reason: str | None = None
+
+
+# Archetypes that count as "tech" for our software-engineering-focused
+# catalog. Override via TECH_ARCHETYPES env var (comma-separated).
+_DEFAULT_TECH_ARCHETYPES = "Engineering,Data,DevOps,Security,QA,Research"
+
+
+def _is_tech_jd(nano_parsed: dict | None) -> tuple[bool, str]:
+    """Return ``(is_tech, reason_when_not_tech)``.
+
+    Reject when:
+      * Stage 1 marked JD_type=fail (parser couldn't make sense of it).
+      * role_archetype is not in the allow-list (e.g., "Other", "Management",
+        "Product", "Design" — none of these align with our SE-focused catalog).
+    """
+    if not nano_parsed:
+        return False, "Stage 1 returned no nano_parsed payload"
+    if nano_parsed.get("JD_type") == "fail":
+        return False, "Stage 1 marked JD_type=fail (unparseable)"
+    arch = (nano_parsed.get("role_archetype") or "").strip()
+    allowed_raw = os.getenv("TECH_ARCHETYPES", _DEFAULT_TECH_ARCHETYPES)
+    allowed = {a.strip() for a in allowed_raw.split(",") if a.strip()}
+    if not arch:
+        return False, "Stage 1 produced no role_archetype"
+    if arch not in allowed:
+        return False, (
+            f"role_archetype {arch!r} is not in TECH_ARCHETYPES "
+            f"(allowed: {sorted(allowed)})"
+        )
+    return True, ""
 
 
 # ── Skill Detail / Reverse Planner models ────────────────────────────────────
@@ -404,12 +479,34 @@ class JdRunSummary(BaseModel):
     error_message: str | None = None
     jd_text_preview: str | None = None
     jd_text_length: int | None = None
+    stage4_case: str | None = None
+    v3_pipeline_triggered: bool = False
+    v3_run_id: str | None = None
+    v3_role_slug: str | None = None
 
 
 class JdRunListResponse(BaseModel):
     runs: list[JdRunSummary]
     limit: int
     offset: int
+
+
+class V3StageRow(BaseModel):
+    stage_index: int           # 0..8
+    stage_name: str            # 'charter', 'anchor', 'dim_gen', ...
+    prompt_version: str | None = None
+    status: str                # 'pending' | 'running' | 'approved' | 'failed'
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
+
+
+class V3RunStatus(BaseModel):
+    role_slug: str
+    role_display: str | None = None
+    stages: list[V3StageRow]   # always 9 rows (one per stage)
+    terminal_status: str       # 'pending' | 'running' | 'approved' | 'failed'
+    last_updated: datetime | None = None
 
 
 class JdRunArtifact(BaseModel):
@@ -1215,6 +1312,47 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             detail=f"Nano JD parsing failed: {exc}",
         ) from exc
 
+    # ── Tech-archetype gate — early-exit non-tech JDs ─────────────────────────
+    # The skill catalog is software-engineering-focused. Reject JDs whose
+    # archetype doesn't fit (Lab Technician, Product Manager, Project Admin,
+    # Synthetic Biology Scientist, etc.) so we don't waste LLM tokens on
+    # Stage 2/3/4/5 or fire v3 to create catalog entries for off-domain roles.
+    is_tech, reject_reason = _is_tech_jd(nano_parsed)
+    if not is_tech:
+        nano_role_for_log = (nano_parsed or {}).get("role") or "—"
+        arch_for_log = (nano_parsed or {}).get("role_archetype") or "—"
+        logger.info(
+            "[skills/extract-from-jd] REJECT non-tech JD: role=%r archetype=%r reason=%s",
+            nano_role_for_log, arch_for_log, reject_reason,
+        )
+        rejected_response = JDSkillPipelineResponse(
+            final_skills=[],
+            jd_role=JdRoleHint(
+                display_name=nano_role_for_log,
+                slug="",
+                role_archetype=arch_for_log,
+                rationale=reject_reason,
+            ) if nano_parsed else None,
+            nano_parsed=nano_parsed,
+            rejected=True,
+            rejection_reason=reject_reason,
+        )
+        # Persist a thin record so the history list shows the rejection.
+        try:
+            history_repo = JdPipelineRunRepository()
+            rejected_run_id = await asyncio.to_thread(
+                history_repo.start_run,
+                jd_text=jd_text,
+                api1_response=rejected_response,
+                api_parser_response=nano_parsed,
+                jd_role_hint_display=nano_role_for_log,
+                llm_cost_usd=cost_acc.total_cost_usd,
+            )
+            rejected_response.run_id = rejected_run_id
+        except Exception as exc:
+            logger.warning("[skills/extract-from-jd] reject-run start_run failed: %s", exc)
+        return rejected_response
+
     # Extract role from nano output
     jd_role: JdRoleHint | None = None
     nano_role = (nano_parsed.get("role") or "").strip()
@@ -1271,6 +1409,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
     # ── Stage 2 (R&R embedding) + Stage 3 (DB lookups) + Stage 3.5 (alias validator) ──
     stage3_signals: Stage3SignalsResponse | None = None
+    s3 = None
     try:
         from jd_similarity_matcher import Stage3Result, run_stage2_and_stage3
 
@@ -1329,15 +1468,88 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             )
     except Exception as exc:
         logger.warning("[skills/extract-from-jd] Stage 2/3 failed (non-fatal): %s", exc)
+        s3 = None
 
+    # ── Stage 1 role resolution (NEW) ─────────────────────────────────────────
+    # Resolve the verbatim Stage 1 role title against the canonical catalog
+    # BEFORE Stage 4 runs. The result is the authoritative "is this role in
+    # the catalog?" signal — sidesteps Stage 3b's noisy trigram fuzzy fallback.
+    stage1_resolved = None
+    if s3 is not None and nano_role:
+        try:
+            from jd_classifier import resolve_stage1_role
+            from jd_similarity_matcher import _SKILL_SCHEMA, _pg_connect
+
+            def _resolve_stage1():
+                conn = _pg_connect()
+                try:
+                    with conn:
+                        return resolve_stage1_role(
+                            conn, nano_role, schema=_SKILL_SCHEMA,
+                        )
+                finally:
+                    conn.close()
+
+            stage1_resolved = await asyncio.to_thread(_resolve_stage1)
+            if stage1_resolved is not None:
+                logger.info(
+                    "[stage1/resolve] %r -> %s (id=%d, match_kind=%s)",
+                    nano_role, stage1_resolved.slug,
+                    stage1_resolved.role_id, stage1_resolved.match_kind,
+                )
+            else:
+                logger.info(
+                    "[stage1/resolve] %r is NOT in canonical catalog "
+                    "(new-role candidate)",
+                    nano_role,
+                )
+        except Exception as exc:
+            logger.warning("[stage1/resolve] failed: %s", exc)
+
+    # ── Stage 4 (Decision Routing) — compulsory ──────────────────────────────
+    stage4_response: Stage4DecisionResponse | None = None
+    decision = None
+    if s3 is not None:
+        try:
+            from jd_classifier import stage4_route_decision
+            decision = await stage4_route_decision(
+                s3, r_and_r_text=r_and_r_text, role_name_input=nano_role,
+                stage1_resolved=stage1_resolved,
+            )
+            stage4_response = Stage4DecisionResponse(
+                case=decision.case,
+                chosen_role=(
+                    RoleSignalItem(
+                        role_id=decision.chosen_role.role_id,
+                        slug=decision.chosen_role.slug,
+                        display_name=decision.chosen_role.display_name,
+                        score=decision.chosen_role.score,
+                    ) if decision.chosen_role else None
+                ),
+                confidence=decision.confidence,
+                llm2_fired=decision.llm2_fired,
+                llm2_reasoning=decision.llm2_reasoning,
+                alias_collision_detected=decision.alias_collision_detected,
+                queued=decision.queued,
+                reasoning=decision.reasoning,
+            )
+            logger.info(
+                "[stage4] case=%s chosen=%s confidence=%.2f queued=%s llm2=%s",
+                decision.case,
+                decision.chosen_role.slug if decision.chosen_role else None,
+                decision.confidence, decision.queued, decision.llm2_fired,
+            )
+        except Exception as exc:
+            logger.warning("[skills/extract-from-jd] Stage 4 failed: %s", exc)
+
+    # ── History start_run (before Stage 5 so we have a run_id to reference) ──
     response = JDSkillPipelineResponse(
         final_skills=final_skills,
         jd_role=jd_role,
         nano_parsed=nano_parsed,
         stage3_signals=stage3_signals,
+        stage4_decision=stage4_response,
     )
-
-    # ── History persistence ───────────────────────────────────────────────────
     history_repo = JdPipelineRunRepository()
     run_id = await asyncio.to_thread(
         history_repo.start_run,
@@ -1348,6 +1560,220 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         llm_cost_usd=cost_acc.total_cost_usd,
     )
     response.run_id = run_id
+
+    # ── Stage 5 (Post-Classification Updates) — compulsory ───────────────────
+    new_skills_attached: list[CandidateSkillAttached] = []
+    new_kra_attached: CandidateKraAttached | None = None
+    if decision is not None and run_id is not None and s3 is not None:
+        try:
+            from jd_classifier import (
+                NEW_KRA_THRESHOLD, detect_unknown_skills,
+                enqueue_kra_candidate, enqueue_skill_candidates,
+                query_matched_skill_names, stage5_apply_updates,
+            )
+            from jd_similarity_matcher import _SKILL_SCHEMA, _pg_connect
+
+            jd_skill_dicts = [
+                {"skill_name": s.skill_name, "is_primary": s.is_primary}
+                for s in final_skills
+            ]
+
+            def _run_stage5():
+                conn = _pg_connect()
+                try:
+                    with conn:
+                        updates = stage5_apply_updates(
+                            conn,
+                            jd_run_id=run_id,
+                            decision=decision,
+                            r_and_r_embedding=s3.r_and_r_embedding,
+                            r_and_r_text=r_and_r_text,
+                            role_name_input=nano_role,
+                            s3=s3,
+                        )
+                        skill_attachments: list[CandidateSkillAttached] = []
+                        kra_attachment: CandidateKraAttached | None = None
+                        if decision.chosen_role is not None and not decision.queued:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE jd_pipeline_runs "
+                                    "SET chosen_role_id = %s, "
+                                    "    chosen_role_display = %s "
+                                    "WHERE id = %s",
+                                    (
+                                        decision.chosen_role.role_id,
+                                        decision.chosen_role.display_name,
+                                        run_id,
+                                    ),
+                                )
+
+                            matched = query_matched_skill_names(
+                                conn,
+                                [d["skill_name"] for d in jd_skill_dicts],
+                                schema=_SKILL_SCHEMA,
+                            )
+                            unknown = detect_unknown_skills(jd_skill_dicts, matched)
+                            if unknown:
+                                ids = enqueue_skill_candidates(
+                                    conn,
+                                    jd_run_id=run_id,
+                                    role_id=decision.chosen_role.role_id,
+                                    unknown_skills=unknown,
+                                )
+                                # Pair each new id back with its source skill;
+                                # `enqueue_skill_candidates` preserves input order
+                                # and skips ON CONFLICT rows, so we walk in lockstep.
+                                for s_in, qid in zip(unknown, ids):
+                                    skill_attachments.append(
+                                        CandidateSkillAttached(
+                                            skill_name=s_in["skill_name"],
+                                            is_primary=bool(s_in.get("is_primary", False)),
+                                            queue_id=qid,
+                                            role_display_name=decision.chosen_role.display_name,
+                                            role_slug=decision.chosen_role.slug,
+                                        )
+                                    )
+
+                            chosen_kra_score = next(
+                                (
+                                    r.score for r in s3.kra_match_roles
+                                    if r.role_id == decision.chosen_role.role_id
+                                ),
+                                0.0,
+                            )
+                            if chosen_kra_score < NEW_KRA_THRESHOLD and r_and_r_text:
+                                kid = enqueue_kra_candidate(
+                                    conn,
+                                    jd_run_id=run_id,
+                                    role_id=decision.chosen_role.role_id,
+                                    r_and_r_text=r_and_r_text[:4000],
+                                    best_kra_similarity=chosen_kra_score,
+                                )
+                                if kid is not None:
+                                    kra_attachment = CandidateKraAttached(
+                                        queue_id=kid,
+                                        role_display_name=decision.chosen_role.display_name,
+                                        role_slug=decision.chosen_role.slug,
+                                        best_kra_similarity=float(chosen_kra_score),
+                                        r_and_r_preview=r_and_r_text[:200],
+                                    )
+                        return updates, skill_attachments, kra_attachment
+                finally:
+                    conn.close()
+
+            updates, new_skills_attached, new_kra_attached = await asyncio.to_thread(_run_stage5)
+            response.stage5_updates = Stage5UpdatesResponse(
+                centroid_updated=updates.centroid_updated,
+                centroid_n_after=updates.centroid_n_after,
+                queue_entry_id=updates.queue_entry_id,
+                collision_log_id=updates.collision_log_id,
+                new_skills_attached=new_skills_attached,
+                new_kra_attached=new_kra_attached,
+            )
+            logger.info(
+                "[stage5] centroid=%s n=%s queue=%s collision=%s new_skills=%d new_kra=%s",
+                updates.centroid_updated, updates.centroid_n_after,
+                updates.queue_entry_id, updates.collision_log_id,
+                len(new_skills_attached),
+                new_kra_attached.queue_id if new_kra_attached else None,
+            )
+        except Exception as exc:
+            logger.warning("[skills/extract-from-jd] Stage 5 failed: %s", exc)
+
+    # ── Auto-trigger v3 pipeline for absolutely-new roles ────────────────────
+    # JD_V3_AUTO_TRIGGER=false short-circuits the actual pipeline kickoff so
+    # batch tests can record what WOULD have triggered without spending $3-5
+    # and 30-60min per role.
+    if decision is not None and s3 is not None:
+        try:
+            from jd_classifier import is_absolutely_new_role
+
+            # Belt-and-suspenders: re-check the archetype gate before firing
+            # v3. The endpoint already rejected non-tech JDs at Stage 1, but
+            # if any path bypasses that (custom callers, future refactors),
+            # we still won't spend $0.20-0.40 materializing a non-tech role.
+            is_tech_for_v3, _reason = _is_tech_jd(nano_parsed)
+            if (
+                is_tech_for_v3
+                and is_absolutely_new_role(decision, s3, stage1_resolved=stage1_resolved)
+            ):
+                auto_trigger_enabled = (
+                    os.getenv("JD_V3_AUTO_TRIGGER", "true").lower() != "false"
+                )
+                if auto_trigger_enabled:
+                    from skill_library_v3.runner import (
+                        create_initial_run, run_stage_0,
+                    )
+                    init = await asyncio.to_thread(create_initial_run, nano_role)
+                    v3_run_id = init.get("run_id")
+                    v3_role_slug = init.get("role_slug")
+                    asyncio.create_task(run_stage_0(v3_run_id))
+                    logger.info(
+                        "[stage4/auto-trigger] new role detected (%r); "
+                        "v3 kicked off run_id=%s slug=%s",
+                        nano_role, v3_run_id, v3_role_slug,
+                    )
+                    if response.stage5_updates is None:
+                        response.stage5_updates = Stage5UpdatesResponse()
+                    response.stage5_updates.v3_pipeline_triggered = True
+                    response.stage5_updates.v3_run_id = str(v3_run_id)
+                    response.stage5_updates.v3_role_slug = v3_role_slug
+                else:
+                    logger.info(
+                        "[stage4/auto-trigger] new role detected (%r); "
+                        "JD_V3_AUTO_TRIGGER=false -> skipped (would have fired)",
+                        nano_role,
+                    )
+                    if response.stage5_updates is None:
+                        response.stage5_updates = Stage5UpdatesResponse()
+                    response.stage5_updates.v3_pipeline_triggered = False
+                    response.stage5_updates.v3_run_id = "DRY_RUN"
+                    # derive a slug preview so the UI can show what would be created
+                    response.stage5_updates.v3_role_slug = (
+                        nano_role.lower().strip().replace(" ", "-")[:120]
+                    )
+        except Exception as exc:
+            logger.warning(
+                "[skills/extract-from-jd] v3 auto-trigger failed: %s", exc,
+            )
+
+    # Persist final api1_response (now with stage4/5 + v3 trigger fields)
+    # back to jd_pipeline_runs so the history list + detail page can read
+    # them. start_run captured an earlier snapshot; this overwrites with
+    # the post-Stage-5/v3 state.
+    if run_id is not None:
+        await asyncio.to_thread(
+            history_repo.update_api1_response, run_id, response,
+        )
+        # If Stage 4 queued (no confident classification), clear the
+        # chosen_role columns. The legacy API3 finalize path may have
+        # written a value via /skills/final-role-output; we run AFTER it
+        # so the clear wins. Prevents the contradictory UI where the
+        # narrative says "queued" but the history list says "Data Engineer".
+        if decision is not None and decision.queued:
+            def _clear_chosen():
+                from jd_similarity_matcher import _pg_connect
+                conn = _pg_connect()
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE jd_pipeline_runs "
+                                "SET chosen_role_id = NULL, "
+                                "    chosen_role_display = NULL "
+                                "WHERE id = %s",
+                                (run_id,),
+                            )
+                finally:
+                    conn.close()
+            try:
+                await asyncio.to_thread(_clear_chosen)
+            except Exception as exc:
+                logger.warning(
+                    "[stage4/clear-chosen] failed for run_id=%s: %s",
+                    run_id, exc,
+                )
+
     return response
 
 
@@ -2848,11 +3274,145 @@ async def list_jd_pipeline_runs(
             status_code=500,
             detail=f"Failed to list JD pipeline runs: {exc}",
         ) from exc
-    summaries = [JdRunSummary(**row) for row in rows]
+    summaries: list[JdRunSummary] = []
+    for row in rows:
+        # `#>>` returns text — coerce the bool slot back to a Python bool.
+        raw_trig = row.pop("v3_pipeline_triggered_raw", None)
+        row["v3_pipeline_triggered"] = (
+            str(raw_trig).lower() == "true" if raw_trig is not None else False
+        )
+        summaries.append(JdRunSummary(**row))
     return JdRunListResponse(
         runs=summaries,
         limit=max(1, min(int(limit), 200)),
         offset=max(0, int(offset)),
+    )
+
+
+_V3_STAGE_PREFIXES: list[tuple[int, str, str]] = [
+    (0, "charter",     "stage0_charter_"),
+    (1, "anchor",      "stage1_anchor_"),
+    (2, "dim_gen",     "stage2_dim_gen_"),
+    (3, "reconciler",  "stage3_recon_"),
+    (4, "typing",      "stage4_type_"),
+    (5, "placement",   "stage5_place_"),
+    (6, "containment", "stage6_contain_"),
+    (7, "enrichment",  "stage7_enrich_"),
+    (8, "catalog_load","stage8_load_"),
+]
+
+
+def _v3_stage_index(prompt_version: str) -> int | None:
+    """Map a v2_run_log.prompt_version like 'stage3_recon_v1.4' to 0..8."""
+    pv = (prompt_version or "").lower()
+    for idx, _name, prefix in _V3_STAGE_PREFIXES:
+        if pv.startswith(prefix):
+            return idx
+    return None
+
+
+@app.get("/v3/runs/{role_slug}/status", response_model=V3RunStatus)
+async def v3_run_status(role_slug: str):
+    """Return a 9-stage timeline for the v3 pipeline of a given role_slug.
+
+    Reads ``v2_run_log`` (which uses ``role_id`` as the role slug for v3
+    runs) and maps each row to a stage index by prompt_version prefix.
+    Stages that have not started yet appear with ``status='pending'``.
+    """
+    from jd_similarity_matcher import _pg_connect
+
+    def _load() -> tuple[list[dict[str, Any]], str | None]:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT prompt_version, status, started_at, completed_at,
+                           role_display
+                      FROM v2_run_log
+                     WHERE role_id = %s
+                     ORDER BY started_at ASC
+                    """,
+                    (role_slug,),
+                )
+                cols = [c[0] for c in cur.description]
+                return (
+                    [dict(zip(cols, r)) for r in cur.fetchall()],
+                    None,
+                )
+        finally:
+            conn.close()
+
+    try:
+        rows, _ = await asyncio.to_thread(_load)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"v3 status load failed: {exc}") from exc
+
+    if not rows:
+        # Role slug not found at all — surface that explicitly.
+        raise HTTPException(
+            status_code=404,
+            detail=f"No v3 run rows for role_slug={role_slug!r}",
+        )
+
+    # Index rows by stage. Multiple rows per stage are possible (re-runs);
+    # the most recent one wins.
+    by_idx: dict[int, dict[str, Any]] = {}
+    role_display: str | None = None
+    for r in rows:
+        idx = _v3_stage_index(r.get("prompt_version") or "")
+        if idx is None:
+            continue
+        role_display = role_display or r.get("role_display")
+        # ORDER BY started_at ASC means later entries overwrite earlier — that's
+        # the desired latest-run-wins behavior.
+        by_idx[idx] = r
+
+    stages: list[V3StageRow] = []
+    last_updated: datetime | None = None
+    for idx, name, _prefix in _V3_STAGE_PREFIXES:
+        r = by_idx.get(idx)
+        if r is None:
+            stages.append(V3StageRow(stage_index=idx, stage_name=name, status="pending"))
+            continue
+        started = r.get("started_at")
+        completed = r.get("completed_at")
+        duration_ms = (
+            int((completed - started).total_seconds() * 1000)
+            if started and completed else None
+        )
+        if started and (last_updated is None or started > last_updated):
+            last_updated = started
+        if completed and (last_updated is None or completed > last_updated):
+            last_updated = completed
+        stages.append(V3StageRow(
+            stage_index=idx,
+            stage_name=name,
+            prompt_version=r.get("prompt_version"),
+            status=str(r.get("status") or "pending"),
+            started_at=started,
+            completed_at=completed,
+            duration_ms=duration_ms,
+        ))
+
+    # Terminal status: stage 8 winning state, else 'running' if any stage
+    # is running, else 'pending'.
+    stage8 = stages[8]
+    if stage8.status in ("approved", "failed"):
+        terminal = stage8.status
+    elif any(s.status == "running" for s in stages):
+        terminal = "running"
+    elif any(s.status == "failed" for s in stages):
+        terminal = "failed"
+    else:
+        terminal = "pending"
+
+    return V3RunStatus(
+        role_slug=role_slug,
+        role_display=role_display,
+        stages=stages,
+        terminal_status=terminal,
+        last_updated=last_updated,
     )
 
 
