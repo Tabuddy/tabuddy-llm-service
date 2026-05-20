@@ -43,9 +43,8 @@ from new_skill_orchestrator import (
     NewSkillMetaV3,
     _derive_legacy_fields,
     _run_enrichment,
-    enrich_new_skill,
-    fetch_candidate_skills_pool_skill_library,
-    fetch_dimensions_catalog_skill_library,
+    enrich_one_existing_canonical_skill,
+    enrich_unmatched_skills_batched,
     find_dimensions_by_identity_skill_library,
 )
 from skill_library_v3.schemas.typology import SkillType, TypedSkill
@@ -874,61 +873,17 @@ async def _backfill_existing_skill_catalog_enrichment(
     sd: SkillDetail,
     cost_acc: CostAccumulator,
 ) -> bool:
-    """Stage 7 + v3 persist when the skill has no catalog context tags (``skill_tags``)."""
+    """Stage 7 + v3 persist when the skill has no catalog context tags
+    (``skill_tags``). Thin wrapper around
+    ``new_skill_orchestrator.enrich_one_existing_canonical_skill`` — the
+    actual enrichment + DB-write logic lives there so the nightly backfill
+    cron can call it directly without importing main.py."""
     if sd.canonical is None or sd.canonical.id is None:
         return False
-    sid = int(sd.canonical.id)
-    detail = await asyncio.to_thread(repo.get_skill_detail, sid)
-    if not detail:
-        return False
-    slug = str(detail.get("slug") or "").strip()
-    display_name = str(detail.get("display_name") or sd.input_skill).strip()
-    if not slug or not display_name:
-        return False
-    type_label = _typology_type_from_skill_nature(detail.get("skill_nature"))
-    skill_payload = {
-        "skill_id": slug,
-        "name": display_name,
-        "type": type_label,
-        "subtype": "general",
-        "primary_dimension": _primary_dimension_slug_for_library_skill(sd),
-    }
-    enrichment, warnings = await _run_enrichment(skill_payload, accumulator=cost_acc)
-    if enrichment is None:
-        return False
-    conf = detail.get("confidence")
-    try:
-        confidence = float(conf) if conf is not None else 0.85
-    except (TypeError, ValueError):
-        confidence = 0.85
-    confidence = max(0.0, min(1.0, confidence))
-    typed = TypedSkill(
-        skill_id=slug,
-        name=display_name,
-        type=type_label,
-        subtype="general",
-        confidence=confidence,
-        reasoning=(
-            "API 3 backfill: existing canonical skill had no catalog context tags "
-            "(skill_tags); ran Stage 7 enrichment to populate tags and related fields."
-        ),
-        alternatives_considered=[],
-    )
-    derived = _derive_legacy_fields(typed=typed, enrichment=enrichment)
-    meta = NewSkillMetaV3(
-        skill_id=typed.skill_id,
-        typed=typed,
-        enrichment=enrichment,
-        derived=derived,
-        warnings=list(warnings),
-    )
-    tl = str(derived.typical_lifespan or "EVERGREEN")
-    return _apply_new_skill_v3_enrichment_to_db(
+    return await enrich_one_existing_canonical_skill(
         repo,
-        skill_id=sid,
-        display_name=display_name,
-        meta=meta,
-        typical_lifespan=tl,
+        skill_id=int(sd.canonical.id),
+        cost_acc=cost_acc,
     )
 
 
@@ -1548,10 +1503,10 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             from jd_classifier import llm2_resolve_role, stage4_route_decision
 
             async def _llm2_with_cost(
-                rr_text: str, candidates: list,
+                *, r_and_r_text: str, candidates: list,
             ):
                 return await llm2_resolve_role(
-                    rr_text, candidates, cost_acc=cost_acc,
+                    r_and_r_text, candidates, cost_acc=cost_acc,
                 )
 
             decision = await stage4_route_decision(
@@ -2099,74 +2054,24 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         role_hint_text = req.jd_role_hint.display_name.strip()
 
     if unmatched_llm_skills:
+        # Cost-regression: one batched LLM call replaces the per-skill
+        # enrich_new_skill loop. Per-skill enrichment (Stage 2 dim-gen,
+        # Stage 3 reconciler, Stage 7 sub-agents) used to fire 6+ LLM calls
+        # per unmatched skill and pushed API 2 cost to $0.40+ for JDs with
+        # 20+ unmatched skills. Now we only get category/nature/lifespan
+        # in-request; richer enrichment (vendor/license, maturity, ambiguity,
+        # versioning, dim placement) is deferred to the v3 background
+        # pipeline that fires for Case NEW.
         try:
-            dimension_catalogue = await asyncio.to_thread(
-                fetch_dimensions_catalog_skill_library,
-                limit=400,
+            new_skill_meta_by_skill.update(
+                await enrich_unmatched_skills_batched(planner, unmatched_llm_skills)
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "skill-library dimensions lookup failed; v3 dim-gen will run without prior catalog: %s",
-                exc,
+                "[skills/extract-details] batched unmatched-skill enrichment "
+                "failed for %d skills: %s",
+                len(unmatched_llm_skills), exc,
             )
-            dimension_catalogue = []
-        # Cap and normalize skill-library dimension rows so the v3 prompt +
-        # overlap checker have the keys they expect
-        # (tentative_id, name, description).
-        if len(dimension_catalogue) > 40:
-            step = len(dimension_catalogue) // 40
-            dimension_catalogue = dimension_catalogue[::step][:40]
-        existing_dims_v3: list[dict] = []
-        for d in dimension_catalogue:
-            dim_id = str(d.get("tentative_id") or d.get("slug") or "").strip()
-            name = str(d.get("name") or d.get("display_name") or "").strip()
-            desc = str(d.get("description") or d.get("rationale") or "").strip()
-            if not dim_id or not name:
-                continue
-            existing_dims_v3.append({
-                "tentative_id": dim_id,
-                "name": name,
-                "description": desc,
-                "role_display": str(d.get("role_display") or "").strip(),
-            })
-
-        candidate_skills_pool: list[dict] = []
-        try:
-            candidate_skills_pool = await asyncio.to_thread(
-                fetch_candidate_skills_pool_skill_library,
-                limit=200,
-            )
-        except Exception as exc:
-            logger.warning(
-                "skill-library canonical skills pool lookup failed; pool will be empty: %s",
-                exc,
-            )
-            candidate_skills_pool = []
-
-        async def _enrich_one(skill_name: str) -> tuple[str, NewSkillMetaV3 | None]:
-            try:
-                meta = await enrich_new_skill(
-                    skill_name=skill_name,
-                    role_hint=role_hint_text,
-                    existing_dims=existing_dims_v3,
-                    candidate_skills_pool=candidate_skills_pool,
-                    accumulator=cost_acc,
-                )
-                return skill_name, meta
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "v3 new-skill orchestrator failed for %r: %s",
-                    skill_name, exc,
-                )
-                return skill_name, None
-
-        results = await asyncio.gather(
-            *[_enrich_one(s) for s in unmatched_llm_skills],
-            return_exceptions=False,
-        )
-        for skill_name, meta in results:
-            if meta is not None:
-                new_skill_meta_by_skill[skill_name] = meta
 
     # Backfill role labels on Stage 3 logs from DB dimension-role links.
     # Some logs can miss b_role/a_role depending on upstream payload shape.
@@ -2996,9 +2901,13 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         else:
             meta_merge_by_skill_lower.setdefault(key, {})
 
-    # 3.6) Existing library skills with zero context tags (skill_tags): run Stage 7 + save.
+    # 3.6) Existing library skills with zero context tags (skill_tags): run
+    # Stage 7 + save. Default OFF — this fires the 5-up enrichment per skill
+    # which used to be a quiet cost leak whenever API 3 saw matched-but-
+    # not-yet-enriched skills. Re-enable for catalog-backfill batches by
+    # setting API3_BACKFILL_LIBRARY_ENRICHMENT=1.
     if _API3_writes_enabled and os.getenv(
-        "API3_BACKFILL_LIBRARY_ENRICHMENT", "1"
+        "API3_BACKFILL_LIBRARY_ENRICHMENT", "0"
     ).strip().lower() in ("1", "true", "yes"):
         for sd in req.skills_detail:
             if sd.source_tag != "db" or sd.canonical is None or sd.canonical.id is None:
