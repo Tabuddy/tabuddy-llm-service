@@ -184,6 +184,7 @@ class SkillLibraryRepository:
         alias_texts: Iterable[str],
         *,
         threshold: float | None = None,
+        cost_acc=None,
     ) -> dict[str, dict]:
         """After exact match fails, embed each term and resolve via pgvector.
 
@@ -208,7 +209,7 @@ class SkillLibraryRepository:
         except ImportError:
             return {}
 
-        vectors = _azure_embed_sync(terms)
+        vectors = _azure_embed_sync(terms, cost_acc=cost_acc)
         if not vectors or len(vectors) != len(terms):
             return {}
 

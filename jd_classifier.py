@@ -835,6 +835,8 @@ _LLM2_SYSTEM_PROMPT = (
 async def llm2_resolve_role(
     r_and_r_text: str,
     candidates: list[RoleSignal],
+    *,
+    cost_acc=None,
 ) -> Llm2Result:
     """Default production LLM2: o4-mini reasoning tier, JSON-mode response.
 
@@ -876,6 +878,14 @@ async def llm2_resolve_role(
         )
         # o4-mini rejects temperature; default 1.0 is fine.
         resp = await client.chat.completions.create(**kwargs)
+        if cost_acc is not None:
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                cost_acc.add(
+                    REASONING_MODEL,
+                    int(getattr(usage, "prompt_tokens", 0) or 0),
+                    int(getattr(usage, "completion_tokens", 0) or 0),
+                )
         raw = resp.choices[0].message.content or "{}"
         data = json.loads(raw)
         return Llm2Result(

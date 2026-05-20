@@ -306,30 +306,50 @@ class JdPipelineRunRepository:
         self,
         run_id: str | UUID | None,
         api1_response: Any,
+        *,
+        llm_cost_usd: float | None = None,
     ) -> bool:
         """Overwrite stored api1_response — used after Stage 4/5 finish so the
         api1_response JSON in the DB matches what the endpoint actually
         returned (including stage4_decision, stage5_updates, v3 trigger).
+        When ``llm_cost_usd`` is set, refreshes ``llm_cost_api1_usd`` with the
+        full API-1 total (skill extract + embeddings + LLM2).
         """
         rid = _coerce_uuid(run_id)
         if not rid:
             return False
         try:
             payload = json.dumps(_json_safe(api1_response), ensure_ascii=False)
-            stmt = sql.SQL(
-                """
-                UPDATE {schema}.{runs}
-                   SET api1_response = %s::jsonb,
-                       updated_at = NOW()
-                 WHERE id = %s::uuid
-                """
-            ).format(
-                schema=sql.Identifier(self.schema),
-                runs=sql.Identifier(self.runs_table),
-            )
+            if llm_cost_usd is not None:
+                stmt = sql.SQL(
+                    """
+                    UPDATE {schema}.{runs}
+                       SET api1_response = %s::jsonb,
+                           llm_cost_api1_usd = %s,
+                           updated_at = NOW()
+                     WHERE id = %s::uuid
+                    """
+                ).format(
+                    schema=sql.Identifier(self.schema),
+                    runs=sql.Identifier(self.runs_table),
+                )
+                params = (payload, float(llm_cost_usd), rid)
+            else:
+                stmt = sql.SQL(
+                    """
+                    UPDATE {schema}.{runs}
+                       SET api1_response = %s::jsonb,
+                           updated_at = NOW()
+                     WHERE id = %s::uuid
+                    """
+                ).format(
+                    schema=sql.Identifier(self.schema),
+                    runs=sql.Identifier(self.runs_table),
+                )
+                params = (payload, rid)
             with self._connect() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(stmt, (payload, rid))
+                    cur.execute(stmt, params)
                     rowcount = cur.rowcount
                 conn.commit()
             return rowcount > 0
@@ -662,6 +682,9 @@ class JdPipelineRunRepository:
                    error_message,
                    LEFT(jd_text, 240)           AS jd_text_preview,
                    LENGTH(jd_text)              AS jd_text_length,
+                   llm_cost_api1_usd,
+                   llm_cost_api2_usd,
+                   llm_cost_api3_usd,
                    api1_response #>> '{{stage4_decision,case}}'              AS stage4_case,
                    api1_response #>> '{{stage5_updates,v3_pipeline_triggered}}' AS v3_pipeline_triggered_raw,
                    api1_response #>> '{{stage5_updates,v3_run_id}}'          AS v3_run_id,
@@ -703,6 +726,9 @@ class JdPipelineRunRepository:
                    jd_role_hint_display,
                    error_message,
                    duration_ms,
+                   llm_cost_api1_usd,
+                   llm_cost_api2_usd,
+                   llm_cost_api3_usd,
                    created_at,
                    updated_at
               FROM {schema}.{runs}
