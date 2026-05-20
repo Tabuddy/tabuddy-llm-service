@@ -28,7 +28,12 @@ def _fq_table(schema: str, table: str) -> str:
     return f"{_pg_quote_ident(schema)}.{_pg_quote_ident(table)}"
 
 
-def _azure_embed_sync(texts: list[str], *, chunk_size: int = 64) -> list[list[float]] | None:
+def _azure_embed_sync(
+    texts: list[str],
+    *,
+    chunk_size: int = 64,
+    cost_acc=None,
+) -> list[list[float]] | None:
     """Azure embeddings to match ``canonical_skills.name_embedding`` (db/schema.sql).
 
     Returns None when the client is unavailable or the API call fails — the vector match
@@ -48,6 +53,12 @@ def _azure_embed_sync(texts: list[str], *, chunk_size: int = 64) -> list[list[fl
         for i in range(0, len(texts), chunk_size):
             chunk = texts[i : i + chunk_size]
             resp = client.embeddings.create(model=EMBEDDING_MODEL, input=chunk)
+            if cost_acc is not None:
+                usage = getattr(resp, "usage", None)
+                tok = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
+                if tok <= 0:
+                    tok = sum(max(1, len(t) // 4) for t in chunk)
+                cost_acc.add_embedding(EMBEDDING_MODEL, tok)
             ordered = sorted(resp.data, key=lambda d: d.index)
             out.extend([list(d.embedding) for d in ordered])
         return out

@@ -89,14 +89,14 @@ class SimilarJdMatch:
 
 # ── Stage 2: Embed R&R text ───────────────────────────────────────────────────
 
-def embed_jd_text(text: str) -> list[float] | None:
+def embed_jd_text(text: str, *, cost_acc=None) -> list[float] | None:
     """Return a 1536-d Azure embedding for the given R&R (or full JD) text."""
     from skill_matcher import _azure_embed_sync
 
     trimmed = (text or "").strip()
     if not trimmed:
         return None
-    vecs = _azure_embed_sync([trimmed[:12_000]])
+    vecs = _azure_embed_sync([trimmed[:12_000]], cost_acc=cost_acc)
     if not vecs or not vecs[0]:
         return None
     return list(vecs[0])
@@ -330,6 +330,7 @@ async def run_stage2_and_stage3(
     *,
     role_aliases: list[str] | None = None,
     top_k: int = 10,
+    cost_acc=None,
 ) -> Stage3Result:
     """Run Stage 2 (R&R embedding) + Stage 3 (parallel DB lookups).
 
@@ -347,7 +348,7 @@ async def run_stage2_and_stage3(
         Stage3Result containing three role signal lists and the R&R embedding.
     """
     # ── Stage 2: embed R&R text ───────────────────────────────────────────────
-    vec = await asyncio.to_thread(embed_jd_text, r_and_r_text)
+    vec = await asyncio.to_thread(embed_jd_text, r_and_r_text, cost_acc=cost_acc)
 
     # ── Stage 3: parallel DB lookups ─────────────────────────────────────────
     async def _kra() -> list[RoleSignal]:

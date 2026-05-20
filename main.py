@@ -461,6 +461,10 @@ class FinalRoleOutputResponse(BaseModel):
     # ``auto_created`` — role was not in DB; inserted after Stage 4 confirmed it.
     # ``human_review_required`` — role absent; skipped insert (writes disabled).
     chosen_role_resolution: str | None = None
+    llm_cost_api1_usd: float | None = None
+    llm_cost_api2_usd: float | None = None
+    llm_cost_api3_usd: float | None = None
+    llm_cost_total_usd: float | None = None
 
 
 # ── JD Pipeline History models ───────────────────────────────────────────────
@@ -484,6 +488,10 @@ class JdRunSummary(BaseModel):
     v3_pipeline_triggered: bool = False
     v3_run_id: str | None = None
     v3_role_slug: str | None = None
+    llm_cost_api1_usd: float | None = None
+    llm_cost_api2_usd: float | None = None
+    llm_cost_api3_usd: float | None = None
+    llm_cost_total_usd: float | None = None
 
 
 class JdRunListResponse(BaseModel):
@@ -535,6 +543,10 @@ class JdRunDetail(BaseModel):
     duration_ms: int | None = None
     created_at: datetime
     updated_at: datetime
+    llm_cost_api1_usd: float | None = None
+    llm_cost_api2_usd: float | None = None
+    llm_cost_api3_usd: float | None = None
+    llm_cost_total_usd: float | None = None
     artifacts: list[JdRunArtifact] = Field(default_factory=list)
     #: Denormalized view for history UIs (JD → skills → dims → API3 links).
     history_view: dict[str, Any] | None = None
@@ -1412,8 +1424,6 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             detail=f"LLM skill extraction failed: {exc}",
         ) from exc
 
-    cost_acc.log_summary("skills/extract-from-jd", logger)
-
     # ── Stage 2 (R&R embedding) + Stage 3 (DB lookups) + Stage 3.5 (alias validator) ──
     stage3_signals: Stage3SignalsResponse | None = None
     s3 = None
@@ -1427,6 +1437,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             nano_role,
             role_aliases=nano_role_aliases,
             top_k=5,
+            cost_acc=cost_acc,
         )
         stage3_signals = Stage3SignalsResponse(
             skill_match_roles=[
@@ -1487,12 +1498,23 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             from jd_classifier import resolve_stage1_role
             from jd_similarity_matcher import _SKILL_SCHEMA, _pg_connect
 
+            def _embed_role_for_stage1(role_text: str) -> list[float] | None:
+                from skill_matcher import _azure_embed_sync
+
+                vecs = _azure_embed_sync([role_text], cost_acc=cost_acc)
+                if not vecs or not vecs[0]:
+                    return None
+                return list(vecs[0])
+
             def _resolve_stage1():
                 conn = _pg_connect()
                 try:
                     with conn:
                         return resolve_stage1_role(
-                            conn, nano_role, schema=_SKILL_SCHEMA,
+                            conn,
+                            nano_role,
+                            schema=_SKILL_SCHEMA,
+                            embed_fn=_embed_role_for_stage1,
                         )
                 finally:
                     conn.close()
@@ -1518,10 +1540,19 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     decision = None
     if s3 is not None:
         try:
-            from jd_classifier import stage4_route_decision
+            from jd_classifier import llm2_resolve_role, stage4_route_decision
+
+            async def _llm2_with_cost(
+                rr_text: str, candidates: list,
+            ):
+                return await llm2_resolve_role(
+                    rr_text, candidates, cost_acc=cost_acc,
+                )
+
             decision = await stage4_route_decision(
                 s3, r_and_r_text=r_and_r_text, role_name_input=nano_role,
                 stage1_resolved=stage1_resolved,
+                llm2_fn=_llm2_with_cost,
             )
             stage4_response = Stage4DecisionResponse(
                 case=decision.case,
@@ -1692,8 +1723,12 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     # them. start_run captured an earlier snapshot; this overwrites with
     # the post-Stage-5/v3 state.
     if run_id is not None:
+        cost_acc.log_summary("skills/extract-from-jd", logger)
         await asyncio.to_thread(
-            history_repo.update_api1_response, run_id, response,
+            history_repo.update_api1_response,
+            run_id,
+            response,
+            llm_cost_usd=cost_acc.total_cost_usd,
         )
         # If Stage 4 queued (no confident classification), clear the
         # chosen_role columns. The legacy API3 finalize path may have
@@ -1810,6 +1845,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             emb_lookup = await asyncio.to_thread(
                 repo.find_canonical_skills_by_alias_embedding,
                 unmatched_after_exact,
+                cost_acc=cost_acc,
             )
             for key, rec in emb_lookup.items():
                 alias_lookup[key] = rec
@@ -2587,6 +2623,30 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     return response
 
 
+def _pipeline_llm_cost_fields(
+    c1: float | None = None,
+    c2: float | None = None,
+    c3: float | None = None,
+) -> dict[str, float | None]:
+    """Per-API USD costs plus sum of any non-null API totals."""
+    vals = [float(x) for x in (c1, c2, c3) if x is not None]
+    total = round(sum(vals), 8) if vals else None
+    return {
+        "llm_cost_api1_usd": float(c1) if c1 is not None else None,
+        "llm_cost_api2_usd": float(c2) if c2 is not None else None,
+        "llm_cost_api3_usd": float(c3) if c3 is not None else None,
+        "llm_cost_total_usd": total,
+    }
+
+
+def _pipeline_llm_cost_fields_from_tuple(
+    costs: tuple[float | None, float | None, float | None] | None,
+) -> dict[str, float | None]:
+    if costs is None:
+        return _pipeline_llm_cost_fields()
+    return _pipeline_llm_cost_fields(costs[0], costs[1], costs[2])
+
+
 def _log_jd_pipeline_llm_cost_sum(
     logger: logging.Logger,
     costs: tuple[float | None, float | None, float | None],
@@ -2656,6 +2716,8 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
             )
             if costs is not None:
                 _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
+                cost_fields = _pipeline_llm_cost_fields_from_tuple(costs)
+                empty_response = empty_response.model_copy(update=cost_fields)
         return empty_response
 
     # 2) Resolve role in DB.
@@ -3235,6 +3297,9 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         )
         if costs is not None:
             _log_jd_pipeline_llm_cost_sum(logger, costs, req.run_id)
+            response = response.model_copy(
+                update=_pipeline_llm_cost_fields_from_tuple(costs)
+            )
 
     return response
 
@@ -3262,6 +3327,13 @@ async def list_jd_pipeline_runs(
         raw_trig = row.pop("v3_pipeline_triggered_raw", None)
         row["v3_pipeline_triggered"] = (
             str(raw_trig).lower() == "true" if raw_trig is not None else False
+        )
+        row.update(
+            _pipeline_llm_cost_fields(
+                row.get("llm_cost_api1_usd"),
+                row.get("llm_cost_api2_usd"),
+                row.get("llm_cost_api3_usd"),
+            )
         )
         summaries.append(JdRunSummary(**row))
     return JdRunListResponse(
@@ -3700,6 +3772,13 @@ async def get_jd_pipeline_run(run_id: str):
     )
     lib_repo = SkillLibraryRepository()
     await asyncio.to_thread(_merge_history_library_skill_details, history_view, lib_repo)
+    row.update(
+        _pipeline_llm_cost_fields(
+            row.get("llm_cost_api1_usd"),
+            row.get("llm_cost_api2_usd"),
+            row.get("llm_cost_api3_usd"),
+        )
+    )
     return JdRunDetail(**row, artifacts=artifacts, history_view=history_view)
 
 
