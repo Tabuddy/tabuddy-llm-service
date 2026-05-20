@@ -199,7 +199,9 @@ class FinalSkillItem(BaseModel):
 
 
 class RoleSignalItem(BaseModel):
-    role_id: int
+    # role_id is None for "Case NEW" synthesized roles whose catalog entry
+    # is still being upserted by v3 in the background.
+    role_id: int | None = None
     slug: str
     display_name: str
     score: float                   # 0.0–1.0 (× 100 = percentage)
@@ -223,6 +225,9 @@ class Stage4DecisionResponse(BaseModel):
     alias_collision_detected: bool = False
     queued: bool = False
     reasoning: str = ""
+    is_new_role: bool = False
+    new_role_display_name: str | None = None
+    new_role_slug: str | None = None
 
 
 class CandidateSkillAttached(BaseModel):
@@ -1539,6 +1544,9 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 alias_collision_detected=decision.alias_collision_detected,
                 queued=decision.queued,
                 reasoning=decision.reasoning,
+                is_new_role=decision.is_new_role,
+                new_role_display_name=decision.new_role_display_name,
+                new_role_slug=decision.new_role_slug,
             )
             logger.info(
                 "[stage4] case=%s chosen=%s confidence=%.2f queued=%s llm2=%s",
@@ -1567,6 +1575,77 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         llm_cost_usd=cost_acc.total_cost_usd,
     )
     response.run_id = run_id
+
+    # ── v3 auto-fire (Case NEW, must run BEFORE Stage 5) ─────────────────────
+    # Stage 4 routed to Case NEW: chosen_role is synthesized (role_id=None).
+    # When JD_V3_AUTO_TRIGGER=true, upsert the role now so Stage 5 has a real
+    # role_id to attach unknown skills/KRA to. v3 Stage 0 cascade fires in
+    # the background. The pipeline ALWAYS returns a chosen_role to the
+    # caller — v3 is for catalog enrichment, not for the current JD's
+    # classification answer.
+    if (
+        decision is not None
+        and decision.is_new_role
+        and decision.chosen_role is not None
+        and decision.new_role_display_name
+    ):
+        auto_trigger = os.getenv("JD_V3_AUTO_TRIGGER", "false").lower() == "true"
+        if auto_trigger:
+            try:
+                from skill_library_v3 import runner as v3_runner
+
+                created = await asyncio.to_thread(
+                    v3_runner.create_initial_run,
+                    decision.new_role_display_name,
+                )
+                run_uuid = created["run_id"]
+                role_slug = created["role_slug"]
+                # Resolve real role_id (upsert_role just persisted the row).
+                from jd_similarity_matcher import _pg_connect
+                def _resolve_role_id():
+                    conn = _pg_connect()
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT id FROM roles WHERE slug = %s LIMIT 1",
+                                (role_slug,),
+                            )
+                            r = cur.fetchone()
+                            return int(r[0]) if r else None
+                    finally:
+                        conn.close()
+                real_role_id = await asyncio.to_thread(_resolve_role_id)
+                # Back-fill chosen_role so Stage 5 + history see the real ID.
+                decision.chosen_role.role_id = real_role_id
+                decision.chosen_role.slug = role_slug
+                decision.new_role_slug = role_slug
+                if stage4_response is not None and stage4_response.chosen_role:
+                    stage4_response.chosen_role.role_id = real_role_id
+                    stage4_response.chosen_role.slug = role_slug
+                    stage4_response.new_role_slug = role_slug
+                asyncio.create_task(v3_runner.run_stage_0(run_uuid))
+                if response.stage5_updates is None:
+                    response.stage5_updates = Stage5UpdatesResponse()
+                response.stage5_updates.v3_pipeline_triggered = True
+                response.stage5_updates.v3_run_id = str(run_uuid)
+                response.stage5_updates.v3_role_slug = role_slug
+                logger.info(
+                    "[v3/auto-fire] role=%r run_id=%s slug=%s role_id=%s "
+                    "(Stage 0 dispatched)",
+                    decision.new_role_display_name, run_uuid, role_slug,
+                    real_role_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[v3/auto-fire] failed for role=%r: %s",
+                    decision.new_role_display_name, exc,
+                )
+        else:
+            logger.info(
+                "[v3/auto-fire] would fire for role=%r slug=%s "
+                "(JD_V3_AUTO_TRIGGER=false, skipping)",
+                decision.new_role_display_name, decision.new_role_slug,
+            )
 
     # ── Stage 5 (Post-Classification Updates) — compulsory ───────────────────
     new_skills_attached: list[CandidateSkillAttached] = []
@@ -1600,7 +1679,14 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                         )
                         skill_attachments: list[CandidateSkillAttached] = []
                         kra_attachment: CandidateKraAttached | None = None
-                        if decision.chosen_role is not None and not decision.queued:
+                        # For Case NEW with v3 auto-trigger off, chosen_role
+                        # is synthesized but role_id is None — skip skill/KRA
+                        # FK-dependent writes since there's no roles row yet.
+                        has_real_role_id = (
+                            decision.chosen_role is not None
+                            and decision.chosen_role.role_id is not None
+                        )
+                        if has_real_role_id and not decision.queued:
                             with conn.cursor() as cur:
                                 cur.execute(
                                     "UPDATE jd_pipeline_runs "
@@ -1669,6 +1755,10 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     conn.close()
 
             updates, new_skills_attached, new_kra_attached = await asyncio.to_thread(_run_stage5)
+            # Preserve v3 auto-fire fields populated earlier (BEFORE Stage 5)
+            # — building a fresh Stage5UpdatesResponse here would clobber
+            # v3_pipeline_triggered / v3_run_id / v3_role_slug to defaults.
+            existing_v3 = response.stage5_updates
             response.stage5_updates = Stage5UpdatesResponse(
                 centroid_updated=updates.centroid_updated,
                 centroid_n_after=updates.centroid_n_after,
@@ -1676,6 +1766,11 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 collision_log_id=updates.collision_log_id,
                 new_skills_attached=new_skills_attached,
                 new_kra_attached=new_kra_attached,
+                v3_pipeline_triggered=(
+                    existing_v3.v3_pipeline_triggered if existing_v3 else False
+                ),
+                v3_run_id=existing_v3.v3_run_id if existing_v3 else None,
+                v3_role_slug=existing_v3.v3_role_slug if existing_v3 else None,
             )
             logger.info(
                 "[stage5] centroid=%s n=%s queue=%s collision=%s new_skills=%d new_kra=%s",

@@ -59,7 +59,23 @@ STAGE1_EMBEDDING_THRESHOLD: float = 0.70
 
 # ── Data models ──────────────────────────────────────────────────────────────
 
-CaseLiteral = Literal["A", "B", "C", "D", "E", "F"]
+CaseLiteral = Literal["A", "B", "C", "D", "E", "F", "NEW"]
+
+
+def _slugify_for_new_role(text: str) -> str:
+    # Mirrors skill_library_v3.db.repository.slugify so the UI preview slug
+    # matches what v3's upsert_role will actually persist.
+    out: list[str] = []
+    last_dash = False
+    for ch in (text or "").strip().lower():
+        if ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif ch in (" ", "-", "_", "\\", ".", ",", "/", "+"):
+            if not last_dash and out:
+                out.append("-")
+                last_dash = True
+    return "".join(out).strip("-") or "unknown"
 
 
 @dataclass
@@ -72,6 +88,9 @@ class Stage4Decision:
     alias_collision_detected: bool
     queued: bool
     reasoning: str
+    is_new_role: bool = False
+    new_role_display_name: str | None = None
+    new_role_slug: str | None = None
 
 
 @dataclass
@@ -444,6 +463,42 @@ async def stage4_route_decision(
 
     # ── Hard gates first (Case E) ─────────────────────────────────────────────
     if not kra:
+        # Same Case NEW gate as the low_kra/small_margin branches: when KRA
+        # produced no signal at all AND title is unresolved AND no exact
+        # alias claims the role exists, finalize as a new role so v3 can
+        # materialize it. Common when the R&R embedding fails or the JD's
+        # responsibilities are truly novel.
+        no_exact_alias = (
+            top_alias is None
+            or top_alias.score < ALIAS_EXACT_MIN_SCORE
+        )
+        if stage1_resolved is None and no_exact_alias and role_name_input:
+            new_slug = _slugify_for_new_role(role_name_input)
+            synth_role = RoleSignal(
+                role_id=None,
+                slug=new_slug,
+                display_name=role_name_input,
+                score=0.0,
+                signal_type="new_role_synth",
+            )
+            return Stage4Decision(
+                case="NEW",
+                chosen_role=synth_role,
+                confidence=0.0,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"Stage 1 title '{role_name_input}' not in catalog "
+                    f"and KRA produced no signal. Finalizing as new role "
+                    f"'{role_name_input}'; v3 enriches the catalog in "
+                    f"the background for future runs."
+                ),
+                is_new_role=True,
+                new_role_display_name=role_name_input,
+                new_role_slug=new_slug,
+            )
         return _queue("E", reason="no_kra_signal",
                       detail="no KRA results")
     top_kra = kra[0]
@@ -472,6 +527,48 @@ async def stage4_route_decision(
                     f"({top_kra.score:.2f}). Skill profile points at "
                     f"{top_skill.slug} ({top_skill.score:.2f}) - generalize."
                 ),
+            )
+        # Case NEW: catalog has no signal for this JD. Title doesn't
+        # resolve (stage1_resolved=None), KRA inconclusive, skill profile
+        # too weak to generalize, and no exact alias hit means the role
+        # is genuinely new. Synthesize an identity so Stage 5 can fire v3
+        # in the background — pipeline must not stop at admin queue.
+        # An exact alias (>= ALIAS_EXACT_MIN_SCORE) means the role IS in
+        # catalog per the Stage 3b DB lookup; keep the queue path in that
+        # case so admin can resolve the alias-vs-skill conflict.
+        no_exact_alias = (
+            top_alias is None
+            or top_alias.score < ALIAS_EXACT_MIN_SCORE
+        )
+        if stage1_resolved is None and no_exact_alias and role_name_input:
+            new_slug = _slugify_for_new_role(role_name_input)
+            synth_role = RoleSignal(
+                role_id=None,  # v3 will populate when upsert_role runs
+                slug=new_slug,
+                display_name=role_name_input,
+                score=0.0,
+                signal_type="new_role_synth",
+            )
+            return Stage4Decision(
+                case="NEW",
+                chosen_role=synth_role,
+                confidence=0.0,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"Stage 1 title '{role_name_input}' not in catalog; "
+                    f"KRA inconclusive ({top_kra.score:.2f}) and skill "
+                    f"profile too weak to generalize "
+                    f"(top_skill={top_skill.score if top_skill else 0:.2f} "
+                    f"< 0.20). Finalizing as new role '{role_name_input}'; "
+                    f"v3 enriches the catalog in the background for "
+                    f"future runs."
+                ),
+                is_new_role=True,
+                new_role_display_name=role_name_input,
+                new_role_slug=new_slug,
             )
         return _queue("E", reason="low_kra",
                       detail=f"top KRA {top_kra.score:.2f} < {KRA_MIN_SCORE}")
@@ -557,6 +654,41 @@ async def stage4_route_decision(
                     f"KRA margin too small. Skill profile points at "
                     f"{top_skill.slug} ({top_skill.score:.2f}) - generalize."
                 ),
+            )
+        # Case NEW (small_margin variant): same rationale as the low_kra
+        # branch above. When stage1 unresolved + no exact alias + skill
+        # too weak to generalize, fire v3 instead of queueing.
+        no_exact_alias = (
+            top_alias is None
+            or top_alias.score < ALIAS_EXACT_MIN_SCORE
+        )
+        if stage1_resolved is None and no_exact_alias and role_name_input:
+            new_slug = _slugify_for_new_role(role_name_input)
+            synth_role = RoleSignal(
+                role_id=None,
+                slug=new_slug,
+                display_name=role_name_input,
+                score=0.0,
+                signal_type="new_role_synth",
+            )
+            return Stage4Decision(
+                case="NEW",
+                chosen_role=synth_role,
+                confidence=0.0,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"Stage 1 title '{role_name_input}' not in catalog; "
+                    f"KRA margin too small ({margin:.2f}) and skill profile "
+                    f"too weak to generalize. Finalizing as new role "
+                    f"'{role_name_input}'; v3 enriches the catalog in "
+                    f"the background for future runs."
+                ),
+                is_new_role=True,
+                new_role_display_name=role_name_input,
+                new_role_slug=new_slug,
             )
         return _queue("E", reason="small_margin",
                       detail=f"KRA margin {margin:.2f} < {required_margin}")

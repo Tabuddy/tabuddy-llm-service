@@ -59,11 +59,13 @@ def _pg_connect() -> psycopg2.extensions.connection:
 
 @dataclass
 class RoleSignal:
-    role_id: int
+    # role_id is None for synthesized "Case NEW" roles that haven't been
+    # written to the catalog yet (v3 upserts the row in the background).
+    role_id: int | None
     slug: str
     display_name: str
     score: float          # 0.0–1.0 (× 100 = percentage)
-    signal_type: str      # "skill_match" | "alias_match" | "kra_match"
+    signal_type: str      # "skill_match" | "alias_match" | "kra_match" | "new_role_synth"
     matched_count: int | None = None   # skill_match: how many JD skills hit this role
     total_count: int | None = None     # skill_match: total input skills
 
