@@ -7,10 +7,18 @@ Stage 5 applies the consequences: rolling-mean centroid update + audit rows.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal
 
+from excel_role_resolver import (
+    resolve_via_excel as _resolve_via_excel,
+    upsert_excel_role as _upsert_excel_role,
+)
 from jd_similarity_matcher import RoleSignal, Stage3Result
+from skill_library_v3.db.repository import slugify as _slugify_canonical
+
+_logger = logging.getLogger(__name__)
 
 
 # ── Tunable constants ────────────────────────────────────────────────────────
@@ -61,7 +69,7 @@ STAGE1_EMBEDDING_THRESHOLD: float = 0.70
 
 # ── Data models ──────────────────────────────────────────────────────────────
 
-CaseLiteral = Literal["A", "B", "C", "D", "E", "F", "NEW"]
+CaseLiteral = Literal["A", "B", "C", "D", "E", "F", "NEW", "EXCEL_NEW"]
 
 
 def _slugify_for_new_role(text: str) -> str:
@@ -78,6 +86,77 @@ def _slugify_for_new_role(text: str) -> str:
                 out.append("-")
                 last_dash = True
     return "".join(out).strip("-") or "unknown"
+
+
+async def _attempt_excel_classification(
+    *,
+    jd_title: str,
+    r_and_r_text: str,
+    r_and_r_embedding: list[float] | None,
+    role_name_input: str,
+    cost_acc=None,
+) -> "Stage4Decision | None":
+    """Try to classify the JD into a generalized Excel-taxonomy role before
+    synthesizing a brand-new one. Returns a Stage4Decision with
+    case='EXCEL_NEW' when the resolver finds a high-confidence match AND the
+    shell-row upsert succeeds. Returns None otherwise so the caller falls
+    through to the existing Case NEW synth path.
+
+    The returned decision still sets `is_new_role=True` and
+    `new_role_display_name` to the *Excel canonical* role name (NOT the
+    verbatim JD title), so main.py's downstream v3 dispatch enriches the
+    correct catalog row in the background.
+    """
+    if not r_and_r_embedding:
+        return None
+    try:
+        result = await _resolve_via_excel(
+            jd_title=jd_title,
+            r_and_r_text=r_and_r_text,
+            r_and_r_embedding=r_and_r_embedding,
+            cost_acc=cost_acc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("[stage4/excel] resolver raised: %s", exc)
+        return None
+
+    if result.matched_entry is None:
+        return None
+
+    entry = result.matched_entry
+    role_id = _upsert_excel_role(entry)
+    if role_id is None:
+        _logger.warning(
+            "[stage4/excel] upsert returned None for role=%r — falling through to synth",
+            entry.role,
+        )
+        return None
+
+    slug = _slugify_canonical(entry.role)
+    chosen = RoleSignal(
+        role_id=role_id,
+        slug=slug,
+        display_name=entry.role,
+        score=result.confidence,
+        signal_type="excel_match",
+    )
+    return Stage4Decision(
+        case="EXCEL_NEW",
+        chosen_role=chosen,
+        confidence=result.confidence,
+        llm2_fired=False,
+        llm2_reasoning=None,
+        alias_collision_detected=False,
+        queued=False,
+        reasoning=(
+            f"JD title '{role_name_input}' not in catalog; Excel taxonomy "
+            f"matched '{entry.role}' (confidence {result.confidence:.2f}): "
+            f"{result.reasoning}"
+        ),
+        is_new_role=True,
+        new_role_display_name=entry.role,
+        new_role_slug=slug,
+    )
 
 
 @dataclass
@@ -517,6 +596,15 @@ async def stage4_route_decision(
             or top_alias.score < ALIAS_EXACT_MIN_SCORE
         )
         if stage1_resolved is None and no_exact_alias and role_name_input:
+            excel_decision = await _attempt_excel_classification(
+                jd_title=role_name_input,
+                r_and_r_text=r_and_r_text,
+                r_and_r_embedding=getattr(s3, "r_and_r_embedding", None),
+                role_name_input=role_name_input,
+                cost_acc=None,
+            )
+            if excel_decision is not None:
+                return excel_decision
             new_slug = _slugify_for_new_role(role_name_input)
             synth_role = RoleSignal(
                 role_id=None,
@@ -585,6 +673,15 @@ async def stage4_route_decision(
             or top_alias.score < ALIAS_EXACT_MIN_SCORE
         )
         if stage1_resolved is None and no_exact_alias and role_name_input:
+            excel_decision = await _attempt_excel_classification(
+                jd_title=role_name_input,
+                r_and_r_text=r_and_r_text,
+                r_and_r_embedding=getattr(s3, "r_and_r_embedding", None),
+                role_name_input=role_name_input,
+                cost_acc=None,
+            )
+            if excel_decision is not None:
+                return excel_decision
             new_slug = _slugify_for_new_role(role_name_input)
             synth_role = RoleSignal(
                 role_id=None,  # v3 will populate when upsert_role runs
@@ -707,6 +804,15 @@ async def stage4_route_decision(
             or top_alias.score < ALIAS_EXACT_MIN_SCORE
         )
         if stage1_resolved is None and no_exact_alias and role_name_input:
+            excel_decision = await _attempt_excel_classification(
+                jd_title=role_name_input,
+                r_and_r_text=r_and_r_text,
+                r_and_r_embedding=getattr(s3, "r_and_r_embedding", None),
+                role_name_input=role_name_input,
+                cost_acc=None,
+            )
+            if excel_decision is not None:
+                return excel_decision
             new_slug = _slugify_for_new_role(role_name_input)
             synth_role = RoleSignal(
                 role_id=None,

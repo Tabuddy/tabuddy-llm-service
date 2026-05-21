@@ -42,3 +42,6 @@ low_confidence_log.jsonl
 uv.lock.bak
 
 backups
+
+# Excel taxonomy embedding cache — built by scripts/build_excel_taxonomy.py
+excel_taxonomy.cache.json

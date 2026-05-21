@@ -55,9 +55,11 @@ from skill_library_v3.catalog_transform import (
 from cost_tracker import CostAccumulator
 from pathlib import Path
 import json
+import re
 import tempfile
 import time
 from datetime import datetime
+from functools import lru_cache
 import logging
 import asyncio
 from typing import Any, cast
@@ -282,6 +284,123 @@ class JDSkillPipelineResponse(BaseModel):
 # Archetypes that count as "tech" for our software-engineering-focused
 # catalog. Override via TECH_ARCHETYPES env var (comma-separated).
 _DEFAULT_TECH_ARCHETYPES = "Engineering,Data,DevOps,Security,QA,Research"
+
+
+@lru_cache(maxsize=1)
+def _canonical_skill_display_names() -> tuple[str, ...]:
+    """Load canonical skill display_names from the skill-library catalog
+    once per process. Used by the archetype-rescue scan to cheaply count
+    distinct skill mentions in a JD body without firing any LLM calls.
+
+    Returns a frozen tuple so the lru_cache is safe across threads.
+    Refreshed only on process restart — catalog churns slowly.
+    """
+    try:
+        from skill_library_repository import SkillLibraryRepository
+        repo = SkillLibraryRepository()
+        # repo exposes a list_canonical_display_names() or similar — fall back to direct SQL.
+        from jd_similarity_matcher import _pg_connect, _qs
+        sql = f"SELECT display_name FROM {_qs()}.canonical_skills WHERE display_name IS NOT NULL"
+        conn = _pg_connect()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    names = [str(r[0]).strip() for r in cur.fetchall() if r[0]]
+        finally:
+            conn.close()
+        return tuple(n for n in names if len(n) >= 3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[archetype-rescue] failed to load canonical skill names: %s; "
+            "rescue will no-op", exc,
+        )
+        return ()
+
+
+_DEFAULT_TECH_RESCUE_MIN_SKILLS = 3
+
+
+def _rescue_archetype(
+    *,
+    jd_text: str,
+    nano_parsed: dict,
+    canonical_names: list[str] | tuple[str, ...] | None = None,
+    min_skills: int | None = None,
+    enabled: bool | None = None,
+) -> int:
+    """When the nano parser stamps role_archetype='Other' on a JD whose body
+    clearly contains tech-skill mentions ("Internship (Snowflake-focused)" →
+    Snowflake/SQL/ETL/Python all present), promote the archetype to
+    'Engineering' so the archetype gate doesn't kill the pipeline. Stage 4
+    skill_top fallback then generalizes the role properly downstream.
+
+    No LLM calls. Word-boundary substring scan against cached canonical
+    skill display_names, distinct-count semantics, length-3+ skills only
+    to avoid noise from tiny tokens.
+
+    Mutates `nano_parsed` in place when the rescue fires:
+      * role_archetype → "Engineering"
+      * archetype_override_applied → True
+      * archetype_override_matched_skills → list of matched display names
+
+    Returns: number of distinct matches found (0 when skipped / disabled).
+    """
+    # Env defaults — caller can override for testing.
+    if enabled is None:
+        enabled = os.getenv("TECH_RESCUE_ENABLED", "true").strip().lower() == "true"
+    if not enabled:
+        return 0
+    if min_skills is None:
+        try:
+            min_skills = int(os.getenv(
+                "TECH_RESCUE_MIN_SKILLS",
+                str(_DEFAULT_TECH_RESCUE_MIN_SKILLS),
+            ))
+        except ValueError:
+            min_skills = _DEFAULT_TECH_RESCUE_MIN_SKILLS
+
+    arch = (nano_parsed.get("role_archetype") or "").strip()
+    allowed_raw = os.getenv("TECH_ARCHETYPES", _DEFAULT_TECH_ARCHETYPES)
+    allowed = {a.strip() for a in allowed_raw.split(",") if a.strip()}
+    # Already a tech archetype → gate would pass anyway, no need to scan.
+    if arch in allowed:
+        return 0
+
+    names = canonical_names if canonical_names is not None else _canonical_skill_display_names()
+    if not names:
+        return 0
+
+    # Length-3+ floor: avoid "C", "AI", "QA" matching inside larger words.
+    text = (jd_text or "")[:12_000].lower()
+    matched: list[str] = []
+    matched_set: set[str] = set()
+    for display in names:
+        if len(display) < 3:
+            continue
+        needle = display.lower()
+        if needle in matched_set:
+            continue
+        # Word-boundary check via regex \b ... \b. Escape any regex chars in
+        # the skill name (e.g., ".", "+", "#").
+        pattern = r"\b" + re.escape(needle) + r"\b"
+        if re.search(pattern, text):
+            matched.append(display)
+            matched_set.add(needle)
+
+    if len(matched) < min_skills:
+        return len(matched)
+
+    # Rescue fires — mutate nano_parsed.
+    nano_parsed["role_archetype"] = "Engineering"
+    nano_parsed["archetype_override_applied"] = True
+    nano_parsed["archetype_override_matched_skills"] = matched
+    logger.info(
+        "[archetype-rescue] fired — original_archetype='Other' → 'Engineering' "
+        "(matched %d distinct skills: %s)",
+        len(matched), matched[:10],
+    )
+    return len(matched)
 
 
 def _is_tech_jd(nano_parsed: dict | None) -> tuple[bool, str]:
@@ -1293,6 +1412,17 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             detail=f"Nano JD parsing failed: {exc}",
         ) from exc
 
+    # ── Archetype rescue — designation-prefixed JDs ───────────────────────────
+    # When the nano parser stamps role_archetype='Other' on a JD whose body
+    # contains clear tech-skill mentions (e.g., "Internship (Snowflake-focused)"
+    # has Snowflake/SQL/ETL/Python all present), promote the archetype to
+    # 'Engineering' so the gate below lets it through. Stage 4 skill_top
+    # fallback then generalizes the role properly downstream. No LLM cost.
+    try:
+        _rescue_archetype(jd_text=jd_text, nano_parsed=nano_parsed)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[archetype-rescue] crashed; continuing without: %s", exc)
+
     # ── Tech-archetype gate — early-exit non-tech JDs ─────────────────────────
     # The skill catalog is software-engineering-focused. Reject JDs whose
     # archetype doesn't fit (Lab Technician, Product Manager, Project Admin,
@@ -1624,7 +1754,34 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         and decision.chosen_role is not None
         and decision.new_role_display_name
     ):
-        auto_trigger = os.getenv("JD_V3_AUTO_TRIGGER", "false").lower() == "true"
+        # Excel-matched roles ALWAYS trigger v3 enrichment when not yet
+        # enriched (catalog convergence policy). Regular Case NEW still
+        # gates on JD_V3_AUTO_TRIGGER to avoid firing on truly novel roles
+        # when the env flag is off.
+        env_auto_trigger = os.getenv("JD_V3_AUTO_TRIGGER", "false").lower() == "true"
+        is_excel_match = getattr(decision, "case", None) == "EXCEL_NEW"
+        skip_v3_already_enriched = False
+        if is_excel_match and decision.chosen_role.role_id is not None:
+            try:
+                from excel_role_resolver import role_has_kras
+                skip_v3_already_enriched = await asyncio.to_thread(
+                    role_has_kras, decision.chosen_role.role_id,
+                )
+                if skip_v3_already_enriched:
+                    logger.info(
+                        "[v3/auto-fire] Excel match %s (role_id=%s) already "
+                        "has role_kras — skipping v3 dispatch",
+                        decision.chosen_role.slug, decision.chosen_role.role_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[v3/auto-fire] role_has_kras check failed (%s) — "
+                    "firing v3 anyway", exc,
+                )
+        auto_trigger = (
+            (env_auto_trigger or is_excel_match)
+            and not skip_v3_already_enriched
+        )
         if auto_trigger:
             try:
                 from skill_library_v3 import runner as v3_runner
@@ -1858,7 +2015,92 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     run_id, exc,
                 )
 
+    # ── Auto-chain Step 2 (extract-details) + Step 3 (final-role-output) ────
+    # When a JD reaches a finalized chosen_role at Stage 4, eagerly run the
+    # remaining pipeline stages in the background so the run row reaches
+    # status='completed' instead of getting stranded at 'extract_from_jd_done'.
+    # Without this, direct API callers (smoke tests, monitoring, batch tools)
+    # leave runs stuck and the admin history view shows them as incomplete
+    # even though Stage 4 already chose a role.
+    #
+    # Background task: HTTP response returns immediately, the chain runs
+    # asynchronously. On failure, the run is marked status='failed' with the
+    # error in error_message so admins can see what went wrong.
+    #
+    # Opt out: set JD_PIPELINE_AUTOCHAIN=false in env (cost-conscious callers
+    # that only need Stage 4 routing). See [[jd-pipeline-cost-invariants]].
+    if (
+        os.getenv("JD_PIPELINE_AUTOCHAIN", "true").lower() == "true"
+        and response.run_id
+        and response.stage4_decision is not None
+        and response.stage4_decision.chosen_role is not None
+        and not response.rejected
+    ):
+        asyncio.create_task(_autochain_steps_2_3(response))
+
     return response
+
+
+async def _autochain_steps_2_3(api1: JDSkillPipelineResponse) -> None:
+    """Background task that chains /skills/extract-details and
+    /skills/final-role-output so a run created at /skills/extract-from-jd
+    always reaches status='completed'.
+
+    Self-calls the backend over HTTP rather than re-invoking the FastAPI
+    endpoint handlers in-process — keeps Step 2/3 request lifecycles
+    isolated (own DB connections, own cost accumulators) and matches the
+    UI's existing call pattern exactly. Errors are logged and persisted
+    to the run row's error_message column.
+    """
+    run_id = api1.run_id
+    if not run_id:
+        return
+
+    import httpx
+
+    base = os.getenv("AUTOCHAIN_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+
+    try:
+        final_skill_names = [s.skill_name for s in api1.final_skills if s.skill_name]
+        primary_skill_names = [
+            s.skill_name for s in api1.final_skills
+            if s.skill_name and getattr(s, "is_primary", False)
+        ]
+        body2: dict = {
+            "final_skills": final_skill_names,
+            "llm_skills": final_skill_names,
+            "primary_skills": primary_skill_names,
+            "jd_role_hint": api1.jd_role.model_dump() if api1.jd_role else None,
+            "run_id": run_id,
+        }
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Step 2 — extract-details (alias + dimension catalogue + new-skill enrichment)
+            r2 = await client.post(f"{base}/skills/extract-details", json=body2)
+            r2.raise_for_status()
+            api2 = r2.json()
+
+            # Step 3 — final-role-output (persist role/dimensions + emit final output)
+            r3 = await client.post(f"{base}/skills/final-role-output", json=api2)
+            r3.raise_for_status()
+
+        logger.info("[autochain] run_id=%s reached status='completed'", run_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[autochain] run_id=%s failed: %s", run_id, exc)
+        try:
+            from jd_pipeline_run_repository import JdPipelineRunRepository
+            history_repo = JdPipelineRunRepository()
+            await asyncio.to_thread(
+                history_repo.mark_failed,
+                run_id,
+                f"autochain (step2/step3) failed: {exc}"[:500],
+            )
+        except Exception as inner:  # noqa: BLE001
+            logger.warning(
+                "[autochain] could not persist error for run_id=%s: %s",
+                run_id, inner,
+            )
 
 
 def _canonical_summary_from_row(row: dict) -> CanonicalSkillSummary:

@@ -5,8 +5,8 @@ Stage 2:   embed R&R verbatim text → 1536-dim vector (whole text for centroid)
 Stage 3a:  skill match      – canonical_skills / skill_aliases → dimension → role scores
 Stage 3b:  role alias match – role_aliases / roles.display_name → direct role hit
 Stage 3c:  KRA vector match – per-sentence cosine similarity vs role_kras embeddings → role scores
-           Score = MAX over all (sentence × KRA) pairs per role. Each sentence is
-           evaluated independently so mixed-content JDs don't dilute specific signals.
+           Per-role score = mean of the top-3 per-sentence best-KRA similarities.
+           Top-3 (sentence, KRA, similarity) triples are returned in RoleSignal.kra_matches.
 
 Stage 3 is read-only. If the role/alias is not found, it is logged as a new/unknown alias
 and role creation is deferred to after Stage 4 decides the canonical role.
@@ -120,13 +120,114 @@ def embed_jd_text(text: str, *, cost_acc=None) -> list[float] | None:
     return list(vecs[0])
 
 
+# Quality-filter constants for split_rr_sentences. See _is_quality_sentence.
+_MIN_SENTENCE_CHARS = 40
+
+# Lines starting with these phrases are skill-listing preludes — they enumerate
+# tools/tech the candidate must know, not behavioral responsibilities. Embedding
+# them produces a bag-of-tech-tokens vector that pattern-matches any KRA
+# mentioning the same technologies (real prod failure: "Hands-on with EC2, S3,
+# RDS, VPC, IAM, CloudFormation" matched the cloud-architect IAM-policies KRA).
+_SKILL_LIST_PREFIXES = (
+    "hands-on with ",
+    "hands on with ",
+    "experience with ",
+    "experience in ",
+    "familiarity with ",
+    "familiar with ",
+    "knowledge of ",
+    "working knowledge of ",
+    "proven knowledge of ",
+    "strong knowledge of ",
+    "proficient in ",
+    "proficiency in ",
+    "expert in ",
+    "expertise in ",
+    "skilled in ",
+    "comfortable with ",
+    "strong understanding of ",
+    "deep understanding of ",
+    "good understanding of ",
+    "solid understanding of ",
+    "exposure to ",
+    "hands-on experience with ",
+)
+
+# Section header keywords — usually appear alone on a line; never behavioral.
+_SECTION_HEADERS = (
+    "required skills",
+    "key responsibilities",
+    "responsibilities",
+    "qualifications",
+    "required qualifications",
+    "preferred qualifications",
+    "nice to have",
+    "about the role",
+    "about you",
+)
+
+_TOKEN_SPLIT_RE = re.compile(r"[,/|;]+\s*|\s+and\s+|\s+&\s+")
+
+
+def _is_skill_bag(line: str) -> bool:
+    """True when the line is a bare comma/slash-separated enumeration of
+    short tech-token-like terms (e.g. "EC2, S3, RDS, VPC, IAM, CloudFormation"
+    or "AWS/Azure/GCP/OCI"). Detection: at least 3 tokens, average token
+    length <= 10 chars, no token longer than ~25 chars, every token contains
+    only ASCII letters/digits/. /+/#."""
+    parts = [p.strip() for p in _TOKEN_SPLIT_RE.split(line) if p.strip()]
+    if len(parts) < 3:
+        return False
+    # Reject if any part contains a sentence-shaped verb construction.
+    if any(re.search(r"\b(builds?|designs?|develops?|implements?|maintains?|writes?|leads?|owns?|manages?|deploys?|integrates?|optimi[sz]es?|architects?|configures?|drives?|mentors?|coordinates?|collaborates?)\b", p, re.IGNORECASE) for p in parts):
+        return False
+    short_token_re = re.compile(r"^[A-Za-z0-9./+#\- ]{1,25}$")
+    short_tokens = [p for p in parts if short_token_re.match(p) and len(p) <= 25]
+    if len(short_tokens) < len(parts):
+        return False  # Some part is too long/punctuated to be a tech token
+    avg_len = sum(len(t) for t in short_tokens) / len(short_tokens)
+    return avg_len <= 10
+
+
+def _is_quality_sentence(line: str) -> bool:
+    """Gate a candidate sentence on three quality checks:
+
+    1. Length >= _MIN_SENTENCE_CHARS (filters tiny fragments).
+    2. Doesn't start with a skill-list prelude ("Hands-on with X, Y, Z").
+    3. Isn't a bare list of tech tokens ("EC2, S3, RDS, VPC, IAM, ...").
+
+    Returns True when the line is shaped like a behavioral KRA sentence and
+    should be embedded; False when it's a low-quality input that would
+    pollute KRA matching with bag-of-tech-words pattern-matches.
+    """
+    if len(line) < _MIN_SENTENCE_CHARS:
+        return False
+    lower = line.lower().strip()
+    if any(lower.startswith(p) for p in _SKILL_LIST_PREFIXES):
+        return False
+    # Strip trailing colons/periods before header check
+    header_check = lower.rstrip(":.").strip()
+    if header_check in _SECTION_HEADERS:
+        return False
+    if _is_skill_bag(line):
+        return False
+    return True
+
+
 def split_rr_sentences(text: str) -> list[str]:
-    """Split R&R text into individual sentence/bullet-point chunks.
+    """Split R&R text into individual sentence/bullet-point chunks suitable
+    for per-sentence KRA matching.
 
     Splits on newlines first (bullet points), then on sentence-ending
     punctuation within long lines. Avoids splitting on abbreviations
     like "e.g.", "i.e.", "etc." which are common in JD parentheticals.
-    Filters out fragments shorter than 20 characters.
+
+    Quality-filters each chunk before keeping it (see `_is_quality_sentence`):
+      * Minimum length 40 chars (was 20 — bumped after prod showed
+        "Well-Architected Framework" 26-char fragment causing false matches).
+      * No skill-list preludes ("Hands-on with X, Y, Z").
+      * No bare comma-separated tech-token bags ("EC2, S3, RDS, VPC, IAM").
+
     Caps at 25 sentences to bound embedding cost.
     """
     # Temporarily mask common abbreviation periods to avoid false splits
@@ -140,7 +241,7 @@ def split_rr_sentences(text: str) -> list[str]:
     chunks: list[str] = []
     for line in re.split(r"[\n\r]+", masked):
         line = re.sub(r"^[\s\-\*•▪▸●]+", "", line).strip()
-        if len(line) < 20:
+        if len(line) < _MIN_SENTENCE_CHARS:
             continue
         # Split only on period/semicolon followed by whitespace + uppercase
         parts = re.split(r'(?<=[.;])\s+(?=[A-Z0-9])', line)
@@ -149,7 +250,7 @@ def split_rr_sentences(text: str) -> list[str]:
             part = part.replace('e_g_ ', 'e.g. ').replace('i_e_ ', 'i.e. ')
             part = part.replace('etc_ ', 'etc. ').replace('vs_ ', 'vs. ')
             part = part.strip()
-            if len(part) >= 20:
+            if _is_quality_sentence(part):
                 chunks.append(part)
     return chunks[:25]
 
