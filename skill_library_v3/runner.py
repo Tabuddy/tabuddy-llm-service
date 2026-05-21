@@ -73,6 +73,7 @@ from skill_library_v3.recon_status import decide_recon_status
 from skill_library_v3.schemas.enrichment import SkillEnrichment
 from skill_library_v3.relationship_validators import (
     architecture_has_no_parents,
+    auto_link_service_to_platform,
     library_has_lang_or_framework_parent,
     service_has_platform_parent,
     suppress_symmetry,
@@ -765,8 +766,12 @@ async def run_stage_3(role_slug: str) -> None:
             validator_warnings.append(err)
         validator_log = {"errors": validator_errors, "warnings": validator_warnings}
 
+        # Pass `pair_decisions` (with `kind`) so the router can auto-approve
+        # intra_role MERGEs (LLM self-cleanup) while still escalating
+        # cross_role MERGEs (catalog-integrity risk) to awaiting_review.
         final_status = decide_recon_status(
-            decisions=decisions, validator_log=validator_log,
+            pair_decisions=list(zip(flagged_pairs, decisions)),
+            validator_log=validator_log,
         )
 
         payload = {
@@ -972,8 +977,11 @@ async def run_stage_3_regenerate(new_run_id: uuid.UUID) -> None:
             validator_warnings.append(warn)
         validator_log = {"errors": validator_errors, "warnings": validator_warnings}
 
+        # Pass `pair_decisions` (with `kind`) so the router can auto-approve
+        # intra_role MERGEs while still escalating cross_role MERGEs.
         final_status = decide_recon_status(
-            decisions=decisions, validator_log=validator_log,
+            pair_decisions=list(zip(flagged_pairs, decisions)),
+            validator_log=validator_log,
         )
         payload = {
             "candidate_dimensions": ctx["candidate_dimensions"],
@@ -1464,6 +1472,15 @@ async def run_stage_6(role_slug: str) -> None:
             )
             relationships.append(rel)
 
+        # Pre-validator: deterministically add Platform parent to Service
+        # skills that lack one (the Stage 6 LLM's top-K candidate list
+        # sometimes misses the enterprise Platform — pega-platform,
+        # salesforce, servicenow — even though it's in the role's skill
+        # set). Auto-link before validation so the run can clear cleanly.
+        relationships, auto_link_fixes = auto_link_service_to_platform(
+            typed_skills=typed_skills, relationships=relationships,
+        )
+
         # Run all five validators.
         validator_errors: list[dict] = []
         validator_warnings: list[dict] = []
@@ -1483,6 +1500,9 @@ async def run_stage_6(role_slug: str) -> None:
             (validator_errors if f.get("level") == "error" else validator_warnings).append(f)
         for f in suppress_symmetry(relationships=relationships):
             (validator_errors if f.get("level") == "error" else validator_warnings).append(f)
+        # Auto-link fixes are info-level — surface them in warnings for audit
+        # so admin can see which Service-Platform edges were auto-added.
+        validator_warnings.extend(auto_link_fixes)
         validator_log = {"errors": validator_errors, "warnings": validator_warnings}
 
         # Errors require human gate; otherwise auto-approve.
@@ -1587,6 +1607,11 @@ async def run_stage_6_regenerate(new_run_id: uuid.UUID) -> None:
             rel = await agent.resolve(typed=typed, placed=placed, candidates=top_k)
             relationships.append(rel)
 
+        # Pre-validator auto-link (see Stage 6 runner above for rationale).
+        relationships, auto_link_fixes = auto_link_service_to_platform(
+            typed_skills=typed_skills, relationships=relationships,
+        )
+
         validator_errors: list[dict] = []
         validator_warnings: list[dict] = []
         for f in validate_dag_no_cycles(relationships):
@@ -1599,6 +1624,7 @@ async def run_stage_6_regenerate(new_run_id: uuid.UUID) -> None:
             (validator_errors if f.get("level") == "error" else validator_warnings).append(f)
         for f in suppress_symmetry(relationships=relationships):
             (validator_errors if f.get("level") == "error" else validator_warnings).append(f)
+        validator_warnings.extend(auto_link_fixes)
         validator_log = {"errors": validator_errors, "warnings": validator_warnings}
 
         final_status = "awaiting_review" if validator_errors else "approved"

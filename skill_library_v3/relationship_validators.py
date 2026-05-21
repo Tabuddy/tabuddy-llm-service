@@ -101,6 +101,94 @@ def validate_dag_no_cycles(
     return findings
 
 
+# ── 2a. Pre-validator auto-link (Service → Platform) ──────────────────────
+
+
+def auto_link_service_to_platform(
+    *,
+    typed_skills: list[TypedSkill],
+    relationships: list[SkillRelationships],
+) -> tuple[list[SkillRelationships], list[dict]]:
+    """Deterministic post-processor: when a Service-typed skill has no
+    Platform-typed parent AND the role's typed_skills set contains a
+    Platform-typed skill, add it as a parent.
+
+    Fixes the common LLM mistake where Stage 6's top-K candidate list for a
+    Service-typed skill doesn't surface the role's enterprise Platform
+    (e.g. ``pega-platform``, ``salesforce``, ``servicenow``) — the LLM then
+    falls back to a Protocol parent (``rest``, ``soap``) which violates the
+    Service-Platform rule, blocking Stage 6 at awaiting_review.
+
+    The auto-link only fires when:
+      * The skill is typed Service.
+      * Its current parent_skills has no Platform-typed entry.
+      * The role's typed_skills DOES include at least one Platform-typed
+        skill (we have something to link TO).
+
+    If the Platform skill already appears in the Service's ``related_to``
+    by mistake (schema forbids same id in both parent_skills and
+    related_to), we MOVE it from related_to → parent_skills.
+
+    Idempotent. Safe to run before ``service_has_platform_parent``.
+
+    Returns ``(patched_relationships, fixes_applied)`` where
+    ``fixes_applied`` is a list of audit dicts for downstream logging.
+    """
+    type_by_id = {t.skill_id: t.type for t in typed_skills}
+    platform_ids = [t.skill_id for t in typed_skills if t.type == "Platform"]
+    fixes_applied: list[dict] = []
+
+    if not platform_ids:
+        return list(relationships), fixes_applied
+
+    out: list[SkillRelationships] = []
+    for rel in relationships:
+        # Only touch Service-typed skills.
+        if type_by_id.get(rel.skill_id) != "Service":
+            out.append(rel)
+            continue
+
+        has_platform_parent = any(
+            type_by_id.get(p) == "Platform" for p in rel.parent_skills
+        )
+        if has_platform_parent:
+            out.append(rel)
+            continue
+
+        # Pick the first Platform from typed_skills order — deterministic.
+        platform_to_add = platform_ids[0]
+
+        # Schema rule: parent_skills and related_to must be disjoint.
+        # If platform_to_add is already in related_to (LLM mistake),
+        # MOVE it (don't duplicate, that fails schema validation).
+        new_related = [
+            r for r in rel.related_to if r != platform_to_add
+        ]
+        new_parents = [*rel.parent_skills, platform_to_add]
+
+        # Rebuild via the schema's constructor so the structural checks run.
+        patched = SkillRelationships(
+            skill_id=rel.skill_id,
+            parent_skills=new_parents,
+            child_skills=list(rel.child_skills),
+            suppress_on_match=list(rel.suppress_on_match),
+            requires=list(rel.requires),
+            related_to=new_related,
+        )
+        out.append(patched)
+        fixes_applied.append(
+            {
+                "code": "auto_linked_service_to_platform",
+                "level": "info",
+                "skill_id": rel.skill_id,
+                "added_parent": platform_to_add,
+                "original_parents": list(rel.parent_skills),
+            }
+        )
+
+    return out, fixes_applied
+
+
 # ── 2. Service has Platform parent ─────────────────────────────────────────
 
 
