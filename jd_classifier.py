@@ -15,11 +15,15 @@ from jd_similarity_matcher import RoleSignal, Stage3Result
 
 # ── Tunable constants ────────────────────────────────────────────────────────
 
-# With Stage 3c using MAX-per-role aggregation, real KRA top scores range
-# from ~0.35 (weak alignment) to ~0.55 (very strong). KRA_MIN_SCORE acts as
-# the "the JD's R&R aligns with this role's KRAs at all" floor; below it,
-# no classification is attempted.
-KRA_MIN_SCORE: float = 0.40
+# Stage 3c now uses mean-of-top-3 per-sentence scoring (not MAX).
+# Observed score ranges with descriptive KRA texts + mean-of-top-3:
+#   ~0.40 (weak / wrong role)  →  ~0.65 (strong / correct role)
+# KRA_MIN_SCORE: floor below which no classification is attempted.
+# KRA_MARGIN_DEFAULT: minimum gap between #1 and #2 role scores required
+#   to classify without LLM2; mean-of-top-3 naturally widens margins so
+#   0.05 remains a reasonable floor.
+# KRA_TIE_BAND: scores within this band are treated as a statistical tie → Case F.
+KRA_MIN_SCORE: float = 0.45
 KRA_MARGIN_DEFAULT: float = 0.05
 KRA_MARGIN_ON_COLLISION: float = 0.08
 KRA_TIE_BAND: float = 0.02
@@ -27,10 +31,8 @@ SKILL_TIE_BAND: float = 0.05
 LLM2_MIN_CONFIDENCE: float = 0.70
 
 # Gap #6 bypass: when alias is an exact match and skill agrees with it at
-# moderate confidence, skip KRA gating entirely. KRA is noisy because R&R
-# blocks rarely overlap precisely with stored KRAs even after Stage 3c uses
-# MAX aggregation. This bypass prevents valid classifications from being
-# queued when the JD title + skill list make the role unambiguous.
+# moderate confidence, skip KRA gating entirely. Prevents valid classifications
+# from being queued when the JD title + skill list make the role unambiguous.
 ALIAS_EXACT_MIN_SCORE: float = 0.95
 SKILL_WITNESS_MIN_SCORE: float = 0.50
 
