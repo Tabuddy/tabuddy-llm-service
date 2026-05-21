@@ -197,6 +197,12 @@ class FinalSkillItem(BaseModel):
     is_primary: bool
 
 
+class KraMatchDetailItem(BaseModel):
+    sentence: str
+    kra_text: str
+    similarity: float
+
+
 class RoleSignalItem(BaseModel):
     # role_id is None for "Case NEW" synthesized roles whose catalog entry
     # is still being upserted by v3 in the background.
@@ -206,6 +212,7 @@ class RoleSignalItem(BaseModel):
     score: float                   # 0.0–1.0 (× 100 = percentage)
     matched_count: int | None = None   # skill_match only
     total_count: int | None = None     # skill_match only
+    kra_matches: list[KraMatchDetailItem] | None = None  # kra_match only
 
 
 class Stage3SignalsResponse(BaseModel):
@@ -1416,7 +1423,20 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 for r in s3.alias_match_roles
             ],
             kra_match_roles=[
-                RoleSignalItem(role_id=r.role_id, slug=r.slug, display_name=r.display_name, score=r.score)
+                RoleSignalItem(
+                    role_id=r.role_id,
+                    slug=r.slug,
+                    display_name=r.display_name,
+                    score=r.score,
+                    kra_matches=[
+                        KraMatchDetailItem(
+                            sentence=m.sentence,
+                            kra_text=m.kra_text,
+                            similarity=m.similarity,
+                        )
+                        for m in r.kra_matches
+                    ] if r.kra_matches else None,
+                )
                 for r in s3.kra_match_roles
             ],
             alias_found=s3.alias_found,

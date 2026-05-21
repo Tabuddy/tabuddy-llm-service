@@ -1,9 +1,12 @@
 """Stage 2 (R&R embedding) and Stage 3 (parallel DB lookups) of the JD pipeline.
 
-Stage 2:   embed R&R verbatim text → 1536-dim vector
+Stage 2:   embed R&R verbatim text → 1536-dim vector (whole text for centroid)
+           + split into sentences → batch embed each sentence (for KRA matching)
 Stage 3a:  skill match      – canonical_skills / skill_aliases → dimension → role scores
 Stage 3b:  role alias match – role_aliases / roles.display_name → direct role hit
-Stage 3c:  KRA vector match – cosine similarity vs role_kras embeddings → role scores
+Stage 3c:  KRA vector match – per-sentence cosine similarity vs role_kras embeddings → role scores
+           Score = MAX over all (sentence × KRA) pairs per role. Each sentence is
+           evaluated independently so mixed-content JDs don't dilute specific signals.
 
 Stage 3 is read-only. If the role/alias is not found, it is logged as a new/unknown alias
 and role creation is deferred to after Stage 4 decides the canonical role.
@@ -12,8 +15,12 @@ and role creation is deferred to after Stage 4 decides the canonical role.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
+import math
 import os
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +65,13 @@ def _pg_connect() -> psycopg2.extensions.connection:
 # ── Data models ───────────────────────────────────────────────────────────────
 
 @dataclass
+class KraMatchDetail:
+    sentence: str
+    kra_text: str
+    similarity: float
+
+
+@dataclass
 class RoleSignal:
     # role_id is None for synthesized "Case NEW" roles that haven't been
     # written to the catalog yet (v3 upserts the row in the background).
@@ -68,6 +82,7 @@ class RoleSignal:
     signal_type: str      # "skill_match" | "alias_match" | "kra_match" | "new_role_synth"
     matched_count: int | None = None   # skill_match: how many JD skills hit this role
     total_count: int | None = None     # skill_match: total input skills
+    kra_matches: list[KraMatchDetail] | None = None  # kra_match only: top sentence-KRA pairs
 
 
 @dataclass
@@ -102,6 +117,54 @@ def embed_jd_text(text: str, *, cost_acc=None) -> list[float] | None:
     if not vecs or not vecs[0]:
         return None
     return list(vecs[0])
+
+
+def split_rr_sentences(text: str) -> list[str]:
+    """Split R&R text into individual sentence/bullet-point chunks.
+
+    Splits on newlines first (bullet points), then on sentence-ending
+    punctuation within long lines. Avoids splitting on abbreviations
+    like "e.g.", "i.e.", "etc." which are common in JD parentheticals.
+    Filters out fragments shorter than 20 characters.
+    Caps at 25 sentences to bound embedding cost.
+    """
+    # Temporarily mask common abbreviation periods to avoid false splits
+    masked = (text or "")
+    masked = re.sub(r'\be\.g\.\s*', 'e_g_ ', masked)
+    masked = re.sub(r'\bi\.e\.\s*', 'i_e_ ', masked)
+    masked = re.sub(r'\betc\.\s*', 'etc_ ', masked)
+    masked = re.sub(r'\bvs\.\s*', 'vs_ ', masked)
+    masked = re.sub(r'\bv\.\s*', 'v_ ', masked)
+
+    chunks: list[str] = []
+    for line in re.split(r"[\n\r]+", masked):
+        line = re.sub(r"^[\s\-\*•▪▸●]+", "", line).strip()
+        if len(line) < 20:
+            continue
+        # Split only on period/semicolon followed by whitespace + uppercase
+        parts = re.split(r'(?<=[.;])\s+(?=[A-Z0-9])', line)
+        for part in parts:
+            # Restore masked abbreviations
+            part = part.replace('e_g_ ', 'e.g. ').replace('i_e_ ', 'i.e. ')
+            part = part.replace('etc_ ', 'etc. ').replace('vs_ ', 'vs. ')
+            part = part.strip()
+            if len(part) >= 20:
+                chunks.append(part)
+    return chunks[:25]
+
+
+def embed_sentences_batch(texts: list[str]) -> list[list[float]]:
+    """Batch-embed a list of texts in one Azure API call.
+
+    Returns a parallel list of 1536-d vectors. Any failed slot returns [].
+    """
+    from skill_matcher import _azure_embed_sync
+
+    if not texts:
+        return []
+    truncated = [t[:3000] for t in texts]
+    vecs = _azure_embed_sync(truncated)
+    return [list(v) if v else [] for v in vecs]
 
 
 # ── Stage 3a: Skill → Role match ──────────────────────────────────────────────
@@ -182,13 +245,14 @@ def search_roles_by_alias(
 
     Search terms = [role_name] + role_aliases (all lowercased, deduplicated).
 
-    Strategy (in priority order):
-    1. Exact case-insensitive match on role_aliases.alias_lower  → score 1.0
-    2. Exact case-insensitive match on roles.display_name        → score 1.0
-    3. Trigram similarity on role_aliases (gin_trgm index)       → score = best similarity
+    Strategy: exact case-insensitive match only — no trigram / fuzzy fallback.
+    1. Exact match on role_aliases.alias_lower  → score 1.0
+    2. Exact match on roles.display_name        → score 1.0
 
-    Exact hits take precedence; trigram only fires when exact returns nothing.
-    Logs when no match is found across all terms (signals a new / unknown alias).
+    Trigram was removed because it produced false positives (e.g. "Software Engineer"
+    fuzzy-matching "Android Software Engineer" and surfacing Android Engineer as #1).
+    With the comprehensive alias table every real role title hits exactly.
+    Logs when no match found — signals a genuinely new/unknown role title.
     """
     all_terms = list({
         t.strip().lower()
@@ -200,8 +264,7 @@ def search_roles_by_alias(
 
     qs = _qs()
 
-    # Step 1+2: exact match — any term hits alias_lower or display_name
-    exact_sql = f"""
+    sql = f"""
         SELECT r.id AS role_id, r.slug, r.display_name, 1.0::float AS score
           FROM {qs}.role_aliases ra
           JOIN {qs}.roles r ON r.id = ra.role_id
@@ -212,38 +275,18 @@ def search_roles_by_alias(
          WHERE LOWER(r.display_name) = ANY(%s)
     """
 
-    # Step 3: trigram fallback across all terms using LATERAL unnest + gin_trgm index
-    trgm_sql = f"""
-        SELECT r.id AS role_id, r.slug, r.display_name,
-               MAX(similarity(ra.alias_lower, t.term)) AS score
-          FROM {qs}.role_aliases ra
-          JOIN {qs}.roles r ON r.id = ra.role_id
-          JOIN LATERAL (SELECT unnest(%s::text[]) AS term) t ON true
-         WHERE ra.alias_lower %% t.term
-         GROUP BY r.id, r.slug, r.display_name
-         ORDER BY score DESC
-         LIMIT %s
-    """
-
     conn = _pg_connect()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(exact_sql, (all_terms, all_terms))
-                exact_rows = [dict(zip([c[0] for c in cur.description], row)) for row in cur.fetchall()]
-
-                if not exact_rows:
-                    cur.execute(trgm_sql, (all_terms, top_k))
-                    fuzzy_rows = [dict(zip([c[0] for c in cur.description], row)) for row in cur.fetchall()]
-                else:
-                    fuzzy_rows = []
+                cur.execute(sql, (all_terms, all_terms))
+                matched_rows = [dict(zip([c[0] for c in cur.description], row)) for row in cur.fetchall()]
     finally:
         conn.close()
 
-    matched_rows = exact_rows or fuzzy_rows
     if not matched_rows:
         logger.info(
-            "[stage3b/alias_match] no match — role=%r aliases=%r — new/unknown alias",
+            "[stage3b/alias_match] no match — role=%r aliases=%r — new/unknown role title",
             role_name, role_aliases or [],
         )
         return []
@@ -258,69 +301,129 @@ def search_roles_by_alias(
                 role_id=rid,
                 slug=str(r["slug"]),
                 display_name=str(r["display_name"]),
-                score=round(float(r["score"]), 4),
+                score=1.0,
                 signal_type="alias_match",
             ))
-    return results
+    return results[:top_k]
 
 
 # ── Stage 3c: KRA vector match ────────────────────────────────────────────────
 
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+_KRA_TOP_K_SENTENCES = 3  # number of top per-sentence scores to average for role scoring
+
+
 def search_roles_by_kra_vector(
-    vec: list[float],
+    vecs: list[list[float]],
     *,
+    sentences: list[str] | None = None,
     top_k: int = 10,
 ) -> list[RoleSignal]:
-    """MAX cosine similarity of the R&R embedding against each role's KRAs.
+    """Score roles by mean-of-top-3 per-sentence best KRA similarity.
 
-    For each role, score = best single KRA match (not average). Average over a
-    role's many KRAs dilutes the signal because the R&R rarely overlaps with
-    every KRA — typically it strongly matches 1-2 KRAs and weakly matches the
-    rest. MAX preserves that strong-match signal.
+    Scoring algorithm:
+      1. For each JD sentence, find its best-matching KRA for every role
+         (one score per sentence per role).
+      2. Per-role final score = mean of the top-3 per-sentence scores.
+
+    Why top-3 mean instead of MAX:
+      MAX lets a single off-topic sentence (e.g. "UI development" in a backend JD)
+      push an irrelevant role to #1. Mean-of-top-3 requires at least 3 sentences
+      to consistently match a role's KRAs, which eliminates coincidental one-liner hits.
+
+    The top-3 (sentence, KRA, similarity) pairs per role are also tracked and
+    returned as `kra_matches` on each `RoleSignal` for the UI popup.
     """
-    if not vec:
+    vecs = [v for v in (vecs or []) if v]
+    if not vecs:
         return []
 
     qs = _qs()
-    vec_type = f"{qs}.vector(1536)"
-    vec_str = "[" + ",".join(map(str, vec)) + "]"
-
-    # Per-role MAX similarity. The HNSW index serves each role's nearest-KRA
-    # lookup; pgvector returns ordered rows so DISTINCT ON gives us the best
-    # row per role for free.
-    sql = f"""
-        SELECT r.id           AS role_id,
-               r.slug,
-               r.display_name,
-               MAX(1 - (rk.kra_embedding <=> %s::{vec_type})) AS max_sim,
-               COUNT(*)       AS kra_count
-          FROM {qs}.role_kras rk
-          JOIN {qs}.roles r ON r.id = rk.role_id
-         WHERE rk.kra_embedding IS NOT NULL
-           AND rk.source_field = 'primary_responsibility'
-         GROUP BY r.id, r.slug, r.display_name
-         ORDER BY max_sim DESC
-         LIMIT %s
-    """
     conn = _pg_connect()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (vec_str, top_k))
-                rows = [dict(zip([c[0] for c in cur.description], row)) for row in cur.fetchall()]
+                cur.execute(f"""
+                    SELECT r.id AS role_id, r.slug, r.display_name,
+                           rk.kra_text, rk.kra_embedding::text
+                      FROM {qs}.role_kras rk
+                      JOIN {qs}.roles r ON r.id = rk.role_id
+                     WHERE rk.kra_embedding IS NOT NULL
+                       AND rk.source_field = 'primary_responsibility'
+                """)
+                rows = cur.fetchall()
     finally:
         conn.close()
 
-    return [
-        RoleSignal(
-            role_id=int(r["role_id"]),
-            slug=str(r["slug"]),
-            display_name=str(r["display_name"]),
-            score=round(float(r["max_sim"]), 4),
+    if not rows:
+        return []
+
+    # Parse all KRA embeddings once; group by role
+    role_info: dict[int, tuple[str, str]] = {}
+    role_kras: dict[int, list[tuple[str, list[float]]]] = defaultdict(list)
+    for role_id, slug, display_name, kra_text, emb_str in rows:
+        rid = int(role_id)
+        role_info[rid] = (str(slug), str(display_name))
+        role_kras[rid].append((str(kra_text), [float(x) for x in emb_str.strip("[]").split(",")]))
+
+    track_details = sentences is not None and len(sentences) == len(vecs)
+
+    # For each role: list of (best_kra_sim, best_kra_text) per sentence
+    role_per_sent: dict[int, list[tuple[float, str]]] = defaultdict(list)
+    # Top-3 (sim, sentence, kra_text) pairs per role for UI popup
+    role_top: dict[int, list[tuple[float, str, str]]] = defaultdict(list)
+
+    for i, sent_vec in enumerate(vecs):
+        sent_text = sentences[i] if track_details else ""
+        for rid, kra_list in role_kras.items():
+            # Best KRA match for this sentence × this role
+            best_sim = 0.0
+            best_kra_text = ""
+            for kra_text, kra_vec in kra_list:
+                sim = _cosine(sent_vec, kra_vec)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_kra_text = kra_text
+            role_per_sent[rid].append((best_sim, best_kra_text))
+
+            if track_details:
+                heap = role_top[rid]
+                entry = (best_sim, sent_text, best_kra_text)
+                if len(heap) < 3:
+                    heapq.heappush(heap, entry)
+                elif best_sim > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+
+    # Final score = mean of top-K per-sentence scores
+    role_score: dict[int, float] = {}
+    for rid, sent_scores in role_per_sent.items():
+        top_scores = sorted([s for s, _ in sent_scores], reverse=True)[:_KRA_TOP_K_SENTENCES]
+        role_score[rid] = sum(top_scores) / len(top_scores) if top_scores else 0.0
+
+    sorted_roles = sorted(role_score.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    result = []
+    for rid, score in sorted_roles:
+        kra_matches: list[KraMatchDetail] | None = None
+        if track_details and rid in role_top:
+            kra_matches = [
+                KraMatchDetail(sentence=s, kra_text=k, similarity=round(sc, 4))
+                for sc, s, k in sorted(role_top[rid], reverse=True)
+            ]
+        result.append(RoleSignal(
+            role_id=rid,
+            slug=role_info[rid][0],
+            display_name=role_info[rid][1],
+            score=round(score, 4),
             signal_type="kra_match",
-        )
-        for r in rows
-    ]
+            kra_matches=kra_matches,
+        ))
+    return result
 
 
 # ── Main orchestrator ─────────────────────────────────────────────────────────
@@ -350,13 +453,40 @@ async def run_stage2_and_stage3(
         Stage3Result containing three role signal lists and the R&R embedding.
     """
     # ── Stage 2: embed R&R text ───────────────────────────────────────────────
-    vec = await asyncio.to_thread(embed_jd_text, r_and_r_text, cost_acc=cost_acc)
+    # One batch call: whole text (index 0, for Stage 5 centroid) + per-sentence
+    # (indices 1+, for KRA matching). Single API round-trip, no extra cost.
+    sentences = split_rr_sentences(r_and_r_text)
+    all_texts = [(r_and_r_text or "")[:12_000]] + sentences
+
+    all_vecs = await asyncio.to_thread(embed_sentences_batch, all_texts)
+    vec: list[float] | None = all_vecs[0] if all_vecs and all_vecs[0] else None
+
+    # Keep sentences and their vectors aligned — drop any sentence whose embedding failed
+    raw_sentence_vecs = all_vecs[1:] if len(all_vecs) > 1 else []
+    paired = [(s, v) for s, v in zip(sentences, raw_sentence_vecs) if v]
+    sentence_vecs: list[list[float]] = [v for _, v in paired]
+    sentences_for_kra: list[str] = [s for s, _ in paired]
+
+    # Fall back to whole-text vector if sentence splitting produced nothing
+    if not sentence_vecs and vec:
+        sentence_vecs = [vec]
+        sentences_for_kra = [(r_and_r_text or "")[:300]]
+
+    logger.info(
+        "[stage2] r_and_r_chars=%d sentences=%d sentence_vecs=%d",
+        len(r_and_r_text or ""), len(sentences), len(sentence_vecs),
+    )
 
     # ── Stage 3: parallel DB lookups ─────────────────────────────────────────
     async def _kra() -> list[RoleSignal]:
-        if not vec:
+        if not sentence_vecs:
             return []
-        return await asyncio.to_thread(search_roles_by_kra_vector, vec, top_k=top_k)
+        return await asyncio.to_thread(
+            search_roles_by_kra_vector,
+            sentence_vecs,
+            sentences=sentences_for_kra,
+            top_k=top_k,
+        )
 
     skill_roles, alias_roles, kra_roles = await asyncio.gather(
         asyncio.to_thread(search_roles_by_skills, skills, top_k=top_k),
