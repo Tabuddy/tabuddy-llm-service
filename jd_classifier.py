@@ -274,7 +274,22 @@ async def stage4_route_decision(
     top_alias = alias[0] if alias else None
     alias_collision = len({a.role_id for a in alias}) > 1
 
-    # ── Stage-1-priority branch (NEW) ─────────────────────────────────────────
+    # ── Stage-1 corroboration guard ───────────────────────────────────────────
+    # Only an exact display_name match (match_kind="name") is unambiguous
+    # enough to trust on its own. Alias and embedding matches can be wrong for
+    # generic titles — e.g. "Software Engineer" is a valid alias for
+    # "Backend Developer" in the DB but could equally describe a Fullstack or
+    # Frontend role. Discard any non-name stage1 resolution when BOTH
+    # skill_match and kra_match independently point to a different role.
+    if (
+        stage1_resolved is not None
+        and stage1_resolved.match_kind != "name"
+        and not (top_skill is not None and top_skill.role_id == stage1_resolved.role_id)
+        and not (kra and kra[0].role_id == stage1_resolved.role_id)
+    ):
+        stage1_resolved = None
+
+    # ── Stage-1-priority branch ───────────────────────────────────────────────
     # Stage 1 already extracted a verbatim role title and we exact-matched it
     # against the canonical catalog. If that match exists, it is the highest-
     # signal source we have — overrides the trigram alias noise that Stage 3b
@@ -441,6 +456,33 @@ async def stage4_route_decision(
             reasoning=(
                 f"Skill scores tied ({skill[0].score:.2f} vs {skill[1].score:.2f}); "
                 f"alias+KRA agree on {kra[0].slug}"
+            ),
+        )
+
+    # Skill+KRA consensus bypass: when skill and KRA both agree on the same
+    # role and KRA is above the minimum score, classify directly even if alias
+    # points elsewhere. Two independent signals converging is stronger than one
+    # exact-string alias hit. Alias becomes tiebreaker only when signals diverge.
+    if (
+        kra
+        and top_kra_score >= KRA_MIN_SCORE
+        and top_skill is not None
+        and top_skill.role_id == kra[0].role_id
+        and top_alias is not None
+        and top_alias.score >= ALIAS_EXACT_MIN_SCORE
+        and top_alias.role_id != kra[0].role_id
+    ):
+        return Stage4Decision(
+            case="B",
+            chosen_role=kra[0],
+            confidence=kra[0].score,
+            llm2_fired=False,
+            llm2_reasoning=None,
+            alias_collision_detected=True,
+            queued=False,
+            reasoning=(
+                f"Skill+KRA agree on {kra[0].slug} ({top_skill.score:.2f}/{kra[0].score:.2f}); "
+                f"alias ({top_alias.slug}, {top_alias.score:.2f}) overridden by consensus"
             ),
         )
 

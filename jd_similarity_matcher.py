@@ -80,8 +80,9 @@ class RoleSignal:
     display_name: str
     score: float          # 0.0–1.0 (× 100 = percentage)
     signal_type: str      # "skill_match" | "alias_match" | "kra_match" | "new_role_synth"
-    matched_count: int | None = None   # skill_match: how many JD skills hit this role
-    total_count: int | None = None     # skill_match: total input skills
+    matched_count: int | None = None        # skill_match: how many JD skills hit this role
+    total_count: int | None = None          # skill_match: total input skills
+    matched_skills: list[str] | None = None # skill_match: canonical names of matched skills
     kra_matches: list[KraMatchDetail] | None = None  # kra_match only: top sentence-KRA pairs
 
 
@@ -194,7 +195,8 @@ def search_roles_by_skills(
         SELECT r.id           AS role_id,
                r.slug,
                r.display_name,
-               COUNT(DISTINCT cs.id) AS matched_count
+               COUNT(DISTINCT cs.id)                                        AS matched_count,
+               ARRAY_AGG(DISTINCT cs.display_name ORDER BY cs.display_name) AS matched_skills
           FROM {qs}.canonical_skills  cs
           JOIN {qs}.dimension_skills  ds ON ds.skill_id     = cs.id
           JOIN {qs}.dimensions         d  ON d.id            = ds.dimension_id
@@ -228,6 +230,7 @@ def search_roles_by_skills(
             signal_type="skill_match",
             matched_count=int(r["matched_count"]),
             total_count=total,
+            matched_skills=list(r["matched_skills"]) if r["matched_skills"] else [],
         )
         for r in rows
     ]

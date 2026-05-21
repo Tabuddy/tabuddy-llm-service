@@ -210,8 +210,9 @@ class RoleSignalItem(BaseModel):
     slug: str
     display_name: str
     score: float                   # 0.0–1.0 (× 100 = percentage)
-    matched_count: int | None = None   # skill_match only
-    total_count: int | None = None     # skill_match only
+    matched_count: int | None = None        # skill_match only
+    total_count: int | None = None          # skill_match only
+    matched_skills: list[str] | None = None # skill_match only: canonical names of matched skills
     kra_matches: list[KraMatchDetailItem] | None = None  # kra_match only
 
 
@@ -1397,7 +1398,8 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     try:
         from jd_similarity_matcher import Stage3Result, run_stage2_and_stage3
 
-        skills_for_stage3 = [s.skill_name for s in final_skills]
+        primary_for_stage3 = [s.skill_name for s in final_skills if s.is_primary]
+        skills_for_stage3 = primary_for_stage3 if primary_for_stage3 else [s.skill_name for s in final_skills]
         s3: Stage3Result = await run_stage2_and_stage3(
             r_and_r_text,
             skills_for_stage3,
@@ -1406,6 +1408,32 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             top_k=5,
             cost_acc=cost_acc,
         )
+
+        # ── Fullstack tiebreaker: when roles share the same skill score, a
+        # fullstack/generalist role should rank above a single specialization
+        # because it encompasses both frontend and backend skill sets.
+        s3.skill_match_roles.sort(
+            key=lambda r: (
+                -r.score,
+                0 if "full" in (r.slug or "").lower() else 1,
+            )
+        )
+
+        # ── Alias tiebreaker: when multiple alias matches share the same score
+        # (always 1.0 in exact-match mode), re-rank them by their position in
+        # skill_match_roles so the most skill-aligned role wins.
+        # If a role isn't in skill_match at all, it keeps its original order.
+        if len(s3.alias_match_roles) > 1:
+            skill_rank: dict[int | None, int] = {
+                r.role_id: i for i, r in enumerate(s3.skill_match_roles)
+            }
+            s3.alias_match_roles.sort(
+                key=lambda r: (
+                    -r.score,
+                    skill_rank.get(r.role_id, len(s3.skill_match_roles)),
+                )
+            )
+
         stage3_signals = Stage3SignalsResponse(
             skill_match_roles=[
                 RoleSignalItem(
@@ -1415,6 +1443,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     score=r.score,
                     matched_count=r.matched_count,
                     total_count=r.total_count,
+                    matched_skills=r.matched_skills,
                 )
                 for r in s3.skill_match_roles
             ],
