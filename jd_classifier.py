@@ -438,6 +438,40 @@ async def stage4_route_decision(
             queue_reason="multi_alias_tie",
         )
 
+    # ── Branch 1.5: single unambiguous alias hit → trust it ──────────────────
+    # When EXACTLY one role has alias score >= ALIAS_EXACT_MIN_SCORE (1.0)
+    # AND skill_top either agrees with it OR is too weak (< 0.20) to
+    # contradict, classify by that alias. Catches the common case where
+    # nano correctly identified a catalog role but skill/KRA matching is
+    # weak because the role's canonical_skills/KRAs aren't enriched yet
+    # (freshly-imported shell rows). Without this, body-driven branches
+    # 2-4 fall to a wrong nearest-neighbor when alias points to a
+    # correctly-imported-but-not-enriched role.
+    exact_alias_hits = [a for a in alias if a.score >= ALIAS_EXACT_MIN_SCORE]
+    if len(exact_alias_hits) == 1:
+        alias_pick = exact_alias_hits[0]
+        skill_consents = (
+            top_skill is None
+            or top_skill.score < 0.20
+            or top_skill.role_id == alias_pick.role_id
+        )
+        if skill_consents:
+            return Stage4Decision(
+                case="A",
+                chosen_role=alias_pick,
+                confidence=alias_pick.score,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"Exact alias hit on {alias_pick.slug} (1.0) — no other alias "
+                    f"at this confidence; skill_top "
+                    f"{(top_skill.slug + ' ' + f'{top_skill.score:.2f}') if top_skill else 'absent'} "
+                    f"does not contradict"
+                ),
+            )
+
     # ── Branch 2: skill+KRA convergence → Case A ──────────────────────────────
     # When skill_top and kra_top agree AND KRA has a meaningful signal,
     # classify directly. Alias is logged but doesn't gate.
