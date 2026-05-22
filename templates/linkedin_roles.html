@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TABuddy – LinkedIn Roles</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #23273a;
+      --border: #2e3348;
+      --primary: #6c5ce7;
+      --text: #dfe6e9;
+      --text-dim: #8395a7;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem 1.5rem; }
+    .header {
+      margin-bottom: 1.5rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 1.5rem; font-weight: 600; }
+    .header p { color: var(--text-dim); font-size: 0.9rem; margin-top: 0.35rem; }
+    .meta { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 1rem; }
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th {
+      text-align: left;
+      padding: 0.65rem 1rem;
+      background: var(--surface2);
+      color: var(--text-dim);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 0.6rem 1rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(108, 92, 231, 0.06); }
+    .id-col { width: 6rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+    .empty { padding: 2rem; text-align: center; color: var(--text-dim); }
+    a.back { color: var(--primary); text-decoration: none; font-size: 0.85rem; }
+    a.back:hover { text-decoration: underline; }
+    .pager {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-top: 1.25rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+    }
+    .pager-btns { display: flex; gap: 0.5rem; }
+    .pager-btn {
+      display: inline-block;
+      padding: 0.5rem 1.25rem;
+      font-size: 0.9rem;
+      font-weight: 500;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      text-decoration: none;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .pager-btn:hover:not(.disabled) {
+      background: rgba(108, 92, 231, 0.2);
+      border-color: var(--primary);
+    }
+    .pager-btn.disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+    .pager-info { color: var(--text-dim); font-size: 0.85rem; }
+    .actions-col { width: 3.5rem; text-align: center; }
+    .btn-delete {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 2rem;
+      height: 2rem;
+      padding: 0;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: #e74c3c;
+      cursor: pointer;
+      transition: color 0.15s, background 0.15s;
+    }
+    .btn-delete:hover { color: #ff6b6b; background: rgba(231, 76, 60, 0.2); }
+    .btn-delete:disabled { opacity: 0.5; cursor: wait; }
+    .btn-delete svg { width: 1.1rem; height: 1.1rem; }
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      max-width: 20rem;
+      z-index: 100;
+      display: none;
+    }
+    .toast.error { display: block; background: rgba(225, 112, 85, 0.2); border: 1px solid #e17055; color: #fab1a0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <p><a class="back" href="/">← Home</a></p>
+    <div class="header">
+      <h1>LinkedIn roles</h1>
+      <p>Staging table <code>linkedin_roles</code> — titles imported from LinkedIn before alias backfill.</p>
+    </div>
+    <p class="meta" id="metaLine">
+      {% if rows and total > 0 %}
+      Rows {{ offset + 1 }}–{{ offset + rows|length }} of {{ total }}
+      {% else %}
+      {{ total }} row(s) total
+      {% endif %}
+      ({{ limit }} per page)
+    </p>
+    <div class="table-wrap">
+      {% if rows %}
+      <table>
+        <thead>
+          <tr>
+            <th class="id-col">ID</th>
+            <th>Display name</th>
+            <th>Created at</th>
+            <th class="actions-col" aria-label="Actions"></th>
+          </tr>
+        </thead>
+        <tbody id="rolesBody">
+          {% for row in rows %}
+          <tr data-role-id="{{ row.id }}">
+            <td class="id-col">{{ row.id }}</td>
+            <td>{{ row.display_name }}</td>
+            <td>{{ row.created_at or "—" }}</td>
+            <td class="actions-col">
+              <button type="button" class="btn-delete" title="Delete role"
+                      data-id="{{ row.id }}"
+                      data-name={{ row.display_name|tojson }}>
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                     aria-hidden="true">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                  <line x1="10" y1="11" x2="10" y2="17"></line>
+                  <line x1="14" y1="11" x2="14" y2="17"></line>
+                </svg>
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty">No rows in linkedin_roles.</p>
+      {% endif %}
+    </div>
+
+    <nav class="pager" aria-label="Pagination">
+      <div class="pager-btns">
+        {% if has_prev %}
+        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&offset={{ prev_offset }}">Previous</a>
+        {% else %}
+        <span class="pager-btn disabled">Previous</span>
+        {% endif %}
+        {% if has_next %}
+        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&offset={{ next_offset }}">Next</a>
+        {% else %}
+        <span class="pager-btn disabled">Next</span>
+        {% endif %}
+      </div>
+      <span class="pager-info">Page size: {{ limit }}</span>
+    </nav>
+  </div>
+  <div id="pageState" hidden
+       data-limit="{{ limit }}"
+       data-offset="{{ offset }}"
+       data-total="{{ total }}"></div>
+  <div id="toast" class="toast" role="alert"></div>
+  <script>
+    (function () {
+      const pageState = document.getElementById('pageState').dataset;
+      const pageLimit = Number(pageState.limit) || 500;
+      const pageOffset = Number(pageState.offset) || 0;
+      let totalCount = Number(pageState.total) || 0;
+      const toast = document.getElementById('toast');
+      const metaLine = document.getElementById('metaLine');
+      const body = document.getElementById('rolesBody');
+
+      function showError(msg) {
+        toast.textContent = msg;
+        toast.className = 'toast error';
+        setTimeout(function () { toast.className = 'toast'; toast.textContent = ''; }, 5000);
+      }
+
+      function updateMeta(remainingOnPage) {
+        if (!metaLine) return;
+        totalCount = Math.max(0, totalCount - 1);
+        const newTotal = totalCount;
+        if (remainingOnPage === 0) {
+          if (pageOffset > 0) {
+            window.location.href = '/linkedin-role?limit=' + pageLimit + '&offset=' + Math.max(0, pageOffset - pageLimit);
+            return;
+          }
+          metaLine.textContent = newTotal + ' row(s) total (' + pageLimit + ' per page)';
+          return;
+        }
+        const end = pageOffset + remainingOnPage;
+        metaLine.textContent = 'Rows ' + (pageOffset + 1) + '–' + end + ' of ' + newTotal + ' (' + pageLimit + ' per page)';
+      }
+
+      document.querySelectorAll('.btn-delete').forEach(function (btn) {
+        btn.addEventListener('click', async function () {
+          const id = btn.getAttribute('data-id');
+          const name = btn.getAttribute('data-name') || id;
+          if (!confirm('Delete "' + name + '" from linkedin_roles?')) return;
+          btn.disabled = true;
+          try {
+            const res = await fetch('/api/linkedin-roles/' + encodeURIComponent(id), { method: 'DELETE' });
+            if (!res.ok) {
+              const err = await res.json().catch(function () { return {}; });
+              var detail = err.detail;
+              if (Array.isArray(detail)) detail = detail.map(function (d) { return d.msg || d; }).join(', ');
+              throw new Error(detail || res.statusText || 'Delete failed');
+            }
+            const tr = btn.closest('tr');
+            if (tr) tr.remove();
+            const remaining = body ? body.querySelectorAll('tr').length : 0;
+            updateMeta(remaining);
+            if (remaining === 0 && body) {
+              const wrap = document.querySelector('.table-wrap');
+              if (wrap) wrap.innerHTML = '<p class="empty">No rows in linkedin_roles.</p>';
+            }
+          } catch (e) {
+            showError(e.message || 'Could not delete role');
+            btn.disabled = false;
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

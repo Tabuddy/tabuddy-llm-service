@@ -500,6 +500,19 @@ class JdRunListResponse(BaseModel):
     offset: int
 
 
+class LinkedInRoleRow(BaseModel):
+    id: int
+    display_name: str
+    created_at: datetime
+
+
+class LinkedInRoleListResponse(BaseModel):
+    rows: list[LinkedInRoleRow]
+    total: int
+    limit: int
+    offset: int
+
+
 class V3StageRow(BaseModel):
     stage_index: int           # 0..8
     stage_name: str            # 'charter', 'anchor', 'dim_gen', ...
@@ -4374,7 +4387,111 @@ async def resume_ranking_ui(request: Request):
     )
 
 
-# ── 6. Skill Library Panel ───────────────────────────────────────────────────
+# ── 6. LinkedIn roles (staging) ───────────────────────────────────────────────
+
+@app.get("/linkedin-role", response_class=HTMLResponse)
+async def linkedin_role_ui(
+    request: Request,
+    limit: int = 500,
+    offset: int = 0,
+):
+    """Read-only table of ``linkedin_roles`` (id, display_name, created_at)."""
+    limit = min(max(1, limit), 2000)
+    offset = max(0, offset)
+    repo = SkillLibraryRepository()
+    try:
+        rows = await asyncio.to_thread(
+            repo.list_linkedin_roles, limit=limit, offset=offset
+        )
+        total = await asyncio.to_thread(repo.count_linkedin_roles)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list linkedin_roles: {exc}",
+        ) from exc
+    display_rows = []
+    for r in rows:
+        created = r.get("created_at")
+        if created is not None and hasattr(created, "isoformat"):
+            created = created.isoformat()
+        display_rows.append(
+            {
+                "id": r.get("id"),
+                "display_name": r.get("display_name") or "",
+                "created_at": created,
+            }
+        )
+    has_prev = offset > 0
+    has_next = offset + len(display_rows) < total
+    prev_offset = max(0, offset - limit)
+    next_offset = offset + limit
+    return templates.TemplateResponse(
+        request,
+        "linkedin_roles.html",
+        {
+            "rows": display_rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_prev": has_prev,
+            "has_next": has_next,
+            "prev_offset": prev_offset,
+            "next_offset": next_offset,
+        },
+    )
+
+
+@app.get("/api/linkedin-roles", response_model=LinkedInRoleListResponse)
+async def api_linkedin_roles(limit: int = 500, offset: int = 0):
+    """JSON list of ``linkedin_roles`` for clients."""
+    limit = min(max(1, limit), 2000)
+    offset = max(0, offset)
+    repo = SkillLibraryRepository()
+    try:
+        rows = await asyncio.to_thread(
+            repo.list_linkedin_roles, limit=limit, offset=offset
+        )
+        total = await asyncio.to_thread(repo.count_linkedin_roles)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list linkedin_roles: {exc}",
+        ) from exc
+    public_rows = [
+        LinkedInRoleRow(
+            id=int(r["id"]),
+            display_name=str(r.get("display_name") or ""),
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return LinkedInRoleListResponse(
+        rows=public_rows,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.delete("/api/linkedin-roles/{role_id}")
+async def api_delete_linkedin_role(role_id: int):
+    """Delete one row from ``linkedin_roles`` staging."""
+    repo = SkillLibraryRepository()
+    try:
+        deleted = await asyncio.to_thread(
+            repo.delete_linkedin_roles_row, role_id
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete linkedin_roles row: {exc}",
+        ) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="LinkedIn role not found")
+    return {"ok": True, "id": role_id}
+
+
+# ── 7. Skill Library Panel ───────────────────────────────────────────────────
 
 class AdminSkillPayload(BaseModel):
     alias: str = Field(..., min_length=1, max_length=200)

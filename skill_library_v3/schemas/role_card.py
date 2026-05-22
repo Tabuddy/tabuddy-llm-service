@@ -47,6 +47,13 @@ class SeniorityBand(BaseModel):
     staff: str = Field(min_length=10, max_length=600)
 
 
+class RoleAliasOnlyOutput(BaseModel):
+    """Subset of Stage 1 role card for LinkedIn title-only backfill."""
+
+    canonical_name: str = Field(min_length=2, max_length=80)
+    aliases: list[str] = Field(default_factory=list, max_length=10)
+
+
 class RoleCard(BaseModel):
     """Stage 1 output — written to v2_run_log.planner_output of a stage1 row.
 
