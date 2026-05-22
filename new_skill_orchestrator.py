@@ -1,20 +1,28 @@
-"""Per-skill orchestrator for unknown skills in API 2.
+"""Per-skill orchestrator for unknown skills.
 
 Stages: skill-driven dim-gen → Stage 3 reconcile/apply → Stage 4 typing →
 deterministic placement from locked dims (Stage 5 placer omitted) →
 Stage 6 containment → Stage 7 enrichment.
+
+DO NOT call ``enrich_new_skill`` or ``_run_enrichment`` from API 2 / API 3
+hot paths. Each fires 6+ LLM calls per skill (Stage 2 dim-gen + Stage 3
+reconciler + 5-up Stage 7 sub-agents) and a JD with 30 unmatched skills
+will burn $0.40+ on one request. Use ``enrich_unmatched_skills_batched``
+in the hot path; ``enrich_new_skill`` is reserved for the v3 background
+pipeline.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, cast
 
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from cost_tracker import CostAccumulator
+    from skill_library_repository import SkillLibraryRepository
 
 from skill_driven_dim_gen import SkillDrivenDimGenAgent
 from skill_library_v3.agents.containment import Stage6ContainmentAgent
@@ -48,7 +56,7 @@ from skill_library_v3.schemas.enrichment import (
 )
 from skill_library_v3.schemas.placement import PlacedSkill
 from skill_library_v3.schemas.relationships import SkillRelationships
-from skill_library_v3.schemas.typology import TypedSkill
+from skill_library_v3.schemas.typology import SkillType, TYPOLOGY_VALUES, TypedSkill
 from skill_library_v3.skill_similarity import top_k_similar_skills
 
 logger = logging.getLogger(__name__)
@@ -378,6 +386,264 @@ async def _run_enrichment(
         ),
         warnings,
     )
+
+
+def _typology_type_from_skill_nature(skill_nature: str | None) -> SkillType:
+    """Map a stored canonical skill_nature (DB enum) back to a Stage 4 typology
+    label. Falls back to "Concept" when no enum row maps to the value."""
+    target = (skill_nature or "").strip().upper()
+    for label in TYPOLOGY_VALUES:
+        if map_type_to_skill_nature(label) == target:
+            return cast(SkillType, label)
+    return "Concept"
+
+
+def _apply_canonical_skill_enrichment_to_db(
+    repo: "SkillLibraryRepository",
+    *,
+    skill_id: int,
+    display_name: str,
+    meta: NewSkillMetaV3,
+    typical_lifespan: str,
+) -> bool:
+    """Persist Stage 7 enrichment + Stage 4 typing onto an EXISTING canonical
+    skill row (volatility/vendor/license/year_introduced/maturity_reasoning/
+    version_strategy/version_tag/confidence/typical_lifespan + VERSION aliases
+    + skill_tags).
+
+    Returns True if ``canonical_skills`` enrichment columns were updated.
+    """
+    enr = meta.enrichment
+    derived = meta.derived
+    typed = meta.typed
+
+    if enr and enr.maturity:
+        volatility = map_maturity_to_volatility(enr.maturity.maturity)
+    elif derived is not None:
+        volatility = str(derived.volatility or "STABLE")
+    else:
+        volatility = "STABLE"
+
+    vendor: str | None = None
+    license_value: str | None = None
+    year_introduced: int | None = None
+    maturity_reasoning: str | None = None
+    version_strategy = "NOT_APPLICABLE"
+    version_tag: str | None = None
+
+    if enr is not None:
+        vl = enr.vendor_license
+        vendor = (str(vl.vendor).strip() if vl.vendor else None) or None
+        if vl.license is not None:
+            license_value = str(getattr(vl.license, "value", vl.license)).strip().lower()
+        year_introduced = vl.year_introduced
+        if enr.maturity:
+            maturity_reasoning = enr.maturity.reasoning
+        ver = enr.versioning
+        version_strategy = map_versioned_to_strategy(bool(ver.versioned))
+        version_tag = (
+            str(ver.current_version).strip() if ver.current_version else None
+        )
+
+    confidence = float(typed.confidence) if typed is not None else 0.7
+    confidence = max(0.0, min(1.0, confidence))
+
+    tl = typical_lifespan
+    if derived is not None and getattr(derived, "typical_lifespan", None):
+        tl = str(derived.typical_lifespan)
+
+    enrichment_row_ok = False
+    try:
+        repo.update_canonical_skill_enrichment_v3(
+            skill_id,
+            volatility=volatility,
+            vendor=vendor,
+            license_value=license_value,
+            year_introduced=year_introduced,
+            maturity_reasoning=maturity_reasoning,
+            version_strategy=version_strategy,
+            version_tag=version_tag,
+            confidence=confidence,
+            typical_lifespan=tl,
+        )
+        enrichment_row_ok = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "update_canonical_skill_enrichment_v3 failed for skill_id=%s: %s",
+            skill_id, exc,
+        )
+
+    if enr is not None and enr.versioning and enr.versioning.version_aliases:
+        disp_lc = display_name.strip().lower()
+        va_keys: list[str] = []
+        for k in enr.versioning.version_aliases.keys():
+            kk = str(k).strip()
+            if not kk or kk.lower() == disp_lc:
+                continue
+            va_keys.append(kk)
+        if va_keys:
+            try:
+                repo.add_aliases(
+                    [(skill_id, k) for k in va_keys],
+                    alias_type="VERSION",
+                    match_strategy="CASE_INSENSITIVE",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "VERSION aliases insert failed skill_id=%s: %s",
+                    skill_id, exc,
+                )
+
+    if enr is not None and enr.context_keywords and enr.context_keywords.context_keywords:
+        try:
+            repo.add_skill_tags(skill_id, list(enr.context_keywords.context_keywords))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("skill_tags insert failed skill_id=%s: %s", skill_id, exc)
+
+    return enrichment_row_ok
+
+
+async def enrich_one_existing_canonical_skill(
+    repo: "SkillLibraryRepository",
+    *,
+    skill_id: int,
+    cost_acc: "CostAccumulator | None" = None,
+) -> bool:
+    """Run Stage 7 enrichment + persistence for ONE existing canonical_skills row.
+
+    Fetches the skill's slug/display_name/skill_nature from the DB, fires
+    ``_run_enrichment`` (5 Stage 7 sub-agents in parallel), and persists the
+    result via ``_apply_canonical_skill_enrichment_to_db`` + skill_tags.
+
+    Returns True on successful enrichment-row write, False on skip/error.
+
+    Intended callers: nightly backfill cron, manual catch-up runs, admin UI
+    buttons. NOT for API 1/2/3 hot paths — each call fires 5 LLM sub-agents
+    (~$0.005/skill). A JD with N unmatched skills × this helper = N × 5 LLM
+    calls, which is the exact leak we deliberately closed in API 2.
+    """
+    detail = repo.get_skill_detail(int(skill_id))
+    if not detail:
+        return False
+    slug = str(detail.get("slug") or "").strip()
+    display_name = str(detail.get("display_name") or "").strip()
+    if not slug or not display_name:
+        return False
+
+    type_label = _typology_type_from_skill_nature(detail.get("skill_nature"))
+    skill_payload = {
+        "skill_id": slug,
+        "name": display_name,
+        "type": type_label,
+        "subtype": "general",
+        "primary_dimension": "general",
+    }
+    enrichment, _warnings = await _run_enrichment(skill_payload, accumulator=cost_acc)
+    if enrichment is None:
+        return False
+
+    raw_conf = detail.get("confidence")
+    try:
+        confidence = float(raw_conf) if raw_conf is not None else 0.85
+    except (TypeError, ValueError):
+        confidence = 0.85
+    confidence = max(0.0, min(1.0, confidence))
+
+    typed = TypedSkill(
+        skill_id=slug,
+        name=display_name,
+        type=type_label,
+        subtype="general",
+        confidence=confidence,
+        reasoning=(
+            "Backfill: existing canonical skill had no catalog context tags "
+            "(skill_tags); ran Stage 7 enrichment to populate tags and "
+            "related fields."
+        ),
+        alternatives_considered=[],
+    )
+    derived = _derive_legacy_fields(typed=typed, enrichment=enrichment)
+    meta = NewSkillMetaV3(
+        skill_id=typed.skill_id,
+        typed=typed,
+        enrichment=enrichment,
+        derived=derived,
+    )
+    tl = str(derived.typical_lifespan or "EVERGREEN")
+    return _apply_canonical_skill_enrichment_to_db(
+        repo,
+        skill_id=int(skill_id),
+        display_name=display_name,
+        meta=meta,
+        typical_lifespan=tl,
+    )
+
+
+async def enrich_unmatched_skills_batched(
+    planner: Any,
+    skill_names: list[str],
+) -> dict[str, NewSkillMetaV3]:
+    """API-2-hot-path replacement for the per-skill ``enrich_new_skill`` loop.
+
+    Fires a single ``planner.enrich_new_skills(skill_names)`` call
+    (gpt-4o-mini, fast tier) covering all unmatched skills at once and
+    returns one ``NewSkillMetaV3`` per skill populated with derived
+    category / sub_category / skill_nature / typical_lifespan only.
+
+    Stage 2 dim-gen, Stage 3 reconciler, and Stage 7 sub-agents are
+    intentionally NOT run — those are the per-skill 6+ LLM-call sub-stages
+    that turned a 30-unmatched-skill JD into a $0.40 request. They are
+    deferred to the v3 background pipeline (which fires for Case NEW) or
+    a separate per-skill backfill cron.
+
+    Cost: ~$0.001 total, regardless of skill count.
+    Returns: ``{skill_name: NewSkillMetaV3}`` for every input skill, even
+    if the LLM batched response drops some entries — missing fields fall
+    back to safe defaults so the API 2 response never silently loses a
+    skill.
+    """
+    if not skill_names:
+        return {}
+
+    try:
+        enrich_map = await planner.enrich_new_skills(skill_names)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[batched_enrich] planner.enrich_new_skills failed for %d skills: %s",
+            len(skill_names), exc,
+        )
+        enrich_map = {}
+
+    out: dict[str, NewSkillMetaV3] = {}
+    for skill_name in skill_names:
+        info = enrich_map.get(skill_name) or {}
+        category = (info.get("category") or "").strip() or "Other"
+        sub_category = (info.get("sub_category") or "").strip() or "general"
+        nature = (info.get("skill_nature") or "").strip().upper() or "TOOL"
+        lifespan = (info.get("typical_lifespan") or "").strip().upper() or "MULTI_YEAR"
+        # Volatility / version_strategy: derive deterministically from lifespan.
+        # SHORT_LIVED → fast-moving; MULTI_YEAR → stable; EVERGREEN → very stable.
+        if lifespan == "SHORT_LIVED":
+            volatility = "FAST"
+            version_strategy = "VERSIONED"
+        elif lifespan == "EVERGREEN":
+            volatility = "STABLE"
+            version_strategy = "UNVERSIONED"
+        else:
+            volatility = "MEDIUM"
+            version_strategy = "UNVERSIONED"
+        out[skill_name] = NewSkillMetaV3(
+            skill_id=_make_skill_id(skill_name),
+            derived=DerivedLegacyFields(
+                category=category,
+                sub_category=sub_category,
+                skill_nature=nature,
+                volatility=volatility,
+                typical_lifespan=lifespan,
+                version_strategy=version_strategy,
+            ),
+        )
+    return out
 
 
 async def enrich_new_skill(

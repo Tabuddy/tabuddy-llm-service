@@ -1085,7 +1085,13 @@ def _fetch_latest_role_card_run(cur, role_slug: str) -> dict | None:
 
 
 def list_recent_runs(limit: int = 20) -> list[dict]:
-    """Last N Stage 0 runs for the UI's recent-runs lane.
+    """Last N Stage 0 runs for the UI's recent-runs lane, deduped to ONE
+    row per role (the latest Stage 0 run per role).
+
+    Without the dedupe, every Case NEW auto-fire or operator-initiated
+    rerun creates another v2_run_log row → same role shows up multiple
+    times in the UI list. Audit trail in v2_run_log is preserved; only the
+    UI presentation collapses duplicates.
 
     Each row also carries ``stage8_complete`` — True when the same role has
     an approved Stage 8 (catalog-load) run, signalling the full pipeline
@@ -1096,22 +1102,29 @@ def list_recent_runs(limit: int = 20) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT v.run_id, v.role_id, v.role_display, v.status,
-                       v.started_at, v.completed_at,
+                WITH latest_per_role AS (
+                    SELECT DISTINCT ON (v.role_id)
+                           v.run_id, v.role_id, v.role_display, v.status,
+                           v.started_at, v.completed_at
+                      FROM v2_run_log v
+                     WHERE v.prompt_version LIKE %s
+                     ORDER BY v.role_id, v.started_at DESC NULLS LAST
+                )
+                SELECT lpr.run_id, lpr.role_id, lpr.role_display, lpr.status,
+                       lpr.started_at, lpr.completed_at,
                        EXISTS (
                            SELECT 1 FROM v2_run_log s8
-                            WHERE s8.role_id = v.role_id
+                            WHERE s8.role_id = lpr.role_id
                               AND s8.prompt_version LIKE %s
                               AND s8.status = 'approved'
                        ) AS stage8_complete
-                  FROM v2_run_log v
-                 WHERE v.prompt_version LIKE %s
-                 ORDER BY v.started_at DESC NULLS LAST
+                  FROM latest_per_role lpr
+                 ORDER BY lpr.started_at DESC NULLS LAST
                  LIMIT %s
                 """,
                 (
-                    STAGE8_PROMPT_VERSION_PREFIX + "%",
                     CHARTER_PROMPT_VERSION_PREFIX + "%",
+                    STAGE8_PROMPT_VERSION_PREFIX + "%",
                     int(limit),
                 ),
             )

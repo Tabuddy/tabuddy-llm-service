@@ -7,19 +7,31 @@ Stage 5 applies the consequences: rolling-mean centroid update + audit rows.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal
 
+from excel_role_resolver import (
+    resolve_via_excel as _resolve_via_excel,
+    upsert_excel_role as _upsert_excel_role,
+)
 from jd_similarity_matcher import RoleSignal, Stage3Result
+from skill_library_v3.db.repository import slugify as _slugify_canonical
+
+_logger = logging.getLogger(__name__)
 
 
 # ── Tunable constants ────────────────────────────────────────────────────────
 
-# With Stage 3c using MAX-per-role aggregation, real KRA top scores range
-# from ~0.35 (weak alignment) to ~0.55 (very strong). KRA_MIN_SCORE acts as
-# the "the JD's R&R aligns with this role's KRAs at all" floor; below it,
-# no classification is attempted.
-KRA_MIN_SCORE: float = 0.40
+# Stage 3c now uses mean-of-top-3 per-sentence scoring (not MAX).
+# Observed score ranges with descriptive KRA texts + mean-of-top-3:
+#   ~0.40 (weak / wrong role)  →  ~0.65 (strong / correct role)
+# KRA_MIN_SCORE: floor below which no classification is attempted.
+# KRA_MARGIN_DEFAULT: minimum gap between #1 and #2 role scores required
+#   to classify without LLM2; mean-of-top-3 naturally widens margins so
+#   0.05 remains a reasonable floor.
+# KRA_TIE_BAND: scores within this band are treated as a statistical tie → Case F.
+KRA_MIN_SCORE: float = 0.45
 KRA_MARGIN_DEFAULT: float = 0.05
 KRA_MARGIN_ON_COLLISION: float = 0.08
 KRA_TIE_BAND: float = 0.02
@@ -27,10 +39,8 @@ SKILL_TIE_BAND: float = 0.05
 LLM2_MIN_CONFIDENCE: float = 0.70
 
 # Gap #6 bypass: when alias is an exact match and skill agrees with it at
-# moderate confidence, skip KRA gating entirely. KRA is noisy because R&R
-# blocks rarely overlap precisely with stored KRAs even after Stage 3c uses
-# MAX aggregation. This bypass prevents valid classifications from being
-# queued when the JD title + skill list make the role unambiguous.
+# moderate confidence, skip KRA gating entirely. Prevents valid classifications
+# from being queued when the JD title + skill list make the role unambiguous.
 ALIAS_EXACT_MIN_SCORE: float = 0.95
 SKILL_WITNESS_MIN_SCORE: float = 0.50
 
@@ -59,7 +69,94 @@ STAGE1_EMBEDDING_THRESHOLD: float = 0.70
 
 # ── Data models ──────────────────────────────────────────────────────────────
 
-CaseLiteral = Literal["A", "B", "C", "D", "E", "F"]
+CaseLiteral = Literal["A", "B", "C", "D", "E", "F", "NEW", "EXCEL_NEW"]
+
+
+def _slugify_for_new_role(text: str) -> str:
+    # Mirrors skill_library_v3.db.repository.slugify so the UI preview slug
+    # matches what v3's upsert_role will actually persist.
+    out: list[str] = []
+    last_dash = False
+    for ch in (text or "").strip().lower():
+        if ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif ch in (" ", "-", "_", "\\", ".", ",", "/", "+"):
+            if not last_dash and out:
+                out.append("-")
+                last_dash = True
+    return "".join(out).strip("-") or "unknown"
+
+
+async def _attempt_excel_classification(
+    *,
+    jd_title: str,
+    r_and_r_text: str,
+    r_and_r_embedding: list[float] | None,
+    role_name_input: str,
+    cost_acc=None,
+) -> "Stage4Decision | None":
+    """Try to classify the JD into a generalized Excel-taxonomy role before
+    synthesizing a brand-new one. Returns a Stage4Decision with
+    case='EXCEL_NEW' when the resolver finds a high-confidence match AND the
+    shell-row upsert succeeds. Returns None otherwise so the caller falls
+    through to the existing Case NEW synth path.
+
+    The returned decision still sets `is_new_role=True` and
+    `new_role_display_name` to the *Excel canonical* role name (NOT the
+    verbatim JD title), so main.py's downstream v3 dispatch enriches the
+    correct catalog row in the background.
+    """
+    if not r_and_r_embedding:
+        return None
+    try:
+        result = await _resolve_via_excel(
+            jd_title=jd_title,
+            r_and_r_text=r_and_r_text,
+            r_and_r_embedding=r_and_r_embedding,
+            cost_acc=cost_acc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("[stage4/excel] resolver raised: %s", exc)
+        return None
+
+    if result.matched_entry is None:
+        return None
+
+    entry = result.matched_entry
+    role_id = _upsert_excel_role(entry)
+    if role_id is None:
+        _logger.warning(
+            "[stage4/excel] upsert returned None for role=%r — falling through to synth",
+            entry.role,
+        )
+        return None
+
+    slug = _slugify_canonical(entry.role)
+    chosen = RoleSignal(
+        role_id=role_id,
+        slug=slug,
+        display_name=entry.role,
+        score=result.confidence,
+        signal_type="excel_match",
+    )
+    return Stage4Decision(
+        case="EXCEL_NEW",
+        chosen_role=chosen,
+        confidence=result.confidence,
+        llm2_fired=False,
+        llm2_reasoning=None,
+        alias_collision_detected=False,
+        queued=False,
+        reasoning=(
+            f"JD title '{role_name_input}' not in catalog; Excel taxonomy "
+            f"matched '{entry.role}' (confidence {result.confidence:.2f}): "
+            f"{result.reasoning}"
+        ),
+        is_new_role=True,
+        new_role_display_name=entry.role,
+        new_role_slug=slug,
+    )
 
 
 @dataclass
@@ -72,6 +169,9 @@ class Stage4Decision:
     alias_collision_detected: bool
     queued: bool
     reasoning: str
+    is_new_role: bool = False
+    new_role_display_name: str | None = None
+    new_role_slug: str | None = None
 
 
 @dataclass
@@ -226,6 +326,44 @@ class Stage5Updates:
 
 # ── Stage 4: Decision Routing ────────────────────────────────────────────────
 
+_ALIAS_MULTI_TIE_THRESHOLD: int = 3
+
+
+def _alias_multi_tie(alias: list[RoleSignal]) -> list[RoleSignal] | None:
+    """Detect the "multiple roles claim the same JD title at 1.0" pattern.
+
+    The Stage 3b alias table over-includes generic titles ("Software Engineer"
+    is listed as an alias for backend-engineer, ar-vr-engineer, and
+    game-developer simultaneously). When the same JD title hits 3+ catalog
+    roles all at score 1.0, the alias signal is ambiguous noise — NOT
+    authority. Returns the tied cohort (so callers can fire LLM2 over it),
+    or None when there's no multi-tie.
+    """
+    if len(alias) < _ALIAS_MULTI_TIE_THRESHOLD:
+        return None
+    top_score = alias[0].score
+    if top_score < ALIAS_EXACT_MIN_SCORE:
+        return None
+    tied = [a for a in alias if a.score >= ALIAS_EXACT_MIN_SCORE]
+    if len(tied) < _ALIAS_MULTI_TIE_THRESHOLD:
+        return None
+    return tied
+
+
+def _dedupe_by_role_id(*signals: RoleSignal | None) -> list[RoleSignal]:
+    """Build a deduplicated candidate list preserving order; drops None."""
+    seen: set[int | None] = set()
+    out: list[RoleSignal] = []
+    for s in signals:
+        if s is None:
+            continue
+        if s.role_id in seen:
+            continue
+        seen.add(s.role_id)
+        out.append(s)
+    return out
+
+
 async def stage4_route_decision(
     s3: Stage3Result,
     r_and_r_text: str,
@@ -234,450 +372,276 @@ async def stage4_route_decision(
     stage1_resolved: Stage1RoleResolution | None = None,
     llm2_fn: Llm2Fn | None = None,
 ) -> Stage4Decision:
-    """Route a Stage 3 result into one of the 6 cases.
+    """Body-driven Stage 4 routing — skill + KRA are the primary decision
+    signals; the verbatim JD title is advisory-only.
 
-    When ``stage1_resolved`` is provided (Stage 1's verbatim role title
-    canonically resolves), it is the FIRST discriminator — Stage 4 will
-    short-circuit to Case A or Case D using that resolution rather than
-    fall through to Stage 3b's trigram-noisy alias scores.
+    Decision tree (top-down):
 
-    Pure-logic Cases A/B/C/E never call llm2_fn. Cases D/F call it with the
-    candidate roles + R&R text and return its choice (or queue if its
-    confidence is below LLM2_MIN_CONFIDENCE).
+      1. Multi-alias-tie (3+ roles share the JD title at score 1.0) → fire
+         LLM2 over the tied alias cohort. The shared title can't itself
+         disambiguate; let LLM2 read the JD R&R and pick.
+
+      2. Skill+KRA convergence (top_skill.role_id == top_kra.role_id AND
+         kra_top.score >= KRA_MIN_SCORE) → Case A. Alias becomes advisory
+         (audited if it disagrees).
+
+      3. Skill-confident + KRA-noisy (top_skill.score >= 0.50 AND KRA
+         margin tight) → Case B skill-led.
+
+      4. KRA-only signal (kra_top.score >= KRA_MIN_SCORE AND skill_top
+         absent/weak < 0.20). If KRA top-2 within KRA_TIE_BAND, fire LLM2
+         over the tied KRA cohort. Otherwise Case B KRA-led.
+
+      5. Single alias hit (alias_top.score >= ALIAS_EXACT_MIN_SCORE,
+         non-multi-tie) AND candidates differ → fire LLM2 with [alias,
+         kra_top, skill_top] dedup'd. Alias is a candidate, not the answer.
+
+      6. No usable signal (KRA + skill both weak) → Excel intercept; if
+         Excel also returns None, synth Case NEW.
+
+      7. Fallback → LLM2 over [kra_top, skill_top] dedup'd, or queue.
+
+    The Stage-1 verbatim role title is intentionally NOT consulted as a
+    decision driver. It's still computed (for audit logs / Excel intercept
+    JD title) but doesn't gate any branch.
+
+    Pure-logic branches (cases 2, 3, 4-non-tied) never call llm2_fn. Cases
+    1, 4-tied, 5, 7 fire LLM2.
     """
+    # stage1_resolved is intentionally ignored in routing (body-driven mode).
+    # We still accept the kwarg for backwards compatibility with callers.
+    _ = stage1_resolved
     skill = s3.skill_match_roles
     alias = s3.alias_match_roles
     kra = s3.kra_match_roles
 
     top_skill = skill[0] if skill else None
     top_alias = alias[0] if alias else None
-    alias_collision = len({a.role_id for a in alias}) > 1
+    top_kra = kra[0] if kra else None
+    top_kra_score = top_kra.score if top_kra else 0.0
+    second_kra_score = kra[1].score if len(kra) > 1 else 0.0
+    kra_margin = top_kra_score - second_kra_score
 
-    # ── Stage-1-priority branch (NEW) ─────────────────────────────────────────
-    # Stage 1 already extracted a verbatim role title and we exact-matched it
-    # against the canonical catalog. If that match exists, it is the highest-
-    # signal source we have — overrides the trigram alias noise that Stage 3b
-    # can produce on shared substrings like "engineer".
-    if stage1_resolved is not None:
-        s1_role = RoleSignal(
-            role_id=stage1_resolved.role_id,
-            slug=stage1_resolved.slug,
-            display_name=stage1_resolved.display_name,
-            score=1.0,
-            signal_type="stage1_match",
-        )
-        matching_kra = next(
-            (r for r in kra if r.role_id == stage1_resolved.role_id),
-            None,
-        )
-        if matching_kra is not None and matching_kra.score >= KRA_MIN_SCORE:
-            return Stage4Decision(
-                case="A",
-                chosen_role=s1_role,
-                confidence=matching_kra.score,
-                llm2_fired=False,
-                llm2_reasoning=None,
-                alias_collision_detected=False,
-                queued=False,
-                reasoning=(
-                    f"Stage 1 title '{stage1_resolved.display_name}' "
-                    f"({stage1_resolved.match_kind} match"
-                    + (f", sim {stage1_resolved.similarity:.2f}" if stage1_resolved.similarity is not None else "")
-                    + f"); KRA agrees ({matching_kra.score:.2f})"
-                ),
-            )
-        if kra and kra[0].role_id != stage1_resolved.role_id:
-            # Stage 1 names role X, KRA tops role Y → LLM2 tie-break with
-            # BOTH candidates so the title-suggested role is seen.
-            return await _resolve_via_llm2(
-                case="D",
-                tied_candidates=[s1_role, kra[0]],
-                r_and_r_text=r_and_r_text,
-                llm2_fn=llm2_fn,
-                alias_collision=True,
-                queue_reason="llm2_unsure",
-            )
-        # KRA list is empty or none of it matches Stage 1's role — classify
-        # by Stage 1 anyway with a confidence haircut.
-        return Stage4Decision(
-            case="A",
-            chosen_role=s1_role,
-            confidence=0.80,
-            llm2_fired=False,
-            llm2_reasoning=None,
-            alias_collision_detected=False,
-            queued=False,
-            reasoning=(
-                f"Stage 1 title '{stage1_resolved.display_name}' "
-                f"({stage1_resolved.match_kind} match"
-                + (f", sim {stage1_resolved.similarity:.2f}" if stage1_resolved.similarity is not None else "")
-                + "); KRA inconclusive"
-            ),
-        )
+    r_and_r_embedding = getattr(s3, "r_and_r_embedding", None)
 
-    # ── Trigram-noise filter (NEW) ────────────────────────────────────────────
-    # When Stage 1's title did NOT canonically resolve AND the fuzzy alias
-    # signal points at a DIFFERENT role than the KRA top, Stage 3b is most
-    # likely returning substring noise (e.g., "AI Engineer" trigram-matches
-    # "ar-vr-engineer" 0.71 because both contain "engineer", while the real
-    # nearest role by KRA is ai-compliance-officer). Treat alias as absent.
-    #
-    # If the fuzzy alias top AGREES with KRA top, it is corroborating
-    # evidence — keep it so consensus checks (Cases A/C) can still fire.
-    if (
-        stage1_resolved is None
-        and top_alias is not None
-        and top_alias.score < ALIAS_EXACT_MIN_SCORE
-        and kra
-        and top_alias.role_id != kra[0].role_id
-    ):
-        alias = []
-        top_alias = None
-        alias_collision = False
-
-    # ── Alias + skill consensus bypass (gap #6) ───────────────────────────────
-    # When KRA is too weak / too noisy to gate on (would route to Case E),
-    # BUT the JD title is an exact alias hit AND skills independently agree,
-    # classify confidently. Lets clear classifications through when KRA is
-    # the only weak signal.
-    second_kra = kra[1].score if len(kra) > 1 else 0.0
-    top_kra_score = kra[0].score if kra else 0.0
-    kra_margin = top_kra_score - second_kra
-    required_margin = (
-        KRA_MARGIN_ON_COLLISION if alias_collision else KRA_MARGIN_DEFAULT
-    )
-    kra_would_queue = (
-        not kra
-        or top_kra_score < KRA_MIN_SCORE
-        or kra_margin < required_margin
-    )
-    alias_exact_and_skill_agrees = (
-        top_alias is not None
-        and top_alias.score >= ALIAS_EXACT_MIN_SCORE
-        and top_skill is not None
-        and top_skill.role_id == top_alias.role_id
-        and top_skill.score >= SKILL_WITNESS_MIN_SCORE
-    )
-    if kra_would_queue and alias_exact_and_skill_agrees:
-        return Stage4Decision(
-            case="A",
-            chosen_role=top_alias,
-            confidence=top_alias.score * 0.9,
-            llm2_fired=False,
-            llm2_reasoning=None,
-            alias_collision_detected=False,
-            queued=False,
-            reasoning=(
-                f"Alias exact ({top_alias.score:.2f}) + skill agrees "
-                f"({top_skill.score:.2f}) on {top_alias.slug}; "
-                f"KRA weak/noisy -> bypass"
-            ),
-        )
-
-    # ── Pre-margin convergence (fix A): when signals agree, classify before
-    # margin gate has a chance to queue. ─────────────────────────────────────
-    skill_tied = (
-        len(skill) >= 2
-        and (skill[0].score - skill[1].score) < SKILL_TIE_BAND
-    )
-
-    # Case A early: all 3 top point at the same role (and skill not tied).
-    if (
-        kra
-        and top_kra_score >= KRA_MIN_SCORE
-        and top_skill is not None
-        and top_alias is not None
-        and not skill_tied
-        and top_skill.role_id == top_alias.role_id == kra[0].role_id
-    ):
-        return Stage4Decision(
-            case="A",
-            chosen_role=kra[0],
-            confidence=kra[0].score,
-            llm2_fired=False,
-            llm2_reasoning=None,
-            alias_collision_detected=False,
-            queued=False,
-            reasoning=f"All 3 signals top-rank {kra[0].slug}",
-        )
-
-    # Case C early: skill tied + alias and KRA agree on the same role.
-    if (
-        kra
-        and top_kra_score >= KRA_MIN_SCORE
-        and skill_tied
-        and top_alias is not None
-        and top_alias.role_id == kra[0].role_id
-    ):
-        return Stage4Decision(
-            case="C",
-            chosen_role=kra[0],
-            confidence=kra[0].score,
-            llm2_fired=False,
-            llm2_reasoning=None,
-            alias_collision_detected=False,
-            queued=False,
-            reasoning=(
-                f"Skill scores tied ({skill[0].score:.2f} vs {skill[1].score:.2f}); "
-                f"alias+KRA agree on {kra[0].slug}"
-            ),
-        )
-
-    # Case D priority (fix B): alias is an exact hit but disagrees with KRA
-    # top. Force LLM2 with [alias_role, kra_top] so the alias-suggested role
-    # is in the candidate set — even when KRA top-2 happen to be tied.
-    if (
-        kra
-        and top_kra_score >= KRA_MIN_SCORE
-        and top_alias is not None
-        and top_alias.score >= ALIAS_EXACT_MIN_SCORE
-        and top_alias.role_id != kra[0].role_id
-    ):
+    # ── Branch 1: multi-alias-tie → LLM2 disambiguation ───────────────────────
+    # 3+ catalog roles share the JD title at score 1.0 — the title is
+    # ambiguous noise. Let LLM2 read the JD body and pick from the cohort.
+    tied_alias_cohort = _alias_multi_tie(alias)
+    if tied_alias_cohort is not None:
         return await _resolve_via_llm2(
             case="D",
-            tied_candidates=[top_alias, kra[0]],
+            tied_candidates=tied_alias_cohort,
             r_and_r_text=r_and_r_text,
             llm2_fn=llm2_fn,
             alias_collision=True,
-            queue_reason="llm2_unsure",
+            queue_reason="multi_alias_tie",
         )
 
-    # ── Hard gates first (Case E) ─────────────────────────────────────────────
-    if not kra:
-        return _queue("E", reason="no_kra_signal",
-                      detail="no KRA results")
-    top_kra = kra[0]
-    if top_kra.score < KRA_MIN_SCORE:
-        # Skill_top fallback: KRA is noisy but skill profile may clearly
-        # identify a canonical role. Generalize "designation" titles (e.g.,
-        # 'Applications Development Programmer Analyst' has skill_top=
-        # backend-engineer 0.27) into the skill_top role rather than queue
-        # → prevents v3 from firing for corporate-jargon titles.
-        if (
-            stage1_resolved is None
-            and top_skill is not None
-            and top_skill.score >= 0.20
-        ):
+    # ── Branch 1.5: single unambiguous alias hit → trust it ──────────────────
+    # When EXACTLY one role has alias score >= ALIAS_EXACT_MIN_SCORE (1.0)
+    # AND skill_top either agrees with it OR is too weak (< 0.20) to
+    # contradict, classify by that alias. Catches the common case where
+    # nano correctly identified a catalog role but skill/KRA matching is
+    # weak because the role's canonical_skills/KRAs aren't enriched yet
+    # (freshly-imported shell rows). Without this, body-driven branches
+    # 2-4 fall to a wrong nearest-neighbor when alias points to a
+    # correctly-imported-but-not-enriched role.
+    exact_alias_hits = [a for a in alias if a.score >= ALIAS_EXACT_MIN_SCORE]
+    if len(exact_alias_hits) == 1:
+        alias_pick = exact_alias_hits[0]
+        skill_consents = (
+            top_skill is None
+            or top_skill.score < 0.20
+            or top_skill.role_id == alias_pick.role_id
+        )
+        if skill_consents:
             return Stage4Decision(
-                case="B",
-                chosen_role=top_skill,
-                confidence=top_skill.score,
+                case="A",
+                chosen_role=alias_pick,
+                confidence=alias_pick.score,
                 llm2_fired=False,
                 llm2_reasoning=None,
                 alias_collision_detected=False,
                 queued=False,
                 reasoning=(
-                    f"Stage 1 title '{role_name_input}' is unmapped "
-                    f"(designation?); KRA inconclusive "
-                    f"({top_kra.score:.2f}). Skill profile points at "
-                    f"{top_skill.slug} ({top_skill.score:.2f}) - generalize."
+                    f"Exact alias hit on {alias_pick.slug} (1.0) — no other alias "
+                    f"at this confidence; skill_top "
+                    f"{(top_skill.slug + ' ' + f'{top_skill.score:.2f}') if top_skill else 'absent'} "
+                    f"does not contradict"
                 ),
             )
-        return _queue("E", reason="low_kra",
-                      detail=f"top KRA {top_kra.score:.2f} < {KRA_MIN_SCORE}")
 
-    second_kra = kra[1].score if len(kra) > 1 else 0.0
-    margin = top_kra.score - second_kra
-    required_margin = (
-        KRA_MARGIN_ON_COLLISION if alias_collision else KRA_MARGIN_DEFAULT
-    )
-    if margin < KRA_TIE_BAND:
-        # Case F: top KRA candidates are statistically indistinguishable.
-        # Fire LLM2 tie-breaker over the tied cohort.
-        tied_candidates = _tied_cohort(kra, KRA_TIE_BAND)
-        return await _resolve_via_llm2(
-            case="F",
-            tied_candidates=tied_candidates,
-            r_and_r_text=r_and_r_text,
-            llm2_fn=llm2_fn,
-            alias_collision=False,
-            queue_reason="llm2_unsure",
-        )
-    if margin < required_margin:
-        # When the JD title doesn't canonically resolve (stage1_resolved=None),
-        # the small_margin gate would otherwise queue. Instead classify into
-        # the KRA top — the JD will get a best-effort answer for downstream
-        # consumers, and v3 will independently materialize the real role.
-        if stage1_resolved is None and top_kra_score >= KRA_MIN_SCORE:
-            # When skill_top has meaningful confidence AND disagrees with
-            # kra_top, route through LLM2 rather than blindly pick kra_top.
-            # Prevents "Senior Java Backend Developer" → android-engineer
-            # (KRA top wrong because Java is over-associated with android in
-            # the canonical_skills catalog).
-            #
-            # Gate: max(0.20 absolute, 50% of kra_top.score). Combines a
-            # noise floor with a relative-strength check so it adapts to
-            # the catalog's actual scoring distribution.
-            skill_vs_kra_gate = max(0.20, 0.5 * top_kra_score)
-            if (
-                top_skill is not None
-                and top_skill.score >= skill_vs_kra_gate
-                and top_skill.role_id != kra[0].role_id
-            ):
-                return await _resolve_via_llm2(
-                    case="D",
-                    tied_candidates=[top_skill, kra[0]],
-                    r_and_r_text=r_and_r_text,
-                    llm2_fn=llm2_fn,
-                    alias_collision=False,
-                    queue_reason="llm2_unsure",
-                )
-            return Stage4Decision(
-                case="B",
-                chosen_role=kra[0],
-                confidence=kra[0].score,
-                llm2_fired=False,
-                llm2_reasoning=None,
-                alias_collision_detected=True,
-                queued=False,
-                reasoning=(
-                    f"Stage 1 title '{role_name_input}' not in catalog; "
-                    f"KRA top-2 within margin -> classify into nearest "
-                    f"neighbor {kra[0].slug} ({kra[0].score:.2f})"
-                ),
-            )
-        # Skill_top fallback (same generalization rule as the low_kra gate):
-        # if stage1 unresolved AND skill_top points at an existing role with
-        # decent confidence, classify by skill rather than queue + fire v3.
-        if (
-            stage1_resolved is None
-            and top_skill is not None
-            and top_skill.score >= 0.20
-        ):
-            return Stage4Decision(
-                case="B",
-                chosen_role=top_skill,
-                confidence=top_skill.score,
-                llm2_fired=False,
-                llm2_reasoning=None,
-                alias_collision_detected=False,
-                queued=False,
-                reasoning=(
-                    f"Stage 1 title '{role_name_input}' is unmapped; "
-                    f"KRA margin too small. Skill profile points at "
-                    f"{top_skill.slug} ({top_skill.score:.2f}) - generalize."
-                ),
-            )
-        return _queue("E", reason="small_margin",
-                      detail=f"KRA margin {margin:.2f} < {required_margin}")
-
-    # ── Signal convergence ────────────────────────────────────────────────────
-    skill_tied = (
-        len(skill) >= 2
-        and (skill[0].score - skill[1].score) < SKILL_TIE_BAND
-    )
-
-    # Case C: skill scores tied (cannot discriminate) but alias+KRA agree
-    # → classify by KRA. Must check this *before* Case A because skill_top
-    # may coincide with the tied-cohort winner.
-    if (
-        skill_tied
-        and top_alias is not None
-        and top_alias.role_id == top_kra.role_id
-    ):
-        return Stage4Decision(
-            case="C",
-            chosen_role=top_kra,
-            confidence=top_kra.score,
-            llm2_fired=False,
-            llm2_reasoning=None,
-            alias_collision_detected=False,
-            queued=False,
-            reasoning=(
-                f"Skill scores tied "
-                f"(top {skill[0].score:.2f} vs {skill[1].score:.2f}); "
-                f"alias+KRA agree on {top_kra.slug}"
-            ),
-        )
-
-    # Case A: all 3 agree (and skill not tied)
+    # ── Branch 2: skill+KRA convergence → Case A ──────────────────────────────
+    # When skill_top and kra_top agree AND KRA has a meaningful signal,
+    # classify directly. Alias is logged but doesn't gate.
     if (
         top_skill is not None
-        and top_alias is not None
-        and top_skill.role_id == top_alias.role_id == top_kra.role_id
+        and top_kra is not None
+        and top_skill.role_id == top_kra.role_id
+        and top_kra_score >= KRA_MIN_SCORE
     ):
+        alias_note = ""
+        if top_alias is not None:
+            if top_alias.role_id == top_kra.role_id:
+                alias_note = f"; alias agrees ({top_alias.slug})"
+            else:
+                alias_note = f"; alias differs (advisory: {top_alias.slug})"
         return Stage4Decision(
             case="A",
             chosen_role=top_kra,
-            confidence=top_kra.score,
+            confidence=top_kra_score,
             llm2_fired=False,
             llm2_reasoning=None,
-            alias_collision_detected=False,
+            alias_collision_detected=(
+                top_alias is not None
+                and top_alias.role_id != top_kra.role_id
+            ),
             queued=False,
-            reasoning=f"All 3 signals top-rank {top_kra.slug}",
+            reasoning=(
+                f"Skill+KRA converge on {top_kra.slug} "
+                f"({top_skill.score:.2f}/{top_kra_score:.2f}){alias_note}"
+            ),
         )
 
-    # Case B: skill+KRA agree, alias mismatches or absent
+    # ── Branch 3: skill-confident + KRA-noisy → Case B skill-led ──────────────
+    # When skill_top has high witness confidence AND KRA top-2 are tight,
+    # trust the skill profile. Disambiguate via LLM2 if skill and KRA top
+    # disagree (let LLM2 pick from both).
     if (
         top_skill is not None
-        and top_skill.role_id == top_kra.role_id
-        and (top_alias is None or top_alias.role_id != top_kra.role_id)
+        and top_skill.score >= SKILL_WITNESS_MIN_SCORE
+        and top_kra is not None
+        and kra_margin < KRA_MARGIN_DEFAULT
+        and top_skill.role_id != top_kra.role_id
     ):
-        alias_detail = (
-            "alias missed entirely" if top_alias is None
-            else f"alias->{top_alias.slug}"
+        return await _resolve_via_llm2(
+            case="D",
+            tied_candidates=_dedupe_by_role_id(top_skill, top_kra),
+            r_and_r_text=r_and_r_text,
+            llm2_fn=llm2_fn,
+            alias_collision=False,
+            queue_reason="skill_vs_noisy_kra",
         )
+
+    # ── Branch 4: KRA-only signal (skill absent/weak) ─────────────────────────
+    # No usable skill signal — rely on KRA. If KRA top-2 are within tie
+    # band, fire LLM2 over the tied KRA cohort. Otherwise classify by KRA.
+    skill_weak = top_skill is None or top_skill.score < 0.20
+    if skill_weak and top_kra is not None and top_kra_score >= KRA_MIN_SCORE:
+        if kra_margin < KRA_TIE_BAND:
+            tied_kra = _tied_cohort(kra, KRA_TIE_BAND)
+            return await _resolve_via_llm2(
+                case="F",
+                tied_candidates=tied_kra,
+                r_and_r_text=r_and_r_text,
+                llm2_fn=llm2_fn,
+                alias_collision=False,
+                queue_reason="kra_tie",
+            )
         return Stage4Decision(
             case="B",
             chosen_role=top_kra,
-            confidence=top_kra.score * 0.95,  # small penalty for alias gap
+            confidence=top_kra_score,
             llm2_fired=False,
             llm2_reasoning=None,
-            alias_collision_detected=True,
+            alias_collision_detected=(
+                top_alias is not None
+                and top_alias.role_id != top_kra.role_id
+            ),
             queued=False,
-            reasoning=f"Skill+KRA agree on {top_kra.slug}; {alias_detail}",
+            reasoning=(
+                f"KRA-led classification on {top_kra.slug} "
+                f"(skill weak, KRA {top_kra_score:.2f})"
+            ),
         )
 
-    # Case D: alias and KRA point at different roles, skill does NOT witness
-    # KRA → LLM2 tie-breaker between the two candidates.
-    if top_alias is not None and top_alias.role_id != top_kra.role_id:
+    # ── Branch 5: single alias hit + signals diverge → LLM2 ───────────────────
+    # Alias is exact (single role at 1.0, not multi-tie). When signals
+    # diverge across alias/KRA/skill, treat alias as a candidate (not the
+    # answer) and let LLM2 pick from the dedup'd cohort.
+    if (
+        top_alias is not None
+        and top_alias.score >= ALIAS_EXACT_MIN_SCORE
+    ):
+        candidates = _dedupe_by_role_id(top_alias, top_kra, top_skill)
+        # If they all agree on one role: trivial Case A.
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            return Stage4Decision(
+                case="A",
+                chosen_role=chosen,
+                confidence=max(chosen.score, top_kra_score),
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=False,
+                reasoning=(
+                    f"All signals agree on {chosen.slug}"
+                ),
+            )
+        # Multiple candidates — LLM2 disambiguates from JD body.
         return await _resolve_via_llm2(
             case="D",
-            tied_candidates=[top_alias, top_kra],
+            tied_candidates=candidates,
             r_and_r_text=r_and_r_text,
             llm2_fn=llm2_fn,
             alias_collision=True,
-            queue_reason="llm2_unsure",
+            queue_reason="alias_vs_body",
         )
 
-    # Case D' (skill-vs-KRA disagreement) — when there's no usable alias
-    # signal AND skill_top points at a different role than kra_top with
-    # meaningful confidence, fire LLM2 with [skill_top, kra_top] so the
-    # skill-suggested role appears in the candidate set. Previously this
-    # case fell through to the "top KRA stands" fallback and silently
-    # picked KRA top, which routinely misclassified JDs like "Senior Java
-    # Backend Developer" (skill=backend, kra=android because of Java).
-    #
-    # Gate: max(0.20 absolute, 50% of kra_top.score). See Case B' branch
-    # above for the same logic — adapts to sparse-catalog scoring.
-    skill_vs_kra_gate = max(0.20, 0.5 * kra[0].score)
-    if (
-        top_skill is not None
-        and top_skill.score >= skill_vs_kra_gate
-        and top_skill.role_id != kra[0].role_id
-    ):
-        return await _resolve_via_llm2(
-            case="D",
-            tied_candidates=[top_skill, kra[0]],
-            r_and_r_text=r_and_r_text,
-            llm2_fn=llm2_fn,
-            alias_collision=False,
-            queue_reason="llm2_unsure",
-        )
-
-    # Fallback: top KRA stands but no other signal supports it. Treat as
-    # weak Case A (auto-classify with a confidence haircut).
-    top_kra = kra[0]
-    return Stage4Decision(
-        case="A",
-        chosen_role=top_kra,
-        confidence=top_kra.score * 0.85,
-        llm2_fired=False,
-        llm2_reasoning=None,
-        alias_collision_detected=False,
-        queued=False,
-        reasoning=f"Top KRA {top_kra.slug} stands; no contradicting signal",
+    # ── Branch 6: no usable signal → Excel intercept → Case NEW synth ─────────
+    # Either KRA is too weak (< 0.45) and skill is also weak, OR everything
+    # is empty. Try the Excel taxonomy first; fall back to synth Case NEW.
+    excel_decision = await _attempt_excel_classification(
+        jd_title=role_name_input,
+        r_and_r_text=r_and_r_text,
+        r_and_r_embedding=r_and_r_embedding,
+        role_name_input=role_name_input,
+        cost_acc=None,
     )
+    if excel_decision is not None:
+        return excel_decision
+
+    if role_name_input:
+        new_slug = _slugify_for_new_role(role_name_input)
+        synth_role = RoleSignal(
+            role_id=None,
+            slug=new_slug,
+            display_name=role_name_input,
+            score=0.0,
+            signal_type="new_role_synth",
+        )
+        return Stage4Decision(
+            case="NEW",
+            chosen_role=synth_role,
+            confidence=0.0,
+            llm2_fired=False,
+            llm2_reasoning=None,
+            alias_collision_detected=False,
+            queued=False,
+            reasoning=(
+                f"No catalog signal for '{role_name_input}': "
+                f"KRA top={top_kra_score:.2f} (<{KRA_MIN_SCORE}), "
+                f"skill top={(top_skill.score if top_skill else 0):.2f} (<0.20). "
+                f"Finalizing as new role; v3 enriches in background."
+            ),
+            is_new_role=True,
+            new_role_display_name=role_name_input,
+            new_role_slug=new_slug,
+        )
+
+    return _queue(
+        "E",
+        reason="no_signal",
+        detail=(
+            f"KRA top={top_kra_score:.2f}, skill top="
+            f"{(top_skill.score if top_skill else 0):.2f}, "
+            f"alias_top={(top_alias.score if top_alias else 0):.2f}"
+        ),
+    )
+
+
 
 
 def _tied_cohort(kra: list[RoleSignal], band: float) -> list[RoleSignal]:

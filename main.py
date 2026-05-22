@@ -43,9 +43,8 @@ from new_skill_orchestrator import (
     NewSkillMetaV3,
     _derive_legacy_fields,
     _run_enrichment,
-    enrich_new_skill,
-    fetch_candidate_skills_pool_skill_library,
-    fetch_dimensions_catalog_skill_library,
+    enrich_one_existing_canonical_skill,
+    enrich_unmatched_skills_batched,
     find_dimensions_by_identity_skill_library,
 )
 from skill_library_v3.schemas.typology import SkillType, TypedSkill
@@ -56,9 +55,11 @@ from skill_library_v3.catalog_transform import (
 from cost_tracker import CostAccumulator
 from pathlib import Path
 import json
+import re
 import tempfile
 import time
 from datetime import datetime
+from functools import lru_cache
 import logging
 import asyncio
 from typing import Any, cast
@@ -198,13 +199,23 @@ class FinalSkillItem(BaseModel):
     is_primary: bool
 
 
+class KraMatchDetailItem(BaseModel):
+    sentence: str
+    kra_text: str
+    similarity: float
+
+
 class RoleSignalItem(BaseModel):
-    role_id: int
+    # role_id is None for "Case NEW" synthesized roles whose catalog entry
+    # is still being upserted by v3 in the background.
+    role_id: int | None = None
     slug: str
     display_name: str
     score: float                   # 0.0–1.0 (× 100 = percentage)
-    matched_count: int | None = None   # skill_match only
-    total_count: int | None = None     # skill_match only
+    matched_count: int | None = None        # skill_match only
+    total_count: int | None = None          # skill_match only
+    matched_skills: list[str] | None = None # skill_match only: canonical names of matched skills
+    kra_matches: list[KraMatchDetailItem] | None = None  # kra_match only
 
 
 class Stage3SignalsResponse(BaseModel):
@@ -223,6 +234,9 @@ class Stage4DecisionResponse(BaseModel):
     alias_collision_detected: bool = False
     queued: bool = False
     reasoning: str = ""
+    is_new_role: bool = False
+    new_role_display_name: str | None = None
+    new_role_slug: str | None = None
 
 
 class CandidateSkillAttached(BaseModel):
@@ -270,6 +284,229 @@ class JDSkillPipelineResponse(BaseModel):
 # Archetypes that count as "tech" for our software-engineering-focused
 # catalog. Override via TECH_ARCHETYPES env var (comma-separated).
 _DEFAULT_TECH_ARCHETYPES = "Engineering,Data,DevOps,Security,QA,Research"
+
+
+@lru_cache(maxsize=1)
+def _canonical_skill_display_names() -> tuple[str, ...]:
+    """Load canonical skill display_names from the skill-library catalog
+    once per process. Used by the archetype-rescue scan to cheaply count
+    distinct skill mentions in a JD body without firing any LLM calls.
+
+    Returns a frozen tuple so the lru_cache is safe across threads.
+    Refreshed only on process restart — catalog churns slowly.
+    """
+    try:
+        from skill_library_repository import SkillLibraryRepository
+        repo = SkillLibraryRepository()
+        # repo exposes a list_canonical_display_names() or similar — fall back to direct SQL.
+        from jd_similarity_matcher import _pg_connect, _qs
+        sql = f"SELECT display_name FROM {_qs()}.canonical_skills WHERE display_name IS NOT NULL"
+        conn = _pg_connect()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    names = [str(r[0]).strip() for r in cur.fetchall() if r[0]]
+        finally:
+            conn.close()
+        return tuple(n for n in names if len(n) >= 3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[archetype-rescue] failed to load canonical skill names: %s; "
+            "rescue will no-op", exc,
+        )
+        return ()
+
+
+_DEFAULT_TECH_RESCUE_MIN_SKILLS = 3
+
+
+def _rescue_archetype(
+    *,
+    jd_text: str,
+    nano_parsed: dict,
+    canonical_names: list[str] | tuple[str, ...] | None = None,
+    min_skills: int | None = None,
+    enabled: bool | None = None,
+) -> int:
+    """When the nano parser stamps role_archetype='Other' on a JD whose body
+    clearly contains tech-skill mentions ("Internship (Snowflake-focused)" →
+    Snowflake/SQL/ETL/Python all present), promote the archetype to
+    'Engineering' so the archetype gate doesn't kill the pipeline. Stage 4
+    skill_top fallback then generalizes the role properly downstream.
+
+    No LLM calls. Word-boundary substring scan against cached canonical
+    skill display_names, distinct-count semantics, length-3+ skills only
+    to avoid noise from tiny tokens.
+
+    Mutates `nano_parsed` in place when the rescue fires:
+      * role_archetype → "Engineering"
+      * archetype_override_applied → True
+      * archetype_override_matched_skills → list of matched display names
+
+    Returns: number of distinct matches found (0 when skipped / disabled).
+    """
+    # Env defaults — caller can override for testing.
+    if enabled is None:
+        enabled = os.getenv("TECH_RESCUE_ENABLED", "true").strip().lower() == "true"
+    if not enabled:
+        return 0
+    if min_skills is None:
+        try:
+            min_skills = int(os.getenv(
+                "TECH_RESCUE_MIN_SKILLS",
+                str(_DEFAULT_TECH_RESCUE_MIN_SKILLS),
+            ))
+        except ValueError:
+            min_skills = _DEFAULT_TECH_RESCUE_MIN_SKILLS
+
+    arch = (nano_parsed.get("role_archetype") or "").strip()
+    allowed_raw = os.getenv("TECH_ARCHETYPES", _DEFAULT_TECH_ARCHETYPES)
+    allowed = {a.strip() for a in allowed_raw.split(",") if a.strip()}
+    # Already a tech archetype → gate would pass anyway, no need to scan.
+    if arch in allowed:
+        return 0
+
+    names = canonical_names if canonical_names is not None else _canonical_skill_display_names()
+    if not names:
+        return 0
+
+    # Length-3+ floor: avoid "C", "AI", "QA" matching inside larger words.
+    text = (jd_text or "")[:12_000].lower()
+    matched: list[str] = []
+    matched_set: set[str] = set()
+    for display in names:
+        if len(display) < 3:
+            continue
+        needle = display.lower()
+        if needle in matched_set:
+            continue
+        # Word-boundary check via regex \b ... \b. Escape any regex chars in
+        # the skill name (e.g., ".", "+", "#").
+        pattern = r"\b" + re.escape(needle) + r"\b"
+        if re.search(pattern, text):
+            matched.append(display)
+            matched_set.add(needle)
+
+    if len(matched) < min_skills:
+        return len(matched)
+
+    # Rescue fires — mutate nano_parsed.
+    nano_parsed["role_archetype"] = "Engineering"
+    nano_parsed["archetype_override_applied"] = True
+    nano_parsed["archetype_override_matched_skills"] = matched
+    logger.info(
+        "[archetype-rescue] fired — original_archetype='Other' → 'Engineering' "
+        "(matched %d distinct skills: %s)",
+        len(matched), matched[:10],
+    )
+    return len(matched)
+
+
+# ── Free Stage 0: pure-regex non-tech pre-filter ───────────────────────────
+# Runs BEFORE the nano-parser. Catches obvious non-tech JDs (Sales Manager,
+# Lab Technician, Investment Banking Associate, etc.) without firing the
+# ~$0.0002 nano-parser call. Conservative: only rejects when BOTH a non-tech
+# title pattern matches AND the JD body has fewer than 3 tech-marker hits
+# (so a JD titled "Sales Manager" but actually describing a developer role
+# would still proceed to nano for proper classification).
+
+# Strong non-tech patterns: reject regardless of body content. Used when the
+# role is clearly non-tech even though the body may mention tech subjects
+# (e.g., a "Part Time Trainer" teaching AI/ML/Cloud Computing — the body
+# is full of tech terms because of the curriculum, but the actual role is
+# teaching, not engineering).
+_NON_TECH_STRONG_PATTERNS = (
+    # Sales & Revenue
+    "sales manager", "sales executive", "sales associate", "sales representative",
+    "business development manager", "bd manager", "account executive",
+    "commission sales", "brand partner", "brand manager",
+    # Finance / Banking / Wealth (these titles never describe a coder role)
+    "relationship manager", "wealth manager", "investment banking",
+    "financial advisor", "loan officer", "credit officer", "credit analyst",
+    # Medical / Healthcare
+    "lab technician", "medical officer", "physician", "md medicine",
+    "pharmacist", "nurse", "clinical research", "medical policy",
+    # Legal
+    "advocate", "paralegal", "lawyer", "regulatory affairs",
+    # Education / Training — teaching role even when subject is tech
+    "part time trainer", "part-time trainer", "corporate trainer",
+    "technical trainer", "training instructor", "teaching assistant",
+    "professor", "lecturer",
+)
+
+# Soft non-tech patterns: reject ONLY when body has weak tech content.
+# Some of these (e.g., "Marketing Analyst") COULD describe a tech-flavored
+# role at an ad-tech company, so we let nano decide when the body is
+# tech-rich.
+_NON_TECH_SOFT_PATTERNS = (
+    # Marketing — could be marketing-tech engineer at modern company
+    "marketing analyst", "marketing executive", "marketing manager",
+    "digital marketing", "seo executive", "seo specialist",
+    "social media intern", "social media manager", "content marketing",
+    # Accounting / Audit / Tax
+    "tax consultant", "auditor", "bookkeeper", "accounting admin",
+    "project accounting",
+    # HR / Admin / Operations
+    "hr generalist", "hr executive", "talent acquisition", "recruiter",
+    "office admin", "trust & safety", "process associate",
+    "operations associate",
+    # Construction / Field engineering — "Civil Engineer" in a tech company
+    # could mean infra/cloud, so use soft rule
+    "civil engineer", "site engineer", "structural engineer",
+    "geotechnical engineer",
+)
+
+_TECH_MARKER_PATTERN = re.compile(
+    r"\b("
+    r"python|java(?:script)?|typescript|c\+\+|c#|golang|go(?:lang)?|"
+    r"rust|kotlin|swift|ruby|php|scala|"
+    r"react(?:\.js|js)?|angular(?:\.js)?|vue(?:\.js)?|node(?:\.js)?|"
+    r"django|flask|fastapi|spring(?:\sboot)?|rails|laravel|"
+    r"kubernetes|docker|terraform|ansible|jenkins|circleci|github\sactions|"
+    r"aws|azure|gcp|kafka|spark|hadoop|airflow|snowflake|databricks|redshift|"
+    r"rest\sapi|graphql|grpc|microservices|ci/cd|devops|"
+    r"backend|frontend|full[- ]?stack|"
+    r"machine\slearning|deep\slearning|data\sengineering|data\sscience|"
+    r"sql|nosql|mongodb|postgres(?:ql)?|mysql|redis|elasticsearch|"
+    r"selenium|cypress|jest|pytest|junit"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _quick_non_tech_check(jd_text: str, title: str) -> tuple[bool, str]:
+    """Return (is_non_tech, reason). Free regex-based first-layer filter.
+
+    Two tiers of patterns:
+      * STRONG: reject regardless of body content (Trainer/Sales/Medical/etc.
+        — the role is never tech even if the body lists tech subjects).
+      * SOFT: reject only when title matches AND body has < 3 tech-marker hits
+        (lets a Marketing Analyst at an ad-tech company that actually does
+        engineering work pass through to nano).
+
+    Empty title → no decision, let nano handle it.
+    """
+    title_lower = (title or "").lower().strip()
+    if not title_lower:
+        return False, ""
+
+    # Strong patterns: reject immediately
+    strong = next((p for p in _NON_TECH_STRONG_PATTERNS if p in title_lower), None)
+    if strong is not None:
+        return True, f"non-tech title pattern matched ({strong!r}) — strong"
+
+    # Soft patterns: gated by body tech-marker count
+    soft = next((p for p in _NON_TECH_SOFT_PATTERNS if p in title_lower), None)
+    if soft is None:
+        return False, ""
+    tech_hits = len(_TECH_MARKER_PATTERN.findall(jd_text or ""))
+    if tech_hits >= 3:
+        return False, ""
+    return True, (
+        f"non-tech title pattern matched ({soft!r}); "
+        f"body had {tech_hits} tech markers (soft)"
+    )
 
 
 def _is_tech_jd(nano_parsed: dict | None) -> tuple[bool, str]:
@@ -882,61 +1119,17 @@ async def _backfill_existing_skill_catalog_enrichment(
     sd: SkillDetail,
     cost_acc: CostAccumulator,
 ) -> bool:
-    """Stage 7 + v3 persist when the skill has no catalog context tags (``skill_tags``)."""
+    """Stage 7 + v3 persist when the skill has no catalog context tags
+    (``skill_tags``). Thin wrapper around
+    ``new_skill_orchestrator.enrich_one_existing_canonical_skill`` — the
+    actual enrichment + DB-write logic lives there so the nightly backfill
+    cron can call it directly without importing main.py."""
     if sd.canonical is None or sd.canonical.id is None:
         return False
-    sid = int(sd.canonical.id)
-    detail = await asyncio.to_thread(repo.get_skill_detail, sid)
-    if not detail:
-        return False
-    slug = str(detail.get("slug") or "").strip()
-    display_name = str(detail.get("display_name") or sd.input_skill).strip()
-    if not slug or not display_name:
-        return False
-    type_label = _typology_type_from_skill_nature(detail.get("skill_nature"))
-    skill_payload = {
-        "skill_id": slug,
-        "name": display_name,
-        "type": type_label,
-        "subtype": "general",
-        "primary_dimension": _primary_dimension_slug_for_library_skill(sd),
-    }
-    enrichment, warnings = await _run_enrichment(skill_payload, accumulator=cost_acc)
-    if enrichment is None:
-        return False
-    conf = detail.get("confidence")
-    try:
-        confidence = float(conf) if conf is not None else 0.85
-    except (TypeError, ValueError):
-        confidence = 0.85
-    confidence = max(0.0, min(1.0, confidence))
-    typed = TypedSkill(
-        skill_id=slug,
-        name=display_name,
-        type=type_label,
-        subtype="general",
-        confidence=confidence,
-        reasoning=(
-            "API 3 backfill: existing canonical skill had no catalog context tags "
-            "(skill_tags); ran Stage 7 enrichment to populate tags and related fields."
-        ),
-        alternatives_considered=[],
-    )
-    derived = _derive_legacy_fields(typed=typed, enrichment=enrichment)
-    meta = NewSkillMetaV3(
-        skill_id=typed.skill_id,
-        typed=typed,
-        enrichment=enrichment,
-        derived=derived,
-        warnings=list(warnings),
-    )
-    tl = str(derived.typical_lifespan or "EVERGREEN")
-    return _apply_new_skill_v3_enrichment_to_db(
+    return await enrich_one_existing_canonical_skill(
         repo,
-        skill_id=sid,
-        display_name=display_name,
-        meta=meta,
-        typical_lifespan=tl,
+        skill_id=int(sd.canonical.id),
+        cost_acc=cost_acc,
     )
 
 
@@ -1329,6 +1522,50 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
     cost_acc = CostAccumulator()
+
+    # ── Stage 0: Free regex non-tech pre-filter ─────────────────────────────
+    # Cheap layer that runs BEFORE the nano-parser. Catches obvious non-tech
+    # JDs (Lab Technician, Sales Manager, Relationship Manager, etc.) without
+    # spending the ~$0.0002 nano-parser call. Conservative: only fires when
+    # title matches a known non-tech pattern AND the body lacks tech markers.
+    # First line of `jd_text` is treated as the title for pattern matching.
+    prefilter_title = jd_text.splitlines()[0] if jd_text else ""
+    # Strip the "Job Title:" prefix if the caller added it.
+    if prefilter_title.lower().startswith("job title:"):
+        prefilter_title = prefilter_title.split(":", 1)[1].strip()
+    is_non_tech, prefilter_reason = _quick_non_tech_check(jd_text, prefilter_title)
+    if is_non_tech:
+        logger.info(
+            "[skills/extract-from-jd] STAGE-0 REJECT (free regex): title=%r reason=%s",
+            prefilter_title, prefilter_reason,
+        )
+        rejected_response = JDSkillPipelineResponse(
+            final_skills=[],
+            jd_role=JdRoleHint(
+                display_name=prefilter_title or "(unknown)",
+                slug="",
+                role_archetype="Other",
+                rationale=prefilter_reason,
+            ),
+            nano_parsed=None,
+            rejected=True,
+            rejection_reason=f"Non-tech JD: {prefilter_reason}",
+        )
+        try:
+            history_repo = JdPipelineRunRepository()
+            rejected_run_id = await asyncio.to_thread(
+                history_repo.start_run,
+                jd_text=jd_text,
+                api1_response=rejected_response,
+                api_parser_response=None,
+                jd_role_hint_display=prefilter_title or "(unknown)",
+                llm_cost_usd=0.0,
+            )
+            rejected_response.run_id = rejected_run_id
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[skills/extract-from-jd] stage-0 reject start_run failed: %s", exc)
+        return rejected_response
+
     try:
         # Stage 1 — FAST_MODEL parses JD structure (job_parser.txt): company, role, R&R, etc.
         nano_parsed = await _llm_parse_jd_nano(jd_text, cost_acc=cost_acc)
@@ -1337,6 +1574,17 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             status_code=502,
             detail=f"Nano JD parsing failed: {exc}",
         ) from exc
+
+    # ── Archetype rescue — designation-prefixed JDs ───────────────────────────
+    # When the nano parser stamps role_archetype='Other' on a JD whose body
+    # contains clear tech-skill mentions (e.g., "Internship (Snowflake-focused)"
+    # has Snowflake/SQL/ETL/Python all present), promote the archetype to
+    # 'Engineering' so the gate below lets it through. Stage 4 skill_top
+    # fallback then generalizes the role properly downstream. No LLM cost.
+    try:
+        _rescue_archetype(jd_text=jd_text, nano_parsed=nano_parsed)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[archetype-rescue] crashed; continuing without: %s", exc)
 
     # ── Tech-archetype gate — early-exit non-tech JDs ─────────────────────────
     # The skill catalog is software-engineering-focused. Reject JDs whose
@@ -1443,7 +1691,8 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     try:
         from jd_similarity_matcher import Stage3Result, run_stage2_and_stage3
 
-        skills_for_stage3 = [s.skill_name for s in final_skills]
+        primary_for_stage3 = [s.skill_name for s in final_skills if s.is_primary]
+        skills_for_stage3 = primary_for_stage3 if primary_for_stage3 else [s.skill_name for s in final_skills]
         s3: Stage3Result = await run_stage2_and_stage3(
             r_and_r_text,
             skills_for_stage3,
@@ -1452,6 +1701,32 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             top_k=5,
             cost_acc=cost_acc,
         )
+
+        # ── Fullstack tiebreaker: when roles share the same skill score, a
+        # fullstack/generalist role should rank above a single specialization
+        # because it encompasses both frontend and backend skill sets.
+        s3.skill_match_roles.sort(
+            key=lambda r: (
+                -r.score,
+                0 if "full" in (r.slug or "").lower() else 1,
+            )
+        )
+
+        # ── Alias tiebreaker: when multiple alias matches share the same score
+        # (always 1.0 in exact-match mode), re-rank them by their position in
+        # skill_match_roles so the most skill-aligned role wins.
+        # If a role isn't in skill_match at all, it keeps its original order.
+        if len(s3.alias_match_roles) > 1:
+            skill_rank: dict[int | None, int] = {
+                r.role_id: i for i, r in enumerate(s3.skill_match_roles)
+            }
+            s3.alias_match_roles.sort(
+                key=lambda r: (
+                    -r.score,
+                    skill_rank.get(r.role_id, len(s3.skill_match_roles)),
+                )
+            )
+
         stage3_signals = Stage3SignalsResponse(
             skill_match_roles=[
                 RoleSignalItem(
@@ -1461,6 +1736,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     score=r.score,
                     matched_count=r.matched_count,
                     total_count=r.total_count,
+                    matched_skills=r.matched_skills,
                 )
                 for r in s3.skill_match_roles
             ],
@@ -1469,7 +1745,20 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 for r in s3.alias_match_roles
             ],
             kra_match_roles=[
-                RoleSignalItem(role_id=r.role_id, slug=r.slug, display_name=r.display_name, score=r.score)
+                RoleSignalItem(
+                    role_id=r.role_id,
+                    slug=r.slug,
+                    display_name=r.display_name,
+                    score=r.score,
+                    kra_matches=[
+                        KraMatchDetailItem(
+                            sentence=m.sentence,
+                            kra_text=m.kra_text,
+                            similarity=m.similarity,
+                        )
+                        for m in r.kra_matches
+                    ] if r.kra_matches else None,
+                )
                 for r in s3.kra_match_roles
             ],
             alias_found=s3.alias_found,
@@ -1556,10 +1845,10 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             from jd_classifier import llm2_resolve_role, stage4_route_decision
 
             async def _llm2_with_cost(
-                rr_text: str, candidates: list,
+                *, r_and_r_text: str, candidates: list,
             ):
                 return await llm2_resolve_role(
-                    rr_text, candidates, cost_acc=cost_acc,
+                    r_and_r_text, candidates, cost_acc=cost_acc,
                 )
 
             decision = await stage4_route_decision(
@@ -1583,6 +1872,9 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 alias_collision_detected=decision.alias_collision_detected,
                 queued=decision.queued,
                 reasoning=decision.reasoning,
+                is_new_role=decision.is_new_role,
+                new_role_display_name=decision.new_role_display_name,
+                new_role_slug=decision.new_role_slug,
             )
             logger.info(
                 "[stage4] case=%s chosen=%s confidence=%.2f queued=%s llm2=%s",
@@ -1611,6 +1903,104 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         llm_cost_usd=cost_acc.total_cost_usd,
     )
     response.run_id = run_id
+
+    # ── v3 auto-fire (Case NEW, must run BEFORE Stage 5) ─────────────────────
+    # Stage 4 routed to Case NEW: chosen_role is synthesized (role_id=None).
+    # When JD_V3_AUTO_TRIGGER=true, upsert the role now so Stage 5 has a real
+    # role_id to attach unknown skills/KRA to. v3 Stage 0 cascade fires in
+    # the background. The pipeline ALWAYS returns a chosen_role to the
+    # caller — v3 is for catalog enrichment, not for the current JD's
+    # classification answer.
+    if (
+        decision is not None
+        and decision.is_new_role
+        and decision.chosen_role is not None
+        and decision.new_role_display_name
+    ):
+        # Excel-matched roles ALWAYS trigger v3 enrichment when not yet
+        # enriched (catalog convergence policy). Regular Case NEW still
+        # gates on JD_V3_AUTO_TRIGGER to avoid firing on truly novel roles
+        # when the env flag is off.
+        env_auto_trigger = os.getenv("JD_V3_AUTO_TRIGGER", "false").lower() == "true"
+        is_excel_match = getattr(decision, "case", None) == "EXCEL_NEW"
+        skip_v3_already_enriched = False
+        if is_excel_match and decision.chosen_role.role_id is not None:
+            try:
+                from excel_role_resolver import role_has_kras
+                skip_v3_already_enriched = await asyncio.to_thread(
+                    role_has_kras, decision.chosen_role.role_id,
+                )
+                if skip_v3_already_enriched:
+                    logger.info(
+                        "[v3/auto-fire] Excel match %s (role_id=%s) already "
+                        "has role_kras — skipping v3 dispatch",
+                        decision.chosen_role.slug, decision.chosen_role.role_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[v3/auto-fire] role_has_kras check failed (%s) — "
+                    "firing v3 anyway", exc,
+                )
+        auto_trigger = (
+            (env_auto_trigger or is_excel_match)
+            and not skip_v3_already_enriched
+        )
+        if auto_trigger:
+            try:
+                from skill_library_v3 import runner as v3_runner
+
+                created = await asyncio.to_thread(
+                    v3_runner.create_initial_run,
+                    decision.new_role_display_name,
+                )
+                run_uuid = created["run_id"]
+                role_slug = created["role_slug"]
+                # Resolve real role_id (upsert_role just persisted the row).
+                from jd_similarity_matcher import _pg_connect
+                def _resolve_role_id():
+                    conn = _pg_connect()
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT id FROM roles WHERE slug = %s LIMIT 1",
+                                (role_slug,),
+                            )
+                            r = cur.fetchone()
+                            return int(r[0]) if r else None
+                    finally:
+                        conn.close()
+                real_role_id = await asyncio.to_thread(_resolve_role_id)
+                # Back-fill chosen_role so Stage 5 + history see the real ID.
+                decision.chosen_role.role_id = real_role_id
+                decision.chosen_role.slug = role_slug
+                decision.new_role_slug = role_slug
+                if stage4_response is not None and stage4_response.chosen_role:
+                    stage4_response.chosen_role.role_id = real_role_id
+                    stage4_response.chosen_role.slug = role_slug
+                    stage4_response.new_role_slug = role_slug
+                asyncio.create_task(v3_runner.run_stage_0(run_uuid))
+                if response.stage5_updates is None:
+                    response.stage5_updates = Stage5UpdatesResponse()
+                response.stage5_updates.v3_pipeline_triggered = True
+                response.stage5_updates.v3_run_id = str(run_uuid)
+                response.stage5_updates.v3_role_slug = role_slug
+                logger.info(
+                    "[v3/auto-fire] role=%r run_id=%s slug=%s role_id=%s "
+                    "(Stage 0 dispatched)",
+                    decision.new_role_display_name, run_uuid, role_slug,
+                    real_role_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[v3/auto-fire] failed for role=%r: %s",
+                    decision.new_role_display_name, exc,
+                )
+        else:
+            logger.info(
+                "[v3/auto-fire] would fire for role=%r slug=%s "
+                "(JD_V3_AUTO_TRIGGER=false, skipping)",
+                decision.new_role_display_name, decision.new_role_slug,
+            )
 
     # ── Stage 5 (Post-Classification Updates) — compulsory ───────────────────
     new_skills_attached: list[CandidateSkillAttached] = []
@@ -1644,7 +2034,14 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                         )
                         skill_attachments: list[CandidateSkillAttached] = []
                         kra_attachment: CandidateKraAttached | None = None
-                        if decision.chosen_role is not None and not decision.queued:
+                        # For Case NEW with v3 auto-trigger off, chosen_role
+                        # is synthesized but role_id is None — skip skill/KRA
+                        # FK-dependent writes since there's no roles row yet.
+                        has_real_role_id = (
+                            decision.chosen_role is not None
+                            and decision.chosen_role.role_id is not None
+                        )
+                        if has_real_role_id and not decision.queued:
                             with conn.cursor() as cur:
                                 cur.execute(
                                     "UPDATE jd_pipeline_runs "
@@ -1713,6 +2110,10 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     conn.close()
 
             updates, new_skills_attached, new_kra_attached = await asyncio.to_thread(_run_stage5)
+            # Preserve v3 auto-fire fields populated earlier (BEFORE Stage 5)
+            # — building a fresh Stage5UpdatesResponse here would clobber
+            # v3_pipeline_triggered / v3_run_id / v3_role_slug to defaults.
+            existing_v3 = response.stage5_updates
             response.stage5_updates = Stage5UpdatesResponse(
                 centroid_updated=updates.centroid_updated,
                 centroid_n_after=updates.centroid_n_after,
@@ -1720,6 +2121,11 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 collision_log_id=updates.collision_log_id,
                 new_skills_attached=new_skills_attached,
                 new_kra_attached=new_kra_attached,
+                v3_pipeline_triggered=(
+                    existing_v3.v3_pipeline_triggered if existing_v3 else False
+                ),
+                v3_run_id=existing_v3.v3_run_id if existing_v3 else None,
+                v3_role_slug=existing_v3.v3_role_slug if existing_v3 else None,
             )
             logger.info(
                 "[stage5] centroid=%s n=%s queue=%s collision=%s new_skills=%d new_kra=%s",
@@ -1772,7 +2178,92 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     run_id, exc,
                 )
 
+    # ── Auto-chain Step 2 (extract-details) + Step 3 (final-role-output) ────
+    # When a JD reaches a finalized chosen_role at Stage 4, eagerly run the
+    # remaining pipeline stages in the background so the run row reaches
+    # status='completed' instead of getting stranded at 'extract_from_jd_done'.
+    # Without this, direct API callers (smoke tests, monitoring, batch tools)
+    # leave runs stuck and the admin history view shows them as incomplete
+    # even though Stage 4 already chose a role.
+    #
+    # Background task: HTTP response returns immediately, the chain runs
+    # asynchronously. On failure, the run is marked status='failed' with the
+    # error in error_message so admins can see what went wrong.
+    #
+    # Opt out: set JD_PIPELINE_AUTOCHAIN=false in env (cost-conscious callers
+    # that only need Stage 4 routing). See [[jd-pipeline-cost-invariants]].
+    if (
+        os.getenv("JD_PIPELINE_AUTOCHAIN", "true").lower() == "true"
+        and response.run_id
+        and response.stage4_decision is not None
+        and response.stage4_decision.chosen_role is not None
+        and not response.rejected
+    ):
+        asyncio.create_task(_autochain_steps_2_3(response))
+
     return response
+
+
+async def _autochain_steps_2_3(api1: JDSkillPipelineResponse) -> None:
+    """Background task that chains /skills/extract-details and
+    /skills/final-role-output so a run created at /skills/extract-from-jd
+    always reaches status='completed'.
+
+    Self-calls the backend over HTTP rather than re-invoking the FastAPI
+    endpoint handlers in-process — keeps Step 2/3 request lifecycles
+    isolated (own DB connections, own cost accumulators) and matches the
+    UI's existing call pattern exactly. Errors are logged and persisted
+    to the run row's error_message column.
+    """
+    run_id = api1.run_id
+    if not run_id:
+        return
+
+    import httpx
+
+    base = os.getenv("AUTOCHAIN_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+
+    try:
+        final_skill_names = [s.skill_name for s in api1.final_skills if s.skill_name]
+        primary_skill_names = [
+            s.skill_name for s in api1.final_skills
+            if s.skill_name and getattr(s, "is_primary", False)
+        ]
+        body2: dict = {
+            "final_skills": final_skill_names,
+            "llm_skills": final_skill_names,
+            "primary_skills": primary_skill_names,
+            "jd_role_hint": api1.jd_role.model_dump() if api1.jd_role else None,
+            "run_id": run_id,
+        }
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # Step 2 — extract-details (alias + dimension catalogue + new-skill enrichment)
+            r2 = await client.post(f"{base}/skills/extract-details", json=body2)
+            r2.raise_for_status()
+            api2 = r2.json()
+
+            # Step 3 — final-role-output (persist role/dimensions + emit final output)
+            r3 = await client.post(f"{base}/skills/final-role-output", json=api2)
+            r3.raise_for_status()
+
+        logger.info("[autochain] run_id=%s reached status='completed'", run_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[autochain] run_id=%s failed: %s", run_id, exc)
+        try:
+            from jd_pipeline_run_repository import JdPipelineRunRepository
+            history_repo = JdPipelineRunRepository()
+            await asyncio.to_thread(
+                history_repo.mark_failed,
+                run_id,
+                f"autochain (step2/step3) failed: {exc}"[:500],
+            )
+        except Exception as inner:  # noqa: BLE001
+            logger.warning(
+                "[autochain] could not persist error for run_id=%s: %s",
+                run_id, inner,
+            )
 
 
 def _canonical_summary_from_row(row: dict) -> CanonicalSkillSummary:
@@ -2017,74 +2508,24 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
         role_hint_text = req.jd_role_hint.display_name.strip()
 
     if unmatched_llm_skills:
+        # Cost-regression: one batched LLM call replaces the per-skill
+        # enrich_new_skill loop. Per-skill enrichment (Stage 2 dim-gen,
+        # Stage 3 reconciler, Stage 7 sub-agents) used to fire 6+ LLM calls
+        # per unmatched skill and pushed API 2 cost to $0.40+ for JDs with
+        # 20+ unmatched skills. Now we only get category/nature/lifespan
+        # in-request; richer enrichment (vendor/license, maturity, ambiguity,
+        # versioning, dim placement) is deferred to the v3 background
+        # pipeline that fires for Case NEW.
         try:
-            dimension_catalogue = await asyncio.to_thread(
-                fetch_dimensions_catalog_skill_library,
-                limit=400,
+            new_skill_meta_by_skill.update(
+                await enrich_unmatched_skills_batched(planner, unmatched_llm_skills)
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "skill-library dimensions lookup failed; v3 dim-gen will run without prior catalog: %s",
-                exc,
+                "[skills/extract-details] batched unmatched-skill enrichment "
+                "failed for %d skills: %s",
+                len(unmatched_llm_skills), exc,
             )
-            dimension_catalogue = []
-        # Cap and normalize skill-library dimension rows so the v3 prompt +
-        # overlap checker have the keys they expect
-        # (tentative_id, name, description).
-        if len(dimension_catalogue) > 40:
-            step = len(dimension_catalogue) // 40
-            dimension_catalogue = dimension_catalogue[::step][:40]
-        existing_dims_v3: list[dict] = []
-        for d in dimension_catalogue:
-            dim_id = str(d.get("tentative_id") or d.get("slug") or "").strip()
-            name = str(d.get("name") or d.get("display_name") or "").strip()
-            desc = str(d.get("description") or d.get("rationale") or "").strip()
-            if not dim_id or not name:
-                continue
-            existing_dims_v3.append({
-                "tentative_id": dim_id,
-                "name": name,
-                "description": desc,
-                "role_display": str(d.get("role_display") or "").strip(),
-            })
-
-        candidate_skills_pool: list[dict] = []
-        try:
-            candidate_skills_pool = await asyncio.to_thread(
-                fetch_candidate_skills_pool_skill_library,
-                limit=200,
-            )
-        except Exception as exc:
-            logger.warning(
-                "skill-library canonical skills pool lookup failed; pool will be empty: %s",
-                exc,
-            )
-            candidate_skills_pool = []
-
-        async def _enrich_one(skill_name: str) -> tuple[str, NewSkillMetaV3 | None]:
-            try:
-                meta = await enrich_new_skill(
-                    skill_name=skill_name,
-                    role_hint=role_hint_text,
-                    existing_dims=existing_dims_v3,
-                    candidate_skills_pool=candidate_skills_pool,
-                    accumulator=cost_acc,
-                )
-                return skill_name, meta
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "v3 new-skill orchestrator failed for %r: %s",
-                    skill_name, exc,
-                )
-                return skill_name, None
-
-        results = await asyncio.gather(
-            *[_enrich_one(s) for s in unmatched_llm_skills],
-            return_exceptions=False,
-        )
-        for skill_name, meta in results:
-            if meta is not None:
-                new_skill_meta_by_skill[skill_name] = meta
 
     # Backfill role labels on Stage 3 logs from DB dimension-role links.
     # Some logs can miss b_role/a_role depending on upstream payload shape.
@@ -2914,9 +3355,13 @@ async def final_role_output_endpoint(req: FinalRoleOutputRequest):
         else:
             meta_merge_by_skill_lower.setdefault(key, {})
 
-    # 3.6) Existing library skills with zero context tags (skill_tags): run Stage 7 + save.
+    # 3.6) Existing library skills with zero context tags (skill_tags): run
+    # Stage 7 + save. Default OFF — this fires the 5-up enrichment per skill
+    # which used to be a quiet cost leak whenever API 3 saw matched-but-
+    # not-yet-enriched skills. Re-enable for catalog-backfill batches by
+    # setting API3_BACKFILL_LIBRARY_ENRICHMENT=1.
     if _API3_writes_enabled and os.getenv(
-        "API3_BACKFILL_LIBRARY_ENRICHMENT", "1"
+        "API3_BACKFILL_LIBRARY_ENRICHMENT", "0"
     ).strip().lower() in ("1", "true", "yes"):
         for sd in req.skills_detail:
             if sd.source_tag != "db" or sd.canonical is None or sd.canonical.id is None:

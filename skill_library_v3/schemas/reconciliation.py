@@ -43,12 +43,16 @@ class ReconciliationDecision(BaseModel):
     """
 
     decision: DecisionKind
-    # 800 chars (was 500). The reconciler's reasoning sometimes spells
-    # out the boundary case in detail ("Both dims cover the same area
-    # but A focuses on X and B focuses on Y; their boundaries overlap
-    # heavily, so MERGE_INTO is more accurate than KEEP_SEPARATE...").
-    # We retain a cap so prompts further down the cascade don't bloat.
-    reasoning: str = Field(min_length=20, max_length=800)
+    # 1500 chars (was 800, originally 500). The reconciler's reasoning
+    # sometimes spells out the boundary case in detail across multiple
+    # clauses — "Dim A is automated testing... Dim B handles validation
+    # and exception/error-flow design. These are adjacent but distinct
+    # skills: one verifies behavior via tests, the other hardens runtime
+    # behavior via validation..." A 1500-char ceiling covers the worst
+    # legitimate cases we've seen in prod (~900-1100 chars) without
+    # rejecting valid decisions. Downstream stages don't consume this
+    # field — it's audit-only.
+    reasoning: str = Field(min_length=20, max_length=1500)
 
     # Required for MERGE only:
     merge_into_name: str | None = Field(default=None, max_length=80)
