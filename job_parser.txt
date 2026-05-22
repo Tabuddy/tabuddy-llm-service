@@ -125,6 +125,28 @@ Classify the role into exactly one of the following archetypes based on the prim
 - If the role is ambiguous or hybrid, pick the archetype that represents the majority of described responsibilities.
 - If the JD_type is `fail` → this field does not exist in the output (stop at `{ "JD_type": "fail" }`).
 
+**Be strict about non-tech roles — they MUST be classified as `Other`, NOT `Engineering`/`Data`/etc. even if the title contains tech-adjacent words like "Engineer", "Architect", "Analyst", or "Developer":**
+
+| Role family | Examples | Correct archetype |
+|---|---|---|
+| **Sales & Revenue** | Sales Manager, Sales Associate, BD Manager, Account Executive, Commission Sales, Brand Partner | `Other` |
+| **Marketing** | Marketing Analyst, Marketing Manager, Digital Marketing Analyst, SEO Executive, Brand Manager, Social Media Intern, Content Marketing | `Other` |
+| **Finance / Banking** | Relationship Manager, Wealth Manager, Investment Banking Associate, Loan Officer, Credit Officer, Financial Advisor, Healthcare Investment Banking | `Other` |
+| **Accounting / Audit / Tax** | Auditor, CA, Tax Consultant, Project Accounting Admin, Bookkeeper | `Other` |
+| **Medical / Healthcare** | Lab Technician, Medical Officer, MD/MBBS Physician, Nurse, Pharmacist, Medical Policy/Strategy PM, Clinical Research Associate | `Other` |
+| **HR / Recruiting / Admin** | HR Generalist, Recruiter, Talent Acquisition, Office Admin, Trust & Safety Associate, Process Associate | `Other` |
+| **Legal / Compliance** | Advocate, Paralegal, Lawyer, Compliance Officer (non-AI), Regulatory Affairs | `Other` |
+| **Construction / Field** | Civil Engineer (construction site, NOT software), Site Engineer, Field Engineer, EPC Engineer | `Other` |
+| **Operations / Strategy** | Operations Associate, Strategy Consultant, Business Process Architect, Program Manager (non-tech), PMO Manager | `Other` |
+| **Education / Other** | Teacher, Trainer (non-tech), Customer Service Rep, Hospitality, Retail | `Other` |
+
+**Disambiguation guidance:**
+- "Architect" in title ≠ software architect. "Business Process Architect", "Solutions Architect (sales)", "Enterprise Architect (consulting)" without explicit code/tech responsibilities → `Other`.
+- "Analyst" in title ≠ data analyst. "Marketing Analyst", "Financial Analyst", "Business Analyst" focused on BI dashboards or strategy ≠ Engineering/Data. Only `Data` when the JD describes SQL, Python, ETL, modeling.
+- "Engineer" in title ≠ software engineer. "Sales Engineer", "Process Engineer (manufacturing)", "Geotechnical Engineer" → `Other`.
+- "Manager" in title ≠ engineering manager. A PM role in a non-tech domain (medical, finance ops) → `Other`, not `Management`.
+- When in doubt and the JD body has NO programming language, framework, cloud service, or system-design content → `Other`.
+
 ### 2.2c `role_aliases` *(array of strings)*
 
 2–4 common industry names or abbreviations for the role identified in `role`.

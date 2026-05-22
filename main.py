@@ -403,6 +403,112 @@ def _rescue_archetype(
     return len(matched)
 
 
+# ── Free Stage 0: pure-regex non-tech pre-filter ───────────────────────────
+# Runs BEFORE the nano-parser. Catches obvious non-tech JDs (Sales Manager,
+# Lab Technician, Investment Banking Associate, etc.) without firing the
+# ~$0.0002 nano-parser call. Conservative: only rejects when BOTH a non-tech
+# title pattern matches AND the JD body has fewer than 3 tech-marker hits
+# (so a JD titled "Sales Manager" but actually describing a developer role
+# would still proceed to nano for proper classification).
+
+# Strong non-tech patterns: reject regardless of body content. Used when the
+# role is clearly non-tech even though the body may mention tech subjects
+# (e.g., a "Part Time Trainer" teaching AI/ML/Cloud Computing — the body
+# is full of tech terms because of the curriculum, but the actual role is
+# teaching, not engineering).
+_NON_TECH_STRONG_PATTERNS = (
+    # Sales & Revenue
+    "sales manager", "sales executive", "sales associate", "sales representative",
+    "business development manager", "bd manager", "account executive",
+    "commission sales", "brand partner", "brand manager",
+    # Finance / Banking / Wealth (these titles never describe a coder role)
+    "relationship manager", "wealth manager", "investment banking",
+    "financial advisor", "loan officer", "credit officer", "credit analyst",
+    # Medical / Healthcare
+    "lab technician", "medical officer", "physician", "md medicine",
+    "pharmacist", "nurse", "clinical research", "medical policy",
+    # Legal
+    "advocate", "paralegal", "lawyer", "regulatory affairs",
+    # Education / Training — teaching role even when subject is tech
+    "part time trainer", "part-time trainer", "corporate trainer",
+    "technical trainer", "training instructor", "teaching assistant",
+    "professor", "lecturer",
+)
+
+# Soft non-tech patterns: reject ONLY when body has weak tech content.
+# Some of these (e.g., "Marketing Analyst") COULD describe a tech-flavored
+# role at an ad-tech company, so we let nano decide when the body is
+# tech-rich.
+_NON_TECH_SOFT_PATTERNS = (
+    # Marketing — could be marketing-tech engineer at modern company
+    "marketing analyst", "marketing executive", "marketing manager",
+    "digital marketing", "seo executive", "seo specialist",
+    "social media intern", "social media manager", "content marketing",
+    # Accounting / Audit / Tax
+    "tax consultant", "auditor", "bookkeeper", "accounting admin",
+    "project accounting",
+    # HR / Admin / Operations
+    "hr generalist", "hr executive", "talent acquisition", "recruiter",
+    "office admin", "trust & safety", "process associate",
+    "operations associate",
+    # Construction / Field engineering — "Civil Engineer" in a tech company
+    # could mean infra/cloud, so use soft rule
+    "civil engineer", "site engineer", "structural engineer",
+    "geotechnical engineer",
+)
+
+_TECH_MARKER_PATTERN = re.compile(
+    r"\b("
+    r"python|java(?:script)?|typescript|c\+\+|c#|golang|go(?:lang)?|"
+    r"rust|kotlin|swift|ruby|php|scala|"
+    r"react(?:\.js|js)?|angular(?:\.js)?|vue(?:\.js)?|node(?:\.js)?|"
+    r"django|flask|fastapi|spring(?:\sboot)?|rails|laravel|"
+    r"kubernetes|docker|terraform|ansible|jenkins|circleci|github\sactions|"
+    r"aws|azure|gcp|kafka|spark|hadoop|airflow|snowflake|databricks|redshift|"
+    r"rest\sapi|graphql|grpc|microservices|ci/cd|devops|"
+    r"backend|frontend|full[- ]?stack|"
+    r"machine\slearning|deep\slearning|data\sengineering|data\sscience|"
+    r"sql|nosql|mongodb|postgres(?:ql)?|mysql|redis|elasticsearch|"
+    r"selenium|cypress|jest|pytest|junit"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _quick_non_tech_check(jd_text: str, title: str) -> tuple[bool, str]:
+    """Return (is_non_tech, reason). Free regex-based first-layer filter.
+
+    Two tiers of patterns:
+      * STRONG: reject regardless of body content (Trainer/Sales/Medical/etc.
+        — the role is never tech even if the body lists tech subjects).
+      * SOFT: reject only when title matches AND body has < 3 tech-marker hits
+        (lets a Marketing Analyst at an ad-tech company that actually does
+        engineering work pass through to nano).
+
+    Empty title → no decision, let nano handle it.
+    """
+    title_lower = (title or "").lower().strip()
+    if not title_lower:
+        return False, ""
+
+    # Strong patterns: reject immediately
+    strong = next((p for p in _NON_TECH_STRONG_PATTERNS if p in title_lower), None)
+    if strong is not None:
+        return True, f"non-tech title pattern matched ({strong!r}) — strong"
+
+    # Soft patterns: gated by body tech-marker count
+    soft = next((p for p in _NON_TECH_SOFT_PATTERNS if p in title_lower), None)
+    if soft is None:
+        return False, ""
+    tech_hits = len(_TECH_MARKER_PATTERN.findall(jd_text or ""))
+    if tech_hits >= 3:
+        return False, ""
+    return True, (
+        f"non-tech title pattern matched ({soft!r}); "
+        f"body had {tech_hits} tech markers (soft)"
+    )
+
+
 def _is_tech_jd(nano_parsed: dict | None) -> tuple[bool, str]:
     """Return ``(is_tech, reason_when_not_tech)``.
 
@@ -1403,6 +1509,50 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
         raise HTTPException(status_code=400, detail="jd_text cannot be empty")
 
     cost_acc = CostAccumulator()
+
+    # ── Stage 0: Free regex non-tech pre-filter ─────────────────────────────
+    # Cheap layer that runs BEFORE the nano-parser. Catches obvious non-tech
+    # JDs (Lab Technician, Sales Manager, Relationship Manager, etc.) without
+    # spending the ~$0.0002 nano-parser call. Conservative: only fires when
+    # title matches a known non-tech pattern AND the body lacks tech markers.
+    # First line of `jd_text` is treated as the title for pattern matching.
+    prefilter_title = jd_text.splitlines()[0] if jd_text else ""
+    # Strip the "Job Title:" prefix if the caller added it.
+    if prefilter_title.lower().startswith("job title:"):
+        prefilter_title = prefilter_title.split(":", 1)[1].strip()
+    is_non_tech, prefilter_reason = _quick_non_tech_check(jd_text, prefilter_title)
+    if is_non_tech:
+        logger.info(
+            "[skills/extract-from-jd] STAGE-0 REJECT (free regex): title=%r reason=%s",
+            prefilter_title, prefilter_reason,
+        )
+        rejected_response = JDSkillPipelineResponse(
+            final_skills=[],
+            jd_role=JdRoleHint(
+                display_name=prefilter_title or "(unknown)",
+                slug="",
+                role_archetype="Other",
+                rationale=prefilter_reason,
+            ),
+            nano_parsed=None,
+            rejected=True,
+            rejection_reason=f"Non-tech JD: {prefilter_reason}",
+        )
+        try:
+            history_repo = JdPipelineRunRepository()
+            rejected_run_id = await asyncio.to_thread(
+                history_repo.start_run,
+                jd_text=jd_text,
+                api1_response=rejected_response,
+                api_parser_response=None,
+                jd_role_hint_display=prefilter_title or "(unknown)",
+                llm_cost_usd=0.0,
+            )
+            rejected_response.run_id = rejected_run_id
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[skills/extract-from-jd] stage-0 reject start_run failed: %s", exc)
+        return rejected_response
+
     try:
         # Stage 1 — FAST_MODEL parses JD structure (job_parser.txt): company, role, R&R, etc.
         nano_parsed = await _llm_parse_jd_nano(jd_text, cost_acc=cost_acc)
