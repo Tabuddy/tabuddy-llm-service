@@ -43,7 +43,9 @@ def _normalize_entity_source(source: str | None) -> str:
     """Map app-side source tags to DB enum values."""
     s = (source or "").strip().lower()
     if s in {"manual", "human"}:
-        return "MANUAL_CURATED"
+        return "MANUAL_CURATION"
+    if s == "linkedin":
+        return "LINKEDIN"
     # default for llm/db/unknown tags
     return "AUTOMATED_DISCOVERY"
 
@@ -1141,6 +1143,201 @@ class SkillLibraryRepository:
             with conn.cursor() as cur:
                 cur.execute(sql)
                 return self._rows_to_dicts(cur, cur.fetchall())
+
+    @staticmethod
+    def _linkedin_roles_search_clause(q: str | None) -> tuple[str, list]:
+        """ILIKE on display_name + slug; exact id when ``q`` is all digits."""
+        term = (q or "").strip()
+        if not term:
+            return "", []
+        like = f"%{term}%"
+        parts = ["display_name ILIKE %s", "slug ILIKE %s"]
+        params: list = [like, like]
+        if term.isdigit():
+            parts.append("id = %s")
+            params.append(int(term))
+        else:
+            parts.append("CAST(id AS TEXT) LIKE %s")
+            params.append(like)
+        return " WHERE (" + " OR ".join(parts) + ")", params
+
+    def count_linkedin_roles(self, q: str | None = None) -> int:
+        where_sql, params = self._linkedin_roles_search_clause(q)
+        sql = f"SELECT COUNT(*) FROM {self.schema}.linkedin_roles{where_sql}"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params) if params else None)
+                row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def list_linkedin_roles(
+        self,
+        *,
+        q: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Rows from ``linkedin_roles`` staging table (id, slug, display_name, created_at)."""
+        where_sql, params = self._linkedin_roles_search_clause(q)
+        lim_sql = ""
+        if limit is not None and limit > 0:
+            lim_sql = " LIMIT %s OFFSET %s"
+            params = [*params, int(limit), max(0, int(offset))]
+        order = (
+            "display_name ASC, id ASC"
+            if (q or "").strip()
+            else "id ASC"
+        )
+        sql = f"""
+            SELECT id, slug, display_name, created_at
+              FROM {self.schema}.linkedin_roles
+             {where_sql}
+             ORDER BY {order}
+             {lim_sql}
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params) if params else None)
+                return self._rows_to_dicts(cur, cur.fetchall())
+
+    def display_name_exists_in_role_aliases(self, display_name: str) -> bool:
+        """Case-insensitive: ``linkedin_roles.display_name`` vs ``role_aliases.alias_lower``."""
+        key = (display_name or "").strip().lower()
+        if not key:
+            return False
+        sql = f"""
+            SELECT 1 FROM {self.schema}.role_aliases
+             WHERE alias_lower = %s
+             LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (key,))
+                return cur.fetchone() is not None
+
+    def load_all_role_alias_lower(self) -> set[str]:
+        """All ``role_aliases.alias_lower`` values (read-only seed for dedup)."""
+        sql = f"SELECT alias_lower FROM {self.schema}.role_aliases"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+        out: set[str] = set()
+        for (val,) in rows:
+            if val:
+                out.add(str(val).strip().lower())
+        return out
+
+    def role_has_aliases(self, role_id: int) -> bool:
+        sql = f"""
+            SELECT 1 FROM {self.schema}.role_aliases
+             WHERE role_id = %s
+             LIMIT 1
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(role_id),))
+                return cur.fetchone() is not None
+
+    def insert_role_aliases(
+        self,
+        role_id: int,
+        rows: Sequence[dict],
+        *,
+        embeddings: dict[str, list[float] | None] | None = None,
+    ) -> int:
+        """Upsert role alias rows. Each dict: alias_text, alias_type, is_primary."""
+        if not rows:
+            return 0
+        emb = embeddings or {}
+        written = 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for r in rows:
+                    alias_text = str(r.get("alias_text") or "").strip()
+                    if not alias_text:
+                        continue
+                    alias_type = str(r.get("alias_type") or "COLLOQUIAL")
+                    is_primary = bool(r.get("is_primary", False))
+                    vec = emb.get(alias_text)
+                    vec_str = (
+                        "[" + ",".join(map(str, vec)) + "]"
+                        if vec
+                        else None
+                    )
+                    if is_primary:
+                        cur.execute(
+                            f"""
+                            UPDATE {self.schema}.role_aliases
+                               SET is_primary = FALSE
+                             WHERE role_id = %s AND is_primary = TRUE
+                               AND alias_text != %s
+                            """,
+                            (int(role_id), alias_text),
+                        )
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.schema}.role_aliases (
+                            role_id, alias_text, alias_type, match_strategy,
+                            is_primary, alias_embedding
+                        )
+                        VALUES (%s, %s, %s::alias_type,
+                                'CASE_INSENSITIVE', %s,
+                                %s::{self._vector_type_sql})
+                        ON CONFLICT (role_id, alias_text) DO UPDATE
+                            SET alias_type = EXCLUDED.alias_type,
+                                is_primary = EXCLUDED.is_primary,
+                                alias_embedding = COALESCE(
+                                    EXCLUDED.alias_embedding,
+                                    {self.schema}.role_aliases.alias_embedding
+                                )
+                        """,
+                        (
+                            int(role_id),
+                            alias_text,
+                            alias_type,
+                            is_primary,
+                            vec_str,
+                        ),
+                    )
+                    written += 1
+            conn.commit()
+        return written
+
+    def delete_linkedin_roles_row(self, linkedin_role_id: int) -> bool:
+        """Remove a duplicate row from ``linkedin_roles`` staging only."""
+        sql = f"""
+            DELETE FROM {self.schema}.linkedin_roles
+             WHERE id = %s
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(linkedin_role_id),))
+                n = cur.rowcount
+            conn.commit()
+        return n > 0
+
+    def resolve_catalog_role_for_linkedin(
+        self,
+        *,
+        slug: str,
+        display_name: str,
+        create_if_missing: bool = False,
+    ) -> dict | None:
+        """Map a ``linkedin_roles`` row to a canonical ``roles`` row (for ``role_aliases`` FK)."""
+        existing = self.find_role_by_identity(
+            slug=slug,
+            display_name=display_name,
+        )
+        if existing:
+            return existing
+        if not create_if_missing:
+            return None
+        return self.create_role(
+            slug=slug,
+            display_name=display_name,
+            source="linkedin",
+        )
 
     def list_categories(self) -> list[dict]:
         """All categories with sub-category and skill counts."""

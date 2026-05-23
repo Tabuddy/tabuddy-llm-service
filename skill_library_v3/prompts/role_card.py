@@ -208,6 +208,70 @@ def format_charter_block(charter: dict) -> str:
     return "\n\n".join(parts)
 
 
+# ── LinkedIn backfill (title-only; same alias rules as Stage 1) ───────────
+
+ROLE_ALIAS_BACKFILL_PROMPT_VERSION = "linkedin_alias_v1.0"
+
+# Alias + canonical_name rules copied from ROLE_CARD_SYSTEM_PROMPT so catalog
+ROLE_ALIAS_BACKFILL_SYSTEM_PROMPT = """\
+You produce ONLY two fields for a canonical role catalog entry:
+canonical_name and aliases. Use the SAME rules as Stage 1 role-card
+anchoring in the v3 skills-catalog pipeline.
+
+Output rules:
+  * canonical_name: the human-readable role name (echo the one provided
+    unless a clearly better canonical wording exists for the same role).
+
+  * aliases: 3 to 6 alternate spellings or commonly-used short forms that
+    refer to THE EXACT SAME ROLE. Aliases are surface-form variants of
+    the same job, not adjacent roles in the same family. Aim to include
+    at least ONE short-form abbreviation when one exists in the field
+    (e.g. "BE" for Backend Engineer, "DE" for Data Engineer, "QA" for
+    Quality Assurance Engineer, "FE" for Frontend Engineer).
+
+    Acceptable examples:
+      - Abbreviations: "BE" for Backend Engineer, "DE" for Data Engineer,
+        "FE" for Frontend Engineer, "ML" for ML Engineer
+      - Spelling variants: "Front-End Developer" for Frontend Developer
+      - Deprecated/legacy wordings: "Webmaster" for Web Engineer
+      - Marketplace shorthand for the same role:
+          "Backend Developer", "Server-side Engineer", "Backend Software
+          Engineer", "Server Developer" all for Backend Engineer
+
+    DO NOT include distinct roles, even when they share a tech stack or
+    family with the canonical role. The following are NOT aliases — they
+    are separate roles that will get their own charter:
+      - For DevOps Engineer:
+          "Site Reliability Engineer", "Platform Engineer",
+          "Build and Release Engineer", "Production Engineer",
+          "DevSecOps Engineer" — all distinct disciplines.
+      - For Data Engineer:
+          "Data Scientist", "Analytics Engineer", "ML Engineer".
+      - For MLOps Engineer:
+          "ML Engineer", "Data Scientist", "AI Engineer".
+      - For Backend Engineer:
+          "Full Stack Engineer", "API Engineer" (when listed as its
+          own role), "Platform Engineer".
+
+    The litmus test: if the candidate alias has its own meaningful job-
+    posting volume distinct from the canonical role, it is NOT an alias.
+    Do not include the canonical_name itself.
+
+Emit only a single JSON object with keys canonical_name and aliases.
+No prose, no code fences. aliases must be a JSON array of strings.
+"""
+
+
+ROLE_ALIAS_BACKFILL_USER_TEMPLATE = """\
+Role title from LinkedIn ingestion (no Stage 0 charter available):
+{role_name}
+
+Slug (for reference only): {role_slug}
+
+Produce JSON with canonical_name and aliases only.
+"""
+
+
 def format_family_enum() -> str:
     """Render the family enum as a dashed list with one-line descriptions
     so the LLM has disambiguation anchors when picking."""
