@@ -542,7 +542,28 @@ _TECH_MARKER_PATTERN = re.compile(
     r"backend|frontend|full[- ]?stack|"
     r"machine\slearning|deep\slearning|data\sengineering|data\sscience|"
     r"sql|nosql|mongodb|postgres(?:ql)?|mysql|redis|elasticsearch|"
-    r"selenium|cypress|jest|pytest|junit"
+    r"selenium|cypress|jest|pytest|junit|"
+    # Mainframe / legacy enterprise
+    r"cobol|jcl|cics|db2|z/os|vsam|ims|abap|s/4hana|"
+    # Quantum / emerging
+    r"qiskit|cirq|qaoa|vqe|qubit|ibm\squantum|ionq|"
+    # Telecom / networking
+    r"netconf|yang|tm\sforum|oss|bss|nfv|sdn|mec|snmp|bgp|mpls|5g|lte|"
+    # Hardware / silicon
+    r"fpga|asic|rtl|verilog|systemverilog|vlsi|"
+    # ERP / CRM platforms
+    r"sap(?:\s(?:fico|mm|sd|pp|hcm|abap|basis))?|workday|netsuite|peoplesoft|"
+    r"salesforce|sfdc|apex|servicenow|pega|"
+    # Security tooling
+    r"siem|iam|owasp|soc\s?2|gdpr|hipaa|burp\ssuite|nessus|splunk|"
+    # Cloud-native niche
+    r"helm|istio|envoy|etcd|protobuf|grpc|"
+    # Mobile native
+    r"jetpack\scompose|swiftui|uikit|"
+    # Web3 / blockchain
+    r"solidity|web3|ethereum|"
+    # Robotics / IoT
+    r"\bros\b|rtos"
     r")\b",
     re.IGNORECASE,
 )
