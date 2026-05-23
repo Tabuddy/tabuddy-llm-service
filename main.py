@@ -748,6 +748,7 @@ class LinkedInRoleListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    q: str | None = None
 
 
 class V3StageRow(BaseModel):
@@ -4837,18 +4838,25 @@ async def resume_ranking_ui(request: Request):
 @app.get("/linkedin-role", response_class=HTMLResponse)
 async def linkedin_role_ui(
     request: Request,
+    q: str = "",
     limit: int = 500,
     offset: int = 0,
 ):
     """Read-only table of ``linkedin_roles`` (id, display_name, created_at)."""
     limit = min(max(1, limit), 2000)
     offset = max(0, offset)
+    search_q = (q or "").strip()
     repo = SkillLibraryRepository()
     try:
         rows = await asyncio.to_thread(
-            repo.list_linkedin_roles, limit=limit, offset=offset
+            repo.list_linkedin_roles,
+            q=search_q or None,
+            limit=limit,
+            offset=offset,
         )
-        total = await asyncio.to_thread(repo.count_linkedin_roles)
+        total = await asyncio.to_thread(
+            repo.count_linkedin_roles, search_q or None
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -4882,21 +4890,32 @@ async def linkedin_role_ui(
             "has_next": has_next,
             "prev_offset": prev_offset,
             "next_offset": next_offset,
+            "search_q": search_q,
         },
     )
 
 
 @app.get("/api/linkedin-roles", response_model=LinkedInRoleListResponse)
-async def api_linkedin_roles(limit: int = 500, offset: int = 0):
+async def api_linkedin_roles(
+    q: str = "",
+    limit: int = 500,
+    offset: int = 0,
+):
     """JSON list of ``linkedin_roles`` for clients."""
     limit = min(max(1, limit), 2000)
     offset = max(0, offset)
+    search_q = (q or "").strip()
     repo = SkillLibraryRepository()
     try:
         rows = await asyncio.to_thread(
-            repo.list_linkedin_roles, limit=limit, offset=offset
+            repo.list_linkedin_roles,
+            q=search_q or None,
+            limit=limit,
+            offset=offset,
         )
-        total = await asyncio.to_thread(repo.count_linkedin_roles)
+        total = await asyncio.to_thread(
+            repo.count_linkedin_roles, search_q or None
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -4915,6 +4934,7 @@ async def api_linkedin_roles(limit: int = 500, offset: int = 0):
         total=total,
         limit=limit,
         offset=offset,
+        q=search_q or None,
     )
 
 

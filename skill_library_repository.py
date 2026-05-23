@@ -1144,30 +1144,55 @@ class SkillLibraryRepository:
                 cur.execute(sql)
                 return self._rows_to_dicts(cur, cur.fetchall())
 
-    def count_linkedin_roles(self) -> int:
-        sql = f"SELECT COUNT(*) FROM {self.schema}.linkedin_roles"
+    @staticmethod
+    def _linkedin_roles_search_clause(q: str | None) -> tuple[str, list]:
+        """ILIKE on display_name + slug; exact id when ``q`` is all digits."""
+        term = (q or "").strip()
+        if not term:
+            return "", []
+        like = f"%{term}%"
+        parts = ["display_name ILIKE %s", "slug ILIKE %s"]
+        params: list = [like, like]
+        if term.isdigit():
+            parts.append("id = %s")
+            params.append(int(term))
+        else:
+            parts.append("CAST(id AS TEXT) LIKE %s")
+            params.append(like)
+        return " WHERE (" + " OR ".join(parts) + ")", params
+
+    def count_linkedin_roles(self, q: str | None = None) -> int:
+        where_sql, params = self._linkedin_roles_search_clause(q)
+        sql = f"SELECT COUNT(*) FROM {self.schema}.linkedin_roles{where_sql}"
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
+                cur.execute(sql, tuple(params) if params else None)
                 row = cur.fetchone()
         return int(row[0]) if row else 0
 
     def list_linkedin_roles(
         self,
         *,
+        q: str | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict]:
         """Rows from ``linkedin_roles`` staging table (id, slug, display_name, created_at)."""
+        where_sql, params = self._linkedin_roles_search_clause(q)
         lim_sql = ""
-        params: list = []
         if limit is not None and limit > 0:
             lim_sql = " LIMIT %s OFFSET %s"
-            params.extend([int(limit), max(0, int(offset))])
+            params = [*params, int(limit), max(0, int(offset))]
+        order = (
+            "display_name ASC, id ASC"
+            if (q or "").strip()
+            else "id ASC"
+        )
         sql = f"""
             SELECT id, slug, display_name, created_at
               FROM {self.schema}.linkedin_roles
-             ORDER BY id ASC
+             {where_sql}
+             ORDER BY {order}
              {lim_sql}
         """
         with self._connect() as conn:

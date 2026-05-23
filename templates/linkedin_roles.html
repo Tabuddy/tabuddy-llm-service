@@ -122,6 +122,47 @@
       display: none;
     }
     .toast.error { display: block; background: rgba(225, 112, 85, 0.2); border: 1px solid #e17055; color: #fab1a0; }
+    .search-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+    .search-bar input[type="search"] {
+      flex: 1;
+      min-width: 220px;
+      padding: 0.55rem 0.85rem;
+      font-size: 0.9rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+    }
+    .search-bar input[type="search"]::placeholder { color: var(--text-dim); }
+    .search-bar input[type="search"]:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+    .search-btn, .search-clear {
+      padding: 0.55rem 1rem;
+      font-size: 0.9rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .search-btn {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .search-btn:hover { filter: brightness(1.08); }
+    .search-clear {
+      background: var(--surface2);
+      color: var(--text-dim);
+    }
+    .search-clear:hover { color: var(--text); border-color: var(--text-dim); }
   </style>
 </head>
 <body>
@@ -131,8 +172,21 @@
       <h1>LinkedIn roles</h1>
       <p>Staging table <code>linkedin_roles</code> — titles imported from LinkedIn before alias backfill.</p>
     </div>
+    <form class="search-bar" method="get" action="/linkedin-role" role="search">
+      <input type="hidden" name="limit" value="{{ limit }}">
+      <input type="search" name="q" value="{{ search_q }}"
+             placeholder="Search display name, slug, or id…"
+             autocomplete="off" aria-label="Search LinkedIn roles">
+      <button type="submit" class="search-btn">Search</button>
+      {% if search_q %}
+      <a class="search-clear" href="/linkedin-role?limit={{ limit }}">Clear</a>
+      {% endif %}
+    </form>
     <p class="meta" id="metaLine">
-      {% if rows and total > 0 %}
+      {% if search_q %}
+      {{ total }} match{{ 'es' if total != 1 else '' }} for &ldquo;{{ search_q }}&rdquo;
+      {% if rows and total > 0 %} &mdash; rows {{ offset + 1 }}&ndash;{{ offset + rows|length }}{% endif %}
+      {% elif rows and total > 0 %}
       Rows {{ offset + 1 }}–{{ offset + rows|length }} of {{ total }}
       {% else %}
       {{ total }} row(s) total
@@ -175,19 +229,19 @@
         </tbody>
       </table>
       {% else %}
-      <p class="empty">No rows in linkedin_roles.</p>
+      <p class="empty">{% if search_q %}No roles match &ldquo;{{ search_q }}&rdquo;.{% else %}No rows in linkedin_roles.{% endif %}</p>
       {% endif %}
     </div>
 
     <nav class="pager" aria-label="Pagination">
       <div class="pager-btns">
         {% if has_prev %}
-        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&offset={{ prev_offset }}">Previous</a>
+        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&offset={{ prev_offset }}{% if search_q %}&amp;q={{ search_q|urlencode }}{% endif %}">Previous</a>
         {% else %}
         <span class="pager-btn disabled">Previous</span>
         {% endif %}
         {% if has_next %}
-        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&offset={{ next_offset }}">Next</a>
+        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&offset={{ next_offset }}{% if search_q %}&amp;q={{ search_q|urlencode }}{% endif %}">Next</a>
         {% else %}
         <span class="pager-btn disabled">Next</span>
         {% endif %}
@@ -198,7 +252,8 @@
   <div id="pageState" hidden
        data-limit="{{ limit }}"
        data-offset="{{ offset }}"
-       data-total="{{ total }}"></div>
+       data-total="{{ total }}"
+       data-search="{{ search_q|e }}"></div>
   <div id="toast" class="toast" role="alert"></div>
   <script>
     (function () {
@@ -206,6 +261,13 @@
       const pageLimit = Number(pageState.limit) || 500;
       const pageOffset = Number(pageState.offset) || 0;
       let totalCount = Number(pageState.total) || 0;
+      const searchQ = pageState.search || '';
+
+      function pageQuery(extraOffset) {
+        var qs = '?limit=' + pageLimit + '&offset=' + (extraOffset != null ? extraOffset : pageOffset);
+        if (searchQ) qs += '&q=' + encodeURIComponent(searchQ);
+        return qs;
+      }
       const toast = document.getElementById('toast');
       const metaLine = document.getElementById('metaLine');
       const body = document.getElementById('rolesBody');
@@ -222,7 +284,7 @@
         const newTotal = totalCount;
         if (remainingOnPage === 0) {
           if (pageOffset > 0) {
-            window.location.href = '/linkedin-role?limit=' + pageLimit + '&offset=' + Math.max(0, pageOffset - pageLimit);
+            window.location.href = '/linkedin-role' + pageQuery(Math.max(0, pageOffset - pageLimit));
             return;
           }
           metaLine.textContent = newTotal + ' row(s) total (' + pageLimit + ' per page)';

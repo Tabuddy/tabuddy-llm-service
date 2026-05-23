@@ -2,9 +2,9 @@
 """
 Backfill role_aliases from ``linkedin_roles`` staging rows.
 
-Reads ``linkedin_roles`` (id, slug, display_name). Dedup deletes staging rows
-when the title already exists in ``role_aliases``. Aliases are stored on the
-canonical ``roles`` row (find or create on persist).
+Reads ``linkedin_roles`` (id, slug, display_name). Per row: exact lowercase
+match of ``display_name`` in ``role_aliases.alias_lower`` → delete staging row;
+otherwise LLM aliases and persist to catalog ``roles`` / ``role_aliases``.
 
 Phase 1 (default): read + LLM + log WOULD_* only — persist blocks commented.
 """
@@ -167,17 +167,11 @@ def _persist_catalog_and_aliases(
 async def run_backfill(
     *,
     limit: int | None,
-    force: bool,
 ) -> dict[str, int]:
     repo = SkillLibraryRepository()
     roles = repo.list_linkedin_roles(limit=limit)
 
-    alias_lower = repo.load_all_role_alias_lower()
-    logger.info(
-        "Loaded %d linkedin_roles rows, %d existing role_aliases (read-only)",
-        len(roles),
-        len(alias_lower),
-    )
+    logger.info("Loaded %d linkedin_roles rows (read-only)", len(roles))
 
     stats = {
         "processed": 0,
@@ -200,11 +194,11 @@ async def run_backfill(
             stats["skipped"] += 1
             continue
 
-        # Dedup: lower(display_name) vs role_aliases.alias_lower (case-insensitive).
-        if key in alias_lower:
+        # Exact lowercase match: display_name → role_aliases.alias_lower
+        if repo.display_name_exists_in_role_aliases(display_name):
             logger.info(
                 "WOULD_DELETE linkedin_roles id=%s slug=%s display_name=%r "
-                "(matched alias_lower=%r)",
+                "(exact alias_lower match %r)",
                 linkedin_id,
                 slug,
                 display_name,
@@ -216,16 +210,6 @@ async def run_backfill(
 
         catalog = repo.find_role_by_identity(slug=slug, display_name=display_name)
         catalog_role_id = int(catalog["id"]) if catalog else None
-
-        if catalog_role_id is not None and repo.role_has_aliases(catalog_role_id) and not force:
-            logger.info(
-                "SKIP already_has_aliases linkedin_roles.id=%s roles.id=%s display_name=%r",
-                linkedin_id,
-                catalog_role_id,
-                display_name,
-            )
-            stats["skipped"] += 1
-            continue
 
         if catalog_role_id is None:
             logger.info(
@@ -263,7 +247,6 @@ async def run_backfill(
                 r["is_primary"],
             )
             stats["would_insert"] += 1
-            alias_lower.add(_normalize_key(r["alias_text"]))
 
         _persist_catalog_and_aliases(
             repo,
@@ -291,13 +274,8 @@ def main() -> None:
         description="Generate role_aliases from linkedin_roles (log-only phase 1).",
     )
     parser.add_argument("--limit", type=int, default=None, help="Max staging rows")
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Run LLM even if canonical roles.id already has aliases",
-    )
     args = parser.parse_args()
-    asyncio.run(run_backfill(limit=args.limit, force=args.force))
+    asyncio.run(run_backfill(limit=args.limit))
 
 
 if __name__ == "__main__":
