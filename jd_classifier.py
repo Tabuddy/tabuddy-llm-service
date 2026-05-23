@@ -8,7 +8,7 @@ Stage 5 applies the consequences: rolling-mean centroid update + audit rows.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal
 
 from excel_role_resolver import (
@@ -16,6 +16,7 @@ from excel_role_resolver import (
     upsert_excel_role as _upsert_excel_role,
 )
 from jd_similarity_matcher import RoleSignal, Stage3Result
+from domain_classifier import classify_domain_role, SubRolePick
 from skill_library_v3.db.repository import slugify as _slugify_canonical
 
 _logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ STAGE1_EMBEDDING_THRESHOLD: float = 0.70
 
 # ── Data models ──────────────────────────────────────────────────────────────
 
-CaseLiteral = Literal["A", "B", "C", "D", "E", "F", "NEW", "EXCEL_NEW"]
+CaseLiteral = Literal["A", "B", "C", "D", "E", "F", "NEW", "EXCEL_NEW", "DOMAIN"]
 
 
 def _slugify_for_new_role(text: str) -> str:
@@ -172,6 +173,11 @@ class Stage4Decision:
     is_new_role: bool = False
     new_role_display_name: str | None = None
     new_role_slug: str | None = None
+    # Populated only by case="DOMAIN" results (other cases default to empty).
+    sub_role: SubRolePick | None = None
+    matched_skills: list[str] = field(default_factory=list)
+    matched_dimensions: list[str] = field(default_factory=list)
+    matched_kras: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -371,6 +377,8 @@ async def stage4_route_decision(
     *,
     stage1_resolved: Stage1RoleResolution | None = None,
     llm2_fn: Llm2Fn | None = None,
+    nano_aliases: list[str] | None = None,
+    cost_acc=None,
 ) -> Stage4Decision:
     """Body-driven Stage 4 routing — skill + KRA are the primary decision
     signals; the verbatim JD title is advisory-only.
@@ -471,6 +479,49 @@ async def stage4_route_decision(
                     f"does not contradict"
                 ),
             )
+
+    # ── Branch 1.75: domain-first LLM classifier (inserted May 2026) ────────
+    # When no single unambiguous alias claimed the JD, ask gpt-5.4-mini to:
+    # (§A) pick the tech family/domain, then (§B) pick the role inside that
+    # domain plus extract matched skills/dimensions/KRAs, then (§C) optionally
+    # pick a sub-role for branchable parents. Returns None when the LLM is
+    # unsure or hallucinates — caller falls through to Branches 2-6.
+    domain_result = await classify_domain_role(
+        jd_title=role_name_input,
+        r_and_r_text=r_and_r_text,
+        nano_role=role_name_input,
+        nano_aliases=nano_aliases or [],
+        cost_acc=cost_acc,
+    )
+    if domain_result is not None:
+        chosen = RoleSignal(
+            role_id=domain_result.role_id,
+            slug=domain_result.role_slug,
+            display_name=domain_result.role_display_name,
+            score=domain_result.confidence,
+            signal_type="domain_match",
+        )
+        subrole_note = (
+            f" → sub-role {domain_result.sub_role.slug}"
+            if domain_result.sub_role is not None else ""
+        )
+        return Stage4Decision(
+            case="DOMAIN",
+            chosen_role=chosen,
+            confidence=domain_result.confidence,
+            llm2_fired=False,
+            llm2_reasoning=None,
+            alias_collision_detected=False,
+            queued=False,
+            reasoning=(
+                f"Domain={domain_result.domain}{subrole_note}; "
+                f"{domain_result.reasoning}"
+            ),
+            sub_role=domain_result.sub_role,
+            matched_skills=list(domain_result.matched_skills),
+            matched_dimensions=list(domain_result.matched_dimensions),
+            matched_kras=list(domain_result.matched_kras),
+        )
 
     # ── Branch 2: skill+KRA convergence → Case A ──────────────────────────────
     # When skill_top and kra_top agree AND KRA has a meaningful signal,

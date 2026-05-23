@@ -129,11 +129,16 @@ CREATE TABLE roles (
     slug            VARCHAR(120)  NOT NULL UNIQUE,
     display_name    VARCHAR(160)  NOT NULL,
     role_archetype  TEXT,
+    domain          VARCHAR(64)   NOT NULL DEFAULT 'Other',
+    parent_role_id  BIGINT        NULL REFERENCES roles(id) ON DELETE SET NULL,
+    is_branchable   BOOLEAN       NOT NULL DEFAULT FALSE,
     source          entity_source NOT NULL DEFAULT 'AUTOMATED_DISCOVERY',
     created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ
 );
 CREATE INDEX idx_roles_slug_trgm ON roles USING gin (slug gin_trgm_ops);
+CREATE INDEX idx_roles_domain    ON roles (domain);
+CREATE INDEX idx_roles_parent    ON roles (parent_role_id);
 
 -- ─── Dimensions ────────────────────────────────────────────────────────────
 CREATE TABLE dimensions (

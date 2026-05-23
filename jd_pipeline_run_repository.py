@@ -764,3 +764,43 @@ class JdPipelineRunRepository:
         result = dict(run_row)
         result["artifacts"] = [dict(r) for r in artifact_rows]
         return result
+
+    # ── Stuck-row sweeper helpers ──────────────────────────────────────────
+
+    def find_stuck_runs(
+        self, *, older_than_seconds: int = 60,
+    ) -> list[tuple[str, str]]:
+        """Return [(run_id, status)] for runs sitting in extract_from_jd_done
+        longer than the threshold. Used by the /admin/resume-stuck-runs
+        sweeper to re-fire autochain after a missed transition."""
+        stmt = sql.SQL(
+            "SELECT id::text, status FROM {schema}.{runs} "
+            "WHERE status = 'extract_from_jd_done' "
+            "  AND updated_at < now() - make_interval(secs => %s) "
+            "ORDER BY updated_at ASC LIMIT 100"
+        ).format(
+            schema=sql.Identifier(self.schema),
+            runs=sql.Identifier(self.runs_table),
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(stmt, (older_than_seconds,))
+                return [(row[0], row[1]) for row in cur.fetchall()]
+
+    def get_status(self, run_id: str | UUID) -> str | None:
+        """Look up just the `status` of a run. Returns None when run_id is
+        malformed or not present."""
+        rid = _coerce_uuid(run_id)
+        if not rid:
+            return None
+        stmt = sql.SQL(
+            "SELECT status FROM {schema}.{runs} WHERE id = %s::uuid"
+        ).format(
+            schema=sql.Identifier(self.schema),
+            runs=sql.Identifier(self.runs_table),
+        )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(stmt, (rid,))
+                row = cur.fetchone()
+                return row[0] if row else None

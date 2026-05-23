@@ -45,12 +45,14 @@ class CostAccumulator:
 
     def add(self, model: str, input_tokens: int, output_tokens: int) -> None:
         input_rate, output_rate = _get_rates(model)
-        cost = (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+        cost = (input_tokens * input_rate +
+                output_tokens * output_rate) / 1_000_000
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.call_count += 1
         self.total_cost_usd += cost
-        entry = self._by_model.setdefault(model, {"input": 0, "output": 0, "cost": 0.0})
+        entry = self._by_model.setdefault(
+            model, {"input": 0, "output": 0, "cost": 0.0})
         entry["input"] += input_tokens
         entry["output"] += output_tokens
         entry["cost"] += cost
@@ -71,7 +73,8 @@ class CostAccumulator:
         self.total_cost_usd += cost
         self.call_count += 1
         key = f"{model} (embed)"
-        entry = self._by_model.setdefault(key, {"input": 0, "output": 0, "cost": 0.0})
+        entry = self._by_model.setdefault(
+            key, {"input": 0, "output": 0, "cost": 0.0})
         entry["input"] += input_tokens
         entry["cost"] += cost
 

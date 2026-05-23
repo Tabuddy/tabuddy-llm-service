@@ -225,6 +225,14 @@ class Stage3SignalsResponse(BaseModel):
     alias_found: bool = False      # True when at least one alias_match_roles result returned
 
 
+class SubRoleInfo(BaseModel):
+    role_id: int
+    slug: str
+    display_name: str
+    confidence: float
+    reasoning: str = ""
+
+
 class Stage4DecisionResponse(BaseModel):
     case: str
     chosen_role: RoleSignalItem | None = None
@@ -237,6 +245,11 @@ class Stage4DecisionResponse(BaseModel):
     is_new_role: bool = False
     new_role_display_name: str | None = None
     new_role_slug: str | None = None
+    # Populated only by case="DOMAIN" results.
+    sub_role: SubRoleInfo | None = None
+    matched_skills: list[str] = Field(default_factory=list)
+    matched_dimensions: list[str] = Field(default_factory=list)
+    matched_kras: list[str] = Field(default_factory=list)
 
 
 class CandidateSkillAttached(BaseModel):
@@ -507,6 +520,37 @@ def _quick_non_tech_check(jd_text: str, title: str) -> tuple[bool, str]:
         f"non-tech title pattern matched ({soft!r}); "
         f"body had {tech_hits} tech markers (soft)"
     )
+
+
+# Body-length floor thresholds. Conjunction guard: reject ONLY when BOTH a body
+# is too short AND it carries too few tech markers. Niche-tech sparse JDs (e.g.,
+# "Senior FPGA Engineer. Verilog, SystemVerilog required, tape-out experience.")
+# would have tech_hits >= 2 and still pass even with a short body.
+_LOW_EVIDENCE_MIN_WORDS: int = 80
+_LOW_EVIDENCE_MIN_TECH_HITS: int = 2
+
+
+def _quick_low_evidence_check(jd_text: str) -> tuple[bool, str]:
+    """Return (is_too_sparse, reason). Conjunction guard: rejects only when the
+    body is BOTH short (< 40 words) AND tech-marker-poor (< 2 hits). Strips the
+    first line as the assumed title.
+
+    Cheap deterministic gate that runs alongside `_quick_non_tech_check` —
+    catches abuse/spam JDs before they consume any nano-parser tokens.
+    """
+    if not jd_text:
+        return True, "empty JD"
+    lines = jd_text.splitlines()
+    body = "\n".join(lines[1:]) if len(lines) > 1 else jd_text
+    word_count = len([w for w in body.split() if w.strip()])
+    tech_hits = len(_TECH_MARKER_PATTERN.findall(body))
+    if word_count < _LOW_EVIDENCE_MIN_WORDS and tech_hits < _LOW_EVIDENCE_MIN_TECH_HITS:
+        return True, (
+            f"JD body too sparse: {word_count} words, {tech_hits} tech-marker hits"
+            f" — needs more detail (>={_LOW_EVIDENCE_MIN_WORDS} words or "
+            f">={_LOW_EVIDENCE_MIN_TECH_HITS} tech markers) for confident classification"
+        )
+    return False, ""
 
 
 def _is_tech_jd(nano_parsed: dict | None) -> tuple[bool, str]:
@@ -1521,10 +1565,19 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
     if prefilter_title.lower().startswith("job title:"):
         prefilter_title = prefilter_title.split(":", 1)[1].strip()
     is_non_tech, prefilter_reason = _quick_non_tech_check(jd_text, prefilter_title)
-    if is_non_tech:
+    # Low-evidence floor: BOTH-short-AND-tech-marker-poor body. Fires only when
+    # non-tech regex didn't already reject, so non-tech takes priority and its
+    # reason wins. Catches sparse / abuse JDs before any nano-parser spend.
+    is_too_sparse, sparse_reason = (False, "")
+    if not is_non_tech:
+        is_too_sparse, sparse_reason = _quick_low_evidence_check(jd_text)
+    if is_non_tech or is_too_sparse:
+        _reason = prefilter_reason if is_non_tech else sparse_reason
+        _label = "Non-tech JD" if is_non_tech else "Sparse JD"
+        _stage_tag = "non-tech" if is_non_tech else "low-evidence"
         logger.info(
-            "[skills/extract-from-jd] STAGE-0 REJECT (free regex): title=%r reason=%s",
-            prefilter_title, prefilter_reason,
+            "[skills/extract-from-jd] STAGE-0 REJECT (%s): title=%r reason=%s",
+            _stage_tag, prefilter_title, _reason,
         )
         rejected_response = JDSkillPipelineResponse(
             final_skills=[],
@@ -1532,11 +1585,11 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 display_name=prefilter_title or "(unknown)",
                 slug="",
                 role_archetype="Other",
-                rationale=prefilter_reason,
+                rationale=_reason,
             ),
             nano_parsed=None,
             rejected=True,
-            rejection_reason=f"Non-tech JD: {prefilter_reason}",
+            rejection_reason=f"{_label}: {_reason}",
         )
         try:
             history_repo = JdPipelineRunRepository()
@@ -1842,7 +1895,60 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 s3, r_and_r_text=r_and_r_text, role_name_input=nano_role,
                 stage1_resolved=stage1_resolved,
                 llm2_fn=_llm2_with_cost,
+                nano_aliases=nano_role_aliases,
+                cost_acc=cost_acc,
             )
+            # ── Post-step: hoist leaf picks to their branchable parent ────
+            # When any Stage 4 branch lands on a child role (parent_role_id
+            # is set), swap chosen_role → parent and treat the leaf as the
+            # sub_role. Keeps the UI hierarchy consistent regardless of
+            # which branch fired (DOMAIN, LLM2 multi-alias-tie, alias trust).
+            if (
+                decision.chosen_role is not None
+                and decision.sub_role is None
+            ):
+                try:
+                    from domain_classifier import SubRolePick
+                    from jd_similarity_matcher import _pg_connect, _qs
+                    _conn = _pg_connect()
+                    try:
+                        with _conn:
+                            with _conn.cursor() as _cur:
+                                _cur.execute(
+                                    f"""
+                                    SELECT p.id, p.slug, p.display_name
+                                      FROM {_qs()}.roles c
+                                      JOIN {_qs()}.roles p ON p.id = c.parent_role_id
+                                     WHERE c.id = %s AND p.is_branchable = TRUE
+                                    """,
+                                    (decision.chosen_role.role_id,),
+                                )
+                                _row = _cur.fetchone()
+                    finally:
+                        try: _conn.close()
+                        except Exception: pass
+                    if _row is not None:
+                        _leaf = decision.chosen_role
+                        decision.sub_role = SubRolePick(
+                            role_id=_leaf.role_id,
+                            slug=_leaf.slug,
+                            display_name=_leaf.display_name,
+                            confidence=decision.confidence or 0.0,
+                            reasoning=f"hoisted from chosen leaf (case={decision.case})",
+                        )
+                        decision.chosen_role = type(_leaf)(
+                            role_id=int(_row[0]),
+                            slug=_row[1],
+                            display_name=_row[2],
+                            score=_leaf.score,
+                            signal_type=getattr(_leaf, "signal_type", "parent_hoist"),
+                        )
+                        logger.info(
+                            "[stage4] hoisted leaf '%s' → parent '%s' + sub_role",
+                            _leaf.slug, _row[1],
+                        )
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning("[stage4] parent-hoist failed: %s", _exc)
             stage4_response = Stage4DecisionResponse(
                 case=decision.case,
                 chosen_role=(
@@ -1862,6 +1968,18 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 is_new_role=decision.is_new_role,
                 new_role_display_name=decision.new_role_display_name,
                 new_role_slug=decision.new_role_slug,
+                sub_role=(
+                    SubRoleInfo(
+                        role_id=decision.sub_role.role_id,
+                        slug=decision.sub_role.slug,
+                        display_name=decision.sub_role.display_name,
+                        confidence=decision.sub_role.confidence,
+                        reasoning=decision.sub_role.reasoning,
+                    ) if decision.sub_role else None
+                ),
+                matched_skills=list(decision.matched_skills),
+                matched_dimensions=list(decision.matched_dimensions),
+                matched_kras=list(decision.matched_kras),
             )
             logger.info(
                 "[stage4] case=%s chosen=%s confidence=%.2f queued=%s llm2=%s",
@@ -2206,6 +2324,19 @@ async def _autochain_steps_2_3(api1: JDSkillPipelineResponse) -> None:
     if not run_id:
         return
 
+    # Idempotent guard — sweeper re-fires autochain for stuck rows; if a run
+    # already reached `completed` between the sweeper's SELECT and this task
+    # being scheduled, skip rather than double-fire step 2/3.
+    try:
+        current_status = await asyncio.to_thread(
+            JdPipelineRunRepository().get_status, run_id,
+        )
+    except Exception:  # noqa: BLE001
+        current_status = None
+    if current_status == "completed":
+        logger.debug("[autochain] run_id=%s already completed, skipping", run_id)
+        return
+
     import httpx
 
     base = os.getenv("AUTOCHAIN_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -2239,7 +2370,6 @@ async def _autochain_steps_2_3(api1: JDSkillPipelineResponse) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("[autochain] run_id=%s failed: %s", run_id, exc)
         try:
-            from jd_pipeline_run_repository import JdPipelineRunRepository
             history_repo = JdPipelineRunRepository()
             await asyncio.to_thread(
                 history_repo.mark_failed,
@@ -4225,6 +4355,39 @@ async def get_jd_pipeline_run(run_id: str):
         )
     )
     return JdRunDetail(**row, artifacts=artifacts, history_view=history_view)
+
+
+@app.post("/admin/resume-stuck-runs")
+async def resume_stuck_runs(older_than_seconds: int = 60) -> dict:
+    """Re-fire the autochain (step 2 + step 3) for runs sitting in
+    `extract_from_jd_done` longer than `older_than_seconds`. Used to recover
+    from rare cases where the original background task crashed or the server
+    restarted before step 3 completed (e.g. the Pega Developer run on
+    2026-05-21 that stayed in extract_from_jd_done forever).
+
+    Returns: {"swept": <N rows found>, "scheduled": <M autochain tasks dispatched>}.
+    """
+    repo = JdPipelineRunRepository()
+    stuck = await asyncio.to_thread(
+        repo.find_stuck_runs, older_than_seconds=older_than_seconds,
+    )
+    scheduled = 0
+    for run_id, _status in stuck:
+        record = await asyncio.to_thread(repo.get_run, run_id)
+        if record is None or not record.get("api1_response"):
+            continue
+        try:
+            api1 = JDSkillPipelineResponse.model_validate(record["api1_response"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[sweeper] run_id=%s api1 payload invalid: %s", run_id, exc)
+            continue
+        # Make sure run_id is set on the rehydrated payload (older rows may not
+        # have echoed it back into api1_response).
+        if not getattr(api1, "run_id", None):
+            api1.run_id = run_id
+        asyncio.create_task(_autochain_steps_2_3(api1))
+        scheduled += 1
+    return {"swept": len(stuck), "scheduled": scheduled}
 
 
 @app.post("/extract-pdf-links", response_model=PdfLinksResponse)
