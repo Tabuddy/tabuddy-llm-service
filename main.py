@@ -334,6 +334,47 @@ def _canonical_skill_display_names() -> tuple[str, ...]:
 _DEFAULT_TECH_RESCUE_MIN_SKILLS = 3
 
 
+# Tech-adjacent role title cues. When the nano-extracted title contains one
+# of these substrings AND the body has tech-context markers (see pattern
+# below), archetype rescue fires WITHOUT requiring 3+ canonical skill hits —
+# tech-adjacent JDs (BA/PM/TPM/Scrum Master/EM/TAM/Sales Engineer/etc.)
+# legitimately have low skill density.
+_TECH_ADJACENT_TITLE_PATTERNS: tuple[str, ...] = (
+    "business analyst", " ba ", " ba,", " ba.",  # BA acronym in title
+    "product manager", " pm ", " pm,", " pm.",
+    "project manager", "program manager",
+    "scrum master", "agile coach", "agile delivery",
+    "engineering manager", "engineering director", "head of engineering",
+    "technical writer", "documentation engineer",
+    "technical account manager", " tam ", " tam,", " tam.",
+    "sales engineer", "pre-sales engineer", "solutions engineer",
+    "developer advocate", "devrel", "developer relations",
+    "ux researcher", "user researcher",
+    "product designer", "ui designer", "ux designer", "ui/ux designer",
+    "service designer", "ux writer",
+)
+
+# Tech-context body markers. At least ONE must be present in the JD body for
+# the tech-adjacent rescue to fire. Captures the "this is a BA but in a tech
+# function" intent without requiring tech-skill keywords.
+_TECH_ADJACENT_BODY_PATTERN = re.compile(
+    r"\b("
+    r"business requirements|functional requirements|system requirements|"
+    r"user stories|acceptance criteria|user acceptance testing|uat|"
+    r"stakeholder management|stakeholder requirements|"
+    r"it function|technology function|tech team|engineering team|"
+    r"software|application|platform|system design|solution design|"
+    r"agile|scrum|sprint|kanban|"
+    r"product roadmap|feature definition|"
+    r"api documentation|technical documentation|"
+    r"crm|erp|saas|cloud|database|data model|"
+    r"jira|confluence|github|gitlab|"
+    r"ci/cd|devops|pipeline"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _rescue_archetype(
     *,
     jd_text: str,
@@ -379,6 +420,25 @@ def _rescue_archetype(
     # Already a tech archetype → gate would pass anyway, no need to scan.
     if arch in allowed:
         return 0
+
+    # Tech-adjacent rescue: when the nano title is a clear tech-adjacent role
+    # family (BA / PM / TPM / Scrum Master / Engineering Manager / etc.) AND
+    # the body has tech-context markers (IT/technology/software/system/UAT/
+    # stakeholder/etc.), promote archetype to 'Engineering' regardless of how
+    # many canonical skills the body mentions. Tech-adjacent JDs frequently
+    # have low skill density (no Python/SQL/etc.) yet are genuinely tech roles.
+    role_title = (nano_parsed.get("role") or "").lower()
+    body_lower = (jd_text or "")[:12_000].lower()
+    tech_adjacent_title = any(p in role_title for p in _TECH_ADJACENT_TITLE_PATTERNS)
+    if tech_adjacent_title and _TECH_ADJACENT_BODY_PATTERN.search(body_lower):
+        nano_parsed["role_archetype"] = "Engineering"
+        nano_parsed["archetype_override_applied"] = True
+        nano_parsed["archetype_override_reason"] = "tech-adjacent title + tech-context body"
+        logger.info(
+            "[archetype-rescue] fired (tech-adjacent path) — title=%r → "
+            "archetype='Engineering'", role_title,
+        )
+        return 1
 
     names = canonical_names if canonical_names is not None else _canonical_skill_display_names()
     if not names:
