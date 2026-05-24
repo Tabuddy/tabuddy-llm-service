@@ -2083,7 +2083,26 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 decision.confidence, decision.queued, decision.llm2_fired,
             )
         except Exception as exc:
-            logger.warning("[skills/extract-from-jd] Stage 4 failed: %s", exc)
+            # Stage 4 crashed silently before this fix — leaving stage4_response
+            # as None, which Pydantic serialized as {} in the response.
+            # Now: log full traceback + populate a structured fallback so admin
+            # history shows queued + reason, not an unexplained empty payload.
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(
+                "[skills/extract-from-jd] Stage 4 crashed: %s\n%s", exc, tb,
+            )
+            stage4_response = Stage4DecisionResponse(
+                case="E",
+                chosen_role=None,
+                confidence=0.0,
+                llm2_fired=False,
+                llm2_reasoning=None,
+                alias_collision_detected=False,
+                queued=True,
+                reasoning=f"Stage 4 crashed: {type(exc).__name__}: {str(exc)[:300]}",
+                is_new_role=False,
+            )
 
     # ── History start_run (before Stage 5 so we have a run_id to reference) ──
     response = JDSkillPipelineResponse(
@@ -4483,6 +4502,195 @@ async def resume_stuck_runs(older_than_seconds: int = 60) -> dict:
         asyncio.create_task(_autochain_steps_2_3(api1))
         scheduled += 1
     return {"swept": len(stuck), "scheduled": scheduled}
+
+
+# ── Admin: roles that need v3 enrichment, sorted by classification frequency ──
+
+@app.get("/admin/roles-needing-v3")
+async def admin_roles_needing_v3(limit: int = 50) -> dict:
+    """Return roles in the catalog that need v3 enrichment, sorted by how
+    often they show up as `chosen_role` in pipeline runs (desc). Eligibility:
+
+      * `role_kras` empty (Phase 1 shell row, never v3-enriched), OR
+      * `roles.source = 'AUTOMATED_DISCOVERY'` (synthesized via Case NEW)
+
+    Either condition is enough — the union catches both shell roles seeded
+    from Excel AND novel roles invented by the pipeline. Front-end uses
+    this list to render the click-to-trigger-v3 section on the history page.
+    """
+    import psycopg2  # noqa: F401 — needed for the UndefinedTable catch below
+    from jd_similarity_matcher import _pg_connect, _qs
+    qs = _qs()
+    sql = f"""
+        WITH freq AS (
+            SELECT
+                api1_response->'stage4_decision'->'chosen_role'->>'slug'         AS slug,
+                api1_response->'stage4_decision'->'chosen_role'->>'display_name' AS display_name,
+                COUNT(*)                                                          AS classification_count,
+                MAX(created_at)                                                   AS last_classified_at
+              FROM {qs}.jd_pipeline_runs
+             WHERE api1_response->'stage4_decision'->'chosen_role'->>'slug' IS NOT NULL
+               AND COALESCE(api1_response->>'rejected', 'false') <> 'true'
+             GROUP BY 1, 2
+        ),
+        kra_counts AS (
+            SELECT role_id, COUNT(*) AS n FROM {qs}.role_kras GROUP BY role_id
+        ),
+        existing_v3 AS (
+            -- v2_run_log uses `role_id` (varchar) as slug-equivalent + no updated_at
+            SELECT role_id AS role_slug,
+                   MAX(COALESCE(completed_at, started_at)) AS last_v3_at,
+                   bool_or(LOWER(status) IN ('running','pending','queued','in_progress')) AS in_flight
+              FROM {qs}.v2_run_log
+             GROUP BY role_id
+        )
+        SELECT
+            r.id, r.slug, r.display_name, r.domain, r.source::text AS source,
+            r.is_branchable,
+            COALESCE(f.classification_count, 0) AS classification_count,
+            COALESCE(k.n, 0)                    AS kra_count,
+            f.last_classified_at,
+            ev.last_v3_at,
+            COALESCE(ev.in_flight, FALSE)        AS v3_in_flight,
+            CASE
+                WHEN r.source = 'AUTOMATED_DISCOVERY' AND COALESCE(k.n,0)=0 THEN 'synth_no_kras'
+                WHEN r.source = 'AUTOMATED_DISCOVERY' THEN 'synth_with_kras'
+                ELSE 'shell_no_kras'
+            END AS needs_v3_reason
+          FROM {qs}.roles r
+          LEFT JOIN freq        f  ON LOWER(f.slug) = LOWER(r.slug)
+          LEFT JOIN kra_counts  k  ON k.role_id     = r.id
+          LEFT JOIN existing_v3 ev ON ev.role_slug  = r.slug
+         WHERE COALESCE(k.n,0) = 0
+            OR r.source = 'AUTOMATED_DISCOVERY'
+         ORDER BY COALESCE(f.classification_count, 0) DESC,
+                  r.display_name ASC
+         LIMIT %s
+    """
+    def _run():
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                # v2_run_log may not exist in older deploys — fall back gracefully
+                try:
+                    cur.execute(sql, (limit,))
+                    return cur.fetchall(), [d.name for d in cur.description]
+                except psycopg2.errors.UndefinedTable:
+                    conn.rollback()
+                    # Retry with an empty CTE in place of v2_run_log
+                    import re as _re
+                    fallback_sql = _re.sub(
+                        r"existing_v3 AS \(.*?\)\s*\n",
+                        "existing_v3 AS (SELECT NULL::text AS role_slug, "
+                        "NULL::timestamptz AS last_v3_at, FALSE AS in_flight "
+                        "WHERE FALSE)\n",
+                        sql, count=1, flags=_re.DOTALL,
+                    )
+                    cur.execute(fallback_sql, (limit,))
+                    return cur.fetchall(), [d.name for d in cur.description]
+        finally:
+            conn.close()
+    try:
+        rows, cols = await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[admin/roles-needing-v3] query failed: %s", exc, exc_info=True)
+        return {"roles": [], "error": str(exc)}
+    result = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        for ts_key in ("last_classified_at", "last_v3_at"):
+            if d.get(ts_key) is not None:
+                d[ts_key] = d[ts_key].isoformat()
+        result.append(d)
+    return {"roles": result, "count": len(result)}
+
+
+# ── Admin: manually trigger v3 enrichment for a specific role ──
+
+class TriggerV3Request(BaseModel):
+    slug: str | None = None
+    display_name: str | None = None
+
+
+@app.post("/admin/trigger-v3")
+async def admin_trigger_v3(req: TriggerV3Request) -> dict:
+    """Manually fire the v3 pipeline (Stage 0 onwards) for an existing role
+    OR by display_name (will upsert if not in DB). Used by the history page
+    'Trigger v3' button to enrich shell roles by classification frequency.
+
+    Returns: {run_id, slug, role_id, queued: true} on success.
+    Returns 409 when a v3 run for this role is already in flight.
+    """
+    if not req.slug and not req.display_name:
+        raise HTTPException(status_code=400, detail="slug or display_name required")
+
+    import psycopg2  # noqa: F401
+    from skill_library_v3 import runner as v3_runner
+    from jd_similarity_matcher import _pg_connect, _qs
+    qs = _qs()
+
+    def _check_inflight(slug_or_none: str | None) -> bool:
+        if not slug_or_none:
+            return False
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        f"SELECT 1 FROM {qs}.v2_run_log WHERE role_id=%s "
+                        f"AND LOWER(status) IN ('running','pending','queued','in_progress') LIMIT 1",
+                        (slug_or_none,),
+                    )
+                    return cur.fetchone() is not None
+                except psycopg2.errors.UndefinedTable:
+                    return False
+        finally:
+            conn.close()
+
+    if req.slug and _check_inflight(req.slug):
+        raise HTTPException(status_code=409, detail=f"v3 already running for slug={req.slug!r}")
+
+    # Resolve display name. If slug-only, look up DB.
+    display_name = req.display_name
+    if not display_name and req.slug:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT display_name FROM {qs}.roles WHERE slug=%s", (req.slug,))
+                row = cur.fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail=f"role slug={req.slug!r} not in DB")
+                display_name = row[0]
+        finally:
+            conn.close()
+
+    created = await asyncio.to_thread(v3_runner.create_initial_run, display_name)
+    run_uuid = created["run_id"]
+    role_slug = created["role_slug"]
+
+    # Resolve real role_id post-upsert
+    def _role_id():
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT id FROM {qs}.roles WHERE slug=%s", (role_slug,))
+                r = cur.fetchone()
+                return int(r[0]) if r else None
+        finally:
+            conn.close()
+    role_id = await asyncio.to_thread(_role_id)
+    asyncio.create_task(v3_runner.run_stage_0(run_uuid))
+    logger.info(
+        "[admin/trigger-v3] role=%r slug=%s role_id=%s run_id=%s (Stage 0 dispatched)",
+        display_name, role_slug, role_id, run_uuid,
+    )
+    return {
+        "run_id": str(run_uuid),
+        "slug": role_slug,
+        "role_id": role_id,
+        "display_name": display_name,
+        "queued": True,
+    }
 
 
 @app.post("/extract-pdf-links", response_model=PdfLinksResponse)
