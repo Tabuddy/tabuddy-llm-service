@@ -638,14 +638,64 @@ def _is_tech_jd(nano_parsed: dict | None) -> tuple[bool, str]:
     """Return ``(is_tech, reason_when_not_tech)``.
 
     Reject when:
-      * Stage 1 marked JD_type=fail (parser couldn't make sense of it).
+      * Stage 1 marked JD_type=fail (parser couldn't make sense of it) AND
+        archetype rescue didn't find at least 3 canonical-skill mentions.
+        Rich-skill JDs that lack a structured title (e.g., a copy-paste of
+        only the "Required Skills" section of a Drupal Developer posting)
+        should NOT be rejected — the body alone proves it's a real tech JD.
       * role_archetype is not in the allow-list (e.g., "Other", "Management",
         "Product", "Design" — none of these align with our SE-focused catalog).
     """
     if not nano_parsed:
         return False, "Stage 1 returned no nano_parsed payload"
     if nano_parsed.get("JD_type") == "fail":
-        return False, "Stage 1 marked JD_type=fail (unparseable)"
+        # Skill-rich override: a JD can be "unparseable" by nano (no clear
+        # title or responsibilities) but still be undeniably tech if the body
+        # is dense with technical content. Two independent unlock signals:
+        #
+        #   1. Archetype rescue fired with >= 3 canonical-skill mentions
+        #      (`archetype_override_matched_skills`).
+        #   2. Body has >= 5 distinct tech-marker hits per _TECH_MARKER_PATTERN
+        #      (covers cases where canonical_skills lookup didn't match but
+        #      the body uses well-known tech terms like "Drupal", "Composer",
+        #      "Docker", "CI/CD" etc.).
+        #
+        # Either is enough — both are conservative thresholds.
+        rescue_skills = nano_parsed.get("archetype_override_matched_skills") or []
+        rescue_unlocked = (
+            nano_parsed.get("archetype_override_applied")
+            and isinstance(rescue_skills, list)
+            and len(rescue_skills) >= 3
+        )
+        # Fallback: count tech markers in the body the nano-parser saw.
+        # nano_parsed may include the JD body under different keys depending
+        # on the parse path; we scan whatever's there as a best-effort.
+        body_text = ""
+        for k in ("r_and_r_block", "responsibilities", "raw_body", "body"):
+            v = nano_parsed.get(k)
+            if isinstance(v, str):
+                body_text += "\n" + v
+            elif isinstance(v, list):
+                body_text += "\n" + "\n".join(str(x) for x in v if x)
+        tech_marker_hits = (
+            len(_TECH_MARKER_PATTERN.findall(body_text)) if body_text else 0
+        )
+        markers_unlocked = tech_marker_hits >= 5
+
+        if rescue_unlocked or markers_unlocked:
+            logger.info(
+                "[is_tech_jd] JD_type=fail overridden — rescue_skills=%d "
+                "tech_marker_hits=%d (unlocked by: %s)",
+                len(rescue_skills), tech_marker_hits,
+                "rescue" if rescue_unlocked else "tech_markers",
+            )
+            # Fall through to the archetype check below.
+        else:
+            return False, (
+                f"Stage 1 marked JD_type=fail (unparseable); body has only "
+                f"{len(rescue_skills)} canonical-skill mentions and "
+                f"{tech_marker_hits} tech-marker hits — insufficient evidence"
+            )
     arch = (nano_parsed.get("role_archetype") or "").strip()
     allowed_raw = os.getenv("TECH_ARCHETYPES", _DEFAULT_TECH_ARCHETYPES)
     allowed = {a.strip() for a in allowed_raw.split(",") if a.strip()}
@@ -1828,8 +1878,14 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
 
         primary_for_stage3 = [s.skill_name for s in final_skills if s.is_primary]
         skills_for_stage3 = primary_for_stage3 if primary_for_stage3 else [s.skill_name for s in final_skills]
+        # Incomplete-JD fallback: when nano didn't produce a roles_and_responsibilities
+        # section (e.g., a JD that's only "Tech stack:" + bullet list, no resps),
+        # use the raw jd_text so Stage 2 (R&R embedding) + Stage 3c (KRA match)
+        # still have something to embed. Empty r_and_r_text → empty stage3,
+        # which silently bricks Stage 4. Always pass SOMETHING with substance.
+        r_and_r_for_stage3 = r_and_r_text or jd_text
         s3: Stage3Result = await run_stage2_and_stage3(
-            r_and_r_text,
+            r_and_r_for_stage3,
             skills_for_stage3,
             nano_role,
             role_aliases=nano_role_aliases,
@@ -1986,8 +2042,12 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                     r_and_r_text, candidates, cost_acc=cost_acc,
                 )
 
+            # Same fallback as Stage 2: when nano produced no R&R section,
+            # Stage 4 (DOMAIN classifier §A/§B/§C, Excel intercept, LLM2)
+            # needs SOMETHING with substance to read. Fall back to raw jd_text.
+            r_and_r_for_stage4 = r_and_r_text or jd_text
             decision = await stage4_route_decision(
-                s3, r_and_r_text=r_and_r_text, role_name_input=nano_role,
+                s3, r_and_r_text=r_and_r_for_stage4, role_name_input=nano_role,
                 stage1_resolved=stage1_resolved,
                 llm2_fn=_llm2_with_cost,
                 nano_aliases=nano_role_aliases,

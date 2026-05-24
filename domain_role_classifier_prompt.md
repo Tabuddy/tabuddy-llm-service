@@ -61,7 +61,7 @@ classify it into exactly one of 21 pre-defined categories (18 tech families
 
 16. **Tech-Adjacent** — cues: Product Manager, Business Analyst, TPM, Scrum Master, UX/Product Designer, UX Researcher, Technical Writer, DevRel, Sales Engineer (tech context), TAM
 17. **Emerging Tech** — cues: blockchain, Solidity, Web3, Ethereum, IoT, edge computing, quantum, qubit, Qiskit, robotics, ROS, AR/VR
-18. **Other Specialty** — cues: Trust & Safety, Ad Tech (DSP/SSP/RTB), payments-tech-as-domain, GIS/geospatial, ESRI/ArcGIS, vertical-specialty engineering
+18. **Other Specialty** — cues: **Trust & Safety / Integrity / content moderation / anti-abuse / CSAM / spam at scale**, Ad Tech (DSP/SSP/RTB), payments-tech-as-domain, GIS/geospatial, ESRI/ArcGIS, **Telecom Application Engineering (OSS/BSS, TM Forum, NETCONF, YANG, fault management, service activation, provisioning, 5G core, MEC, NFV/SDN)**, growth/experimentation engineering, vertical-specialty engineering. **Pick this family when the role's IDENTITY is the vertical itself, even if the implementation stack is generic (Python/Java/Spring).**
 
 #### Non-tech buckets (safety net — Stage 0 regex usually catches these first)
 
@@ -82,6 +82,9 @@ classify it into exactly one of 21 pre-defined categories (18 tech families
 | ITSM & Automation vs SWE | ServiceNow/RPA/low-code primary → ITSM; general-purpose code primary → SWE |
 | Tech-Adjacent vs Non-Tech: Commercial | Requires technical fluency to do the job → Tech-Adjacent; doesn't → Non-Tech |
 | Hardware Engineering vs SWE (Embedded) | Silicon/RTL/FPGA/PCB → Hardware; firmware/drivers/embedded C++ → SWE |
+| **AI/ML vs Other Specialty (T&S / Integrity)** | When the role's PRIMARY job is detecting, classifying, or stopping abuse/spam/CSAM/harmful content at scale (even if PyTorch/embeddings are the implementation tool) → **Other Specialty**. When the role's PRIMARY job is general-purpose ML R&D, model training/serving, GenAI applications, MLOps → AI/ML. The cue is: who's the customer of the model? *Integrity/policy team* → Other Specialty. *Product/research team* → AI/ML. |
+| **SWE vs Other Specialty (Vertical Engineer)** | When the role IS the vertical (Trust & Safety Engineer, Payments Engineer, Ad Tech Engineer, Telecom Application Engineer, GIS Engineer, Growth Engineer) and the JD body emphasizes vertical-domain workflows (OSS/BSS, RTB auctions, payment rails, content moderation, geospatial pipelines) → **Other Specialty**. When the role is a general SWE who happens to work at a vertical company → SWE. Test: would removing the vertical-domain context leave a coherent job description? If no → Other Specialty. |
+| **SWE vs Infrastructure & Networking (Telecom)** | When the JD mentions carrier-grade systems, telecom operator context, network elements (Ericsson/Nokia/Cisco), TM Forum standards, NETCONF/YANG/SNMP integration, 5G core / NFV / SDN / MEC → **Infrastructure & Networking** (or Other Specialty for "Telecom Application Engineer"). Generic Java/Spring/Kafka stack is NOT enough to override → these are just implementation languages. |
 
 ### Validation gate
 
@@ -188,6 +191,144 @@ You will be shown:
   - Pick `flutter-developer` when Flutter, Dart, widgets-based UI
     architecture dominate.
   - Return `""` when neither dominates or the JD names both.
+
+- **Parent: `Game Developer`** — children include `unity-game-dev`,
+  `unreal-game-dev`, `game-engine-developer`, `game-networking-engineer`,
+  `game-server-engineer`, `game-tools-developer`, `graphics-programmer`,
+  `shader-engineer`, `technical-artist`, `game-designer`.
+  - Pick `unity-game-dev` when Unity / C# scripting / Unity Asset Store / URP/HDRP / Bolt dominate.
+  - Pick `unreal-game-dev` when Unreal Engine / Blueprints / C++ for UE / Niagara dominate.
+  - Pick `game-engine-developer` when building/extending an in-house engine,
+    rendering core, ECS internals — NOT shipping a game on Unity/Unreal.
+  - Pick `game-networking-engineer` when MMO netcode, lockstep, rollback,
+    matchmaking, dedicated servers dominate.
+  - Pick `graphics-programmer` / `shader-engineer` when HLSL / GLSL / PBR /
+    ray tracing / Vulkan / DirectX low-level rendering dominate.
+  - Pick `technical-artist` when shader-graph + DCC pipeline + art workflow
+    automation dominate.
+  - Pick `game-designer` when the role is mechanics / level design /
+    economy / balance — NOT engineering.
+  - Return `""` when JD mentions multiple specialties equally (e.g., generic Senior Game Engineer).
+
+- **Parent: `Embedded / Firmware Engineer`** — children include
+  `embedded-software-engineer`, `firmware-engineer`, `bsp-engineer`,
+  `bootloader-engineer`, `embedded-linux-engineer`, `rtos-engineer`,
+  `device-driver-developer`, `iot-firmware-engineer`, `autosar-developer`,
+  `adas-software-engineer`, `embedded-test-engineer`.
+  - Pick `firmware-engineer` when low-level register access, MCU peripherals,
+    bare-metal C, hardware bring-up dominate.
+  - Pick `bsp-engineer` when board support package / U-Boot / Linux kernel
+    porting / device tree authoring dominate.
+  - Pick `bootloader-engineer` specifically when U-Boot/UEFI/coreboot/SBL is the primary work.
+  - Pick `embedded-linux-engineer` when Yocto/Buildroot/cross-compile/
+    Linux user-space embedded apps dominate.
+  - Pick `rtos-engineer` when FreeRTOS/Zephyr/VxWorks/QNX task scheduling dominate.
+  - Pick `device-driver-developer` when kernel-mode drivers (Linux char device,
+    Windows WDM) dominate.
+  - Pick `iot-firmware-engineer` when LoRa/Zigbee/MQTT/edge connectivity dominate.
+  - Pick `autosar-developer` when Autosar Classic/Adaptive automotive standards dominate.
+  - Pick `adas-software-engineer` when sensor fusion/perception/path planning for autonomous vehicles dominate.
+  - Pick `embedded-test-engineer` when HIL/hardware-in-loop test automation dominates.
+  - Pick `embedded-software-engineer` (the generic) when JD is broad/spans multiple.
+
+- **Parent: `AWS Cloud Engineer`** — children include `aws-cloud-admin`,
+  `aws-cloud-developer`, `aws-cloud-support-engineer`, `aws-solutions-architect`,
+  `aws-container-specialist`, `aws-data-analytics-specialist`,
+  `aws-database-specialist`, `aws-networking-specialist`, `aws-security-engineer`,
+  `aws-serverless-specialist`.
+  - Pick `aws-solutions-architect` when designing AWS Well-Architected /
+    landing zones / multi-account org structure dominates.
+  - Pick `aws-cloud-developer` when SDK-driven AWS app development (Lambda,
+    DynamoDB CRUD, EventBridge wiring) dominates.
+  - Pick `aws-cloud-admin` when IAM / billing / org-level configuration / backup
+    dominates (operational).
+  - Pick `aws-cloud-support-engineer` when 24×7 incident response, ticket
+    queues, customer-facing AWS support dominates.
+  - Pick the specialty children (`aws-data-analytics-specialist`,
+    `aws-database-specialist`, `aws-networking-specialist`,
+    `aws-security-engineer`, `aws-serverless-specialist`,
+    `aws-container-specialist`) when the JD explicitly anchors on that
+    AWS service family.
+
+- **Parent: `Azure Cloud Engineer`** / **`GCP Cloud Engineer`** /
+  **`OCI Cloud Engineer`** — apply the same admin / developer / support /
+  solutions-architect + specialty pattern as AWS, swapping the vendor.
+
+- **Parent: `DevOps Engineer`** — children include `devops-engineer`,
+  `devops-solutions-architect`, `devops-tooling-developer`,
+  `infrastructure-automation-engineer`, `ci-cd-engineer`,
+  `network-devops-engineer`, `ansible-engineer`, `production-engineer`.
+  - Pick `ci-cd-engineer` when pipeline design (Jenkins/GitLab CI/GitHub Actions)
+    is the explicit headline.
+  - Pick `devops-tooling-developer` when JD asks for building internal CLIs / Go
+    / Python tooling that engineers use (not running pipelines).
+  - Pick `devops-solutions-architect` when JD asks for designing org-wide
+    DevOps strategy and process — senior, design-heavy.
+  - Pick `production-engineer` when on-call ownership of production services
+    dominates (heavy SRE overlap; pick here when JD says "Production Engineer" verbatim).
+  - Pick `network-devops-engineer` when network automation (Ansible for Cisco,
+    Terraform for routers) dominates.
+  - Pick `devops-engineer` (the generic) when JD is broad/horizontal.
+
+- **Parent: `Site Reliability Engineer (SRE)`** — children include `site-reliability-engineer`,
+  `cloud-reliability-engineer`, `network-reliability-engineer`.
+  - Pick `network-reliability-engineer` when SRE for telecom/network infra dominates.
+  - Pick `cloud-reliability-engineer` when SRE for a specific cloud platform dominates.
+  - Pick `site-reliability-engineer` (generic) when product/app SRE dominates.
+
+- **Parent: `Container / Kubernetes Engineer`** — children include
+  `kubernetes-administrator`, `kubernetes-engineer`, `kubernetes-platform-engineer`.
+  - Pick `kubernetes-administrator` when cluster ops / upgrades / RBAC /
+    storage / autoscaler tuning dominates.
+  - Pick `kubernetes-platform-engineer` when building developer-facing
+    K8s abstractions (operators, golden paths, service mesh) dominates.
+  - Pick `kubernetes-engineer` (generic) when JD is broad.
+
+- **Parent: `Platform Engineer`** — children include `platform-engineer`,
+  `developer-productivity-engineer`, `developer-experience-engineer`,
+  `build-infrastructure-engineer`, `test-infrastructure-engineer`,
+  `monorepo-engineer`, `data-platform-engineer-infra-side`,
+  `container-platform-manager`, `code-health-engineer`, `environment-engineer`.
+  - Pick `developer-productivity-engineer` / `developer-experience-engineer` when
+    the role is about internal-dev-team tools, golden paths, IDE plugins.
+  - Pick `build-infrastructure-engineer` / `monorepo-engineer` when Bazel/Buck/
+    monorepo tooling dominates.
+  - Pick `test-infrastructure-engineer` when test-runner platforms, flaky-test
+    triage at scale, CI-test-orchestration dominates.
+  - Pick `data-platform-engineer-infra-side` when underlying storage/compute
+    platforms for data teams dominate.
+  - Pick `platform-engineer` (generic) when JD is horizontal.
+
+- **Parent: `Infrastructure as Code Engineer`** — children include
+  `terraform-engineer`, `infrastructure-as-code-engineer`, `config-as-code-engineer`.
+  - Pick `terraform-engineer` when Terraform/HCL is the explicit headline.
+  - Otherwise pick the generic `infrastructure-as-code-engineer`.
+
+- **Parent: `Web Developer`** — children: CMS-specific engineers
+  (`wordpress-dev`, `drupal-dev`, `shopify-dev`, `magento-dev`,
+  `sitecore-dev`, `joomla-dev`, `hybris-dev`, `flex-air-dev`, etc.).
+  - Pick the specific CMS slug when the JD names that CMS verbatim
+    (WordPress / Drupal / Shopify / Magento / Sitecore).
+  - Return `""` when JD is a generic "web developer" without naming a CMS.
+
+- **Parent: `Cloud Architect`** — children include `aws-cloud-architect`,
+  `azure-cloud-architect`, `gcp-cloud-architect`, `multicloud-architect`,
+  `cloud-solutions-architect`, `cloud-infrastructure-engineer`,
+  `cloud-native-engineer`, `cloud-strategy-consultant`.
+  - Pick `aws-cloud-architect` / `azure-cloud-architect` / `gcp-cloud-architect`
+    when the JD anchors on a single vendor.
+  - Pick `multicloud-architect` when explicitly multi-cloud / hybrid.
+  - Pick `cloud-strategy-consultant` when advisory / TCO / migration-planning
+    dominates over hands-on architecture.
+
+- **Other branchable parents** (Desktop Application Developer, Media /
+  Streaming Platform Engineer, Search Engineer, Mainframe Engineer,
+  Multi-Cloud / Hybrid Cloud Engineer, Alibaba / IBM / Other Cloud Engineer,
+  Cloud Migration Engineer, Cloud Security Engineer, FinOps Engineer,
+  Cloud Native / Serverless Developer, AR/VR/XR Developer) — apply the
+  same principle: pick the child whose name most closely matches the
+  technology / specialty the JD explicitly names; return `""` when the
+  JD is generic.
 
 ### Output JSON shape
 
