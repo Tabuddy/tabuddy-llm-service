@@ -360,6 +360,78 @@ def _coerce_str_list(value: Any) -> list[str]:
     return out
 
 
+# ───────────────────────── §B sanity-check helpers ─────────────────────────
+
+
+def _normalise(text: str) -> str:
+    return " ".join((text or "").strip().lower().split()).rstrip(".,;:")
+
+
+async def _maybe_override_via_disambiguator(
+    *,
+    chosen: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    nano_role: str,
+    nano_aliases: list[str],
+) -> dict[str, Any] | None:
+    """Borderline-band sanity check for §B picks.
+
+    Build a mini-cohort containing the LLM's pick plus every in-domain
+    candidate whose display_name matches `nano_role` or any `nano_aliases`
+    entry. Run the shared disambiguator; only return a candidate when it
+    DIFFERS from the LLM pick AND won via TIER_B_TITLE (strongest signal).
+    Returns None when the disambiguator agrees with the LLM or is
+    inconclusive — the caller then keeps the LLM pick.
+    """
+    from role_disambiguator import disambiguate_overlap, load_candidate_enrichment
+
+    targets = {_normalise(nano_role)} | {
+        _normalise(a) for a in nano_aliases if a
+    }
+    targets.discard("")
+    if not targets:
+        return None
+
+    cohort: list[dict[str, Any]] = [chosen]
+    chosen_slug = chosen.get("slug")
+    for c in candidates:
+        if c.get("slug") == chosen_slug:
+            continue
+        if _normalise(c.get("display_name", "")) in targets:
+            cohort.append(c)
+    if len(cohort) < 2:
+        return None  # no alternative candidate matches nano titles
+
+    # Disambiguator expects `role_id` key; §B candidates have `id` — map.
+    cohort_for_disambig: list[dict[str, Any]] = [
+        {**c, "role_id": int(c["id"])} for c in cohort
+    ]
+    role_ids = [c["role_id"] for c in cohort_for_disambig]
+    enrichment = load_candidate_enrichment(role_ids)
+    result = disambiguate_overlap(
+        cohort_for_disambig,
+        nano_role=nano_role,
+        nano_aliases=nano_aliases,
+        jd_skills=[],  # §B doesn't have JD-extracted skills in scope
+        kra_scores=None,  # no Stage 3c output here; Tier A skipped anyway
+        enrichment=enrichment,
+    )
+    if result is None:
+        return None
+    winner_dict, tier = result
+    if tier != "TIER_B_TITLE":
+        # Only TIER_B is strong enough to override an LLM pick at this stage.
+        return None
+    if winner_dict.get("slug") == chosen_slug:
+        return None  # disambiguator agrees with LLM; nothing to do
+    # Return the original §B candidate (with `id` key) — not the
+    # role_id-augmented dict — so downstream code stays unchanged.
+    return next(
+        (c for c in candidates if c.get("slug") == winner_dict.get("slug")),
+        None,
+    )
+
+
 # ───────────────────────── entrypoint ─────────────────────────
 
 
@@ -417,6 +489,31 @@ async def classify_domain_role(
         return None
     if step2_conf < DOMAIN_ROLE_MIN_CONFIDENCE:
         return None
+
+    # ── §B sanity check: title-exact-match disambiguator (borderline only) ──
+    # When the LLM's confidence is in the borderline band (0.70–0.85), build a
+    # mini-cohort of "chosen + any in-domain candidate whose display_name
+    # matches nano_role or nano_aliases" and run the deterministic
+    # disambiguator over it. The override only fires when the disambiguator
+    # picks a different role via TIER_B_TITLE (strongest deterministic signal)
+    # — protects against §B picking a generic peer when one candidate's
+    # display_name IS the JD's literal title.
+    if 0.70 <= step2_conf < 0.85:
+        try:
+            override = await _maybe_override_via_disambiguator(
+                chosen=chosen,
+                candidates=candidates,
+                nano_role=nano_role,
+                nano_aliases=nano_aliases or [],
+            )
+            if override is not None:
+                logger.info(
+                    "[domain-classifier] §B override: %r → %r (TIER_B_TITLE)",
+                    chosen["slug"], override["slug"],
+                )
+                chosen = override
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[domain-classifier] §B disambiguator failed: %s", exc)
 
     matched_skills = _coerce_str_list(step2.get("matched_skills"))
     matched_dimensions = _coerce_str_list(step2.get("matched_dimensions"))

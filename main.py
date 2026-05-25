@@ -897,6 +897,7 @@ class JdRunSummary(BaseModel):
     jd_text_preview: str | None = None
     jd_text_length: int | None = None
     stage4_case: str | None = None
+    sub_role_display: str | None = None
     v3_pipeline_triggered: bool = False
     v3_run_id: str | None = None
     v3_role_slug: str | None = None
@@ -2036,10 +2037,11 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
             from jd_classifier import llm2_resolve_role, stage4_route_decision
 
             async def _llm2_with_cost(
-                *, r_and_r_text: str, candidates: list,
+                *, r_and_r_text: str, candidates: list, enrichment: dict | None = None,
             ):
                 return await llm2_resolve_role(
-                    r_and_r_text, candidates, cost_acc=cost_acc,
+                    r_and_r_text, candidates,
+                    cost_acc=cost_acc, enrichment=enrichment,
                 )
 
             # Same fallback as Stage 2: when nano produced no R&R section,
@@ -2051,6 +2053,7 @@ async def extract_skills_from_jd_endpoint(req: JDSkillPipelineRequest):
                 stage1_resolved=stage1_resolved,
                 llm2_fn=_llm2_with_cost,
                 nano_aliases=nano_role_aliases,
+                jd_skills=skills_for_stage3,
                 cost_acc=cost_acc,
             )
             # ── Post-step: hoist leaf picks to their branchable parent ────
@@ -4550,6 +4553,269 @@ async def get_jd_pipeline_run(run_id: str):
     return JdRunDetail(**row, artifacts=artifacts, history_view=history_view)
 
 
+@app.get("/skills/runs/{run_id}/export")
+async def export_jd_pipeline_run(run_id: str, format: str = "clean") -> dict:
+    """Return a clean, client-consumable JSON for a stored JD pipeline run.
+
+    `format=clean` (default) returns the lean export shape; `format=enriched`
+    additionally includes per-skill catalog dimensions. The intent is a stable
+    contract that downstream consumers can rely on without parsing the
+    internal api1/api2/api3 envelopes.
+
+    Field summary:
+      - final_role: {parent, sub_role}    – parent display_name + sub-role (may be null)
+      - domain: str | null                – role domain (Software Engineering, AI/ML, …)
+      - exp_range: {min, max}             – integer years; null when unspecified
+      - city: list[str]                   – deduped city names from job_locations
+      - salary: {min, max, currency}      – integers + currency (default 'INR')
+      - certifications: list[str]
+      - educations: list[str]             – normalized qualification text
+      - patents: []                       – placeholder (nano doesn't emit yet)
+      - primary_skills: list[{name, category}]
+      - secondary_skills: list[{name, category}]
+      - dimensions (enriched only): same skill shape + dimensions: [str]
+    """
+    fmt = (format or "clean").strip().lower()
+    if fmt not in {"clean", "enriched"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"format must be 'clean' or 'enriched' (got {format!r})",
+        )
+    repo = JdPipelineRunRepository()
+    try:
+        row = await asyncio.to_thread(repo.get_run, run_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch JD pipeline run: {exc}",
+        ) from exc
+    if not row:
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    api1 = row.get("api1_response") or {}
+    nano = api1.get("nano_parsed") or {}
+    stage4 = api1.get("stage4_decision") or {}
+
+    # ── final_role hierarchy ─────────────────────────────────────────────
+    # Prefer Stage 4's structured chosen_role (carries both parent + sub-role).
+    # Old runs that pre-date the structured field fall back to the
+    # denormalized `chosen_role_display` column on jd_pipeline_runs.
+    chosen = stage4.get("chosen_role") or {}
+    sub_role = stage4.get("sub_role") or {}
+    parent_name = chosen.get("display_name") or row.get("chosen_role_display")
+    final_role = {
+        "parent": parent_name,
+        "sub_role": sub_role.get("display_name") if sub_role else None,
+    }
+
+    # ── role domain ──────────────────────────────────────────────────────
+    # Stage 4 reasoning for case='DOMAIN' begins "Domain=<X>; ..." — parse that
+    # first. Otherwise fall back to roles.domain lookup by chosen_role.role_id
+    # OR by display_name (for legacy runs without stage4.chosen_role).
+    role_domain: str | None = None
+    reasoning = stage4.get("reasoning") or ""
+    if isinstance(reasoning, str) and reasoning.startswith("Domain="):
+        role_domain = reasoning.split("Domain=", 1)[1].split(";", 1)[0].strip()
+        role_domain = role_domain.split(" → ", 1)[0].strip() or None
+    if not role_domain and (chosen.get("role_id") or parent_name):
+        try:
+            from jd_similarity_matcher import _pg_connect, _qs
+            qs = _qs()
+
+            def _lookup_domain():
+                conn = _pg_connect()
+                try:
+                    with conn.cursor() as cur:
+                        if chosen.get("role_id"):
+                            cur.execute(
+                                f"SELECT domain FROM {qs}.roles WHERE id = %s",
+                                (chosen["role_id"],),
+                            )
+                        else:
+                            cur.execute(
+                                f"SELECT domain FROM {qs}.roles "
+                                f"WHERE LOWER(display_name) = LOWER(%s) LIMIT 1",
+                                (parent_name,),
+                            )
+                        r = cur.fetchone()
+                        return r[0] if r else None
+                finally:
+                    conn.close()
+
+            role_domain = await asyncio.to_thread(_lookup_domain)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[export] role-domain lookup failed: %s", exc)
+
+    # ── exp_range ────────────────────────────────────────────────────────
+    exp_obj = nano.get("experience") or {}
+    exp_range = {
+        "min": int(exp_obj["min"]) if isinstance(exp_obj.get("min"), (int, float)) else None,
+        "max": int(exp_obj["max"]) if isinstance(exp_obj.get("max"), (int, float)) else None,
+    }
+
+    # ── city (dedup, preserve order) ────────────────────────────────────
+    cities: list[str] = []
+    seen_cities: set[str] = set()
+    for loc in (nano.get("job_locations") or []):
+        if not isinstance(loc, dict):
+            continue
+        city = (loc.get("city") or "").strip()
+        if city and city.lower() not in seen_cities:
+            seen_cities.add(city.lower())
+            cities.append(city)
+
+    # ── salary ───────────────────────────────────────────────────────────
+    ctc = nano.get("ctc") or {}
+    salary = {
+        "min": int(ctc["min"]) if isinstance(ctc.get("min"), (int, float)) else None,
+        "max": int(ctc["max"]) if isinstance(ctc.get("max"), (int, float)) else None,
+        "currency": (ctc.get("currency") or "INR").strip().upper() if ctc else "INR",
+    }
+
+    # ── certifications + educations ─────────────────────────────────────
+    certifications = [c for c in (nano.get("certifications") or []) if isinstance(c, str) and c.strip()]
+    educations: list[str] = []
+    for e in (nano.get("education") or []):
+        if isinstance(e, dict):
+            q = (e.get("qualification") or "").strip() or (e.get("raw") or "").strip()
+            if q:
+                educations.append(q)
+        elif isinstance(e, str) and e.strip():
+            educations.append(e.strip())
+
+    # ── primary / secondary skills + per-skill catalog lookup ───────────
+    final_skills = api1.get("final_skills") or []
+    primary_names = [s["skill_name"] for s in final_skills
+                     if isinstance(s, dict) and s.get("is_primary") and s.get("skill_name")]
+    secondary_names = [s["skill_name"] for s in final_skills
+                       if isinstance(s, dict) and not s.get("is_primary") and s.get("skill_name")]
+
+    skill_meta = await asyncio.to_thread(
+        _fetch_skill_meta_for_export,
+        primary_names + secondary_names,
+        fmt == "enriched",
+    )
+
+    def _shape(name: str) -> dict:
+        info = skill_meta.get(name.lower(), {})
+        out: dict = {"name": name, "category": info.get("category")}
+        if fmt == "enriched":
+            out["dimensions"] = info.get("dimensions") or []
+        return out
+
+    primary_skills = [_shape(n) for n in primary_names]
+    secondary_skills = [_shape(n) for n in secondary_names]
+
+    return {
+        "run_id": str(row.get("id")),
+        "format": fmt,
+        "final_role": final_role,
+        "domain": role_domain,
+        "exp_range": exp_range,
+        "city": cities,
+        "salary": salary,
+        "certifications": certifications,
+        "educations": educations,
+        "patents": [],
+        "primary_skills": primary_skills,
+        "secondary_skills": secondary_skills,
+    }
+
+
+def _fetch_skill_meta_for_export(
+    names: list[str], include_dimensions: bool
+) -> dict[str, dict]:
+    """Resolve each input skill name to (canonical category, dimensions).
+
+    Matches by `canonical_skills.display_name` first (case-insensitive) and
+    falls back to `skill_aliases.alias_lower`. Returns a map keyed by the
+    lower-cased INPUT name so callers can `.get(name.lower())` cheaply.
+
+    `dimensions` is only populated when `include_dimensions=True` (the
+    enriched format) — otherwise we skip the extra join for speed.
+    """
+    out: dict[str, dict] = {}
+    cleaned = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    if not cleaned:
+        return out
+    try:
+        from jd_similarity_matcher import _pg_connect, _qs
+        qs = _qs()
+        conn = _pg_connect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[export] DB connect for skill meta failed: %s", exc)
+        return out
+    lower_names = [n.lower() for n in cleaned]
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Resolve input name -> canonical_skill row (exact or via alias).
+                cur.execute(
+                    f"""
+                    WITH inputs(name_lower) AS (
+                        SELECT UNNEST(%s::text[])
+                    ),
+                    direct AS (
+                        SELECT i.name_lower, cs.id AS skill_id, cs.display_name,
+                               c.display_name AS category
+                          FROM inputs i
+                          JOIN {qs}.canonical_skills cs
+                            ON LOWER(cs.display_name) = i.name_lower
+                          LEFT JOIN {qs}.categories c ON c.id = cs.category_id
+                    ),
+                    via_alias AS (
+                        SELECT i.name_lower, cs.id AS skill_id, cs.display_name,
+                               c.display_name AS category
+                          FROM inputs i
+                          JOIN {qs}.skill_aliases sa ON sa.alias_lower = i.name_lower
+                          JOIN {qs}.canonical_skills cs ON cs.id = sa.skill_id
+                          LEFT JOIN {qs}.categories c ON c.id = cs.category_id
+                         WHERE i.name_lower NOT IN (SELECT name_lower FROM direct)
+                    )
+                    SELECT name_lower, skill_id, display_name, category FROM direct
+                     UNION ALL
+                    SELECT name_lower, skill_id, display_name, category FROM via_alias
+                    """,
+                    (lower_names,),
+                )
+                rows = cur.fetchall()
+                skill_ids: list[int] = []
+                for name_lower, skill_id, _disp, category in rows:
+                    skill_ids.append(int(skill_id))
+                    out[name_lower] = {
+                        "skill_id": int(skill_id),
+                        "category": category,
+                        "dimensions": [],
+                    }
+                if include_dimensions and skill_ids:
+                    cur.execute(
+                        f"""
+                        SELECT ds.skill_id, d.display_name
+                          FROM {qs}.dimension_skills ds
+                          JOIN {qs}.dimensions d ON d.id = ds.dimension_id
+                         WHERE ds.skill_id = ANY(%s)
+                         ORDER BY ds.skill_id, d.display_name
+                        """,
+                        (skill_ids,),
+                    )
+                    dim_by_skill: dict[int, list[str]] = {}
+                    for sid, dim_name in cur.fetchall():
+                        dim_by_skill.setdefault(int(sid), []).append(str(dim_name))
+                    for entry in out.values():
+                        entry["dimensions"] = dim_by_skill.get(entry["skill_id"], [])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[export] skill-meta query failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    # Drop the internal skill_id from the return value to keep callers clean.
+    for entry in out.values():
+        entry.pop("skill_id", None)
+    return out
+
+
 @app.post("/admin/resume-stuck-runs")
 async def resume_stuck_runs(older_than_seconds: int = 60) -> dict:
     """Re-fire the autochain (step 2 + step 3) for runs sitting in
@@ -4586,7 +4852,7 @@ async def resume_stuck_runs(older_than_seconds: int = 60) -> dict:
 # ── Admin: roles that need v3 enrichment, sorted by classification frequency ──
 
 @app.get("/admin/roles-needing-v3")
-async def admin_roles_needing_v3(limit: int = 50) -> dict:
+async def admin_roles_needing_v3(limit: int = 200, offset: int = 0) -> dict:
     """Return roles in the catalog that need v3 enrichment, sorted by how
     often they show up as `chosen_role` in pipeline runs (desc). Eligibility:
 
@@ -4594,8 +4860,12 @@ async def admin_roles_needing_v3(limit: int = 50) -> dict:
       * `roles.source = 'AUTOMATED_DISCOVERY'` (synthesized via Case NEW)
 
     Either condition is enough — the union catches both shell roles seeded
-    from Excel AND novel roles invented by the pipeline. Front-end uses
-    this list to render the click-to-trigger-v3 section on the history page.
+    from Excel AND novel roles invented by the pipeline. Each row now also
+    surfaces `parent_role_id` + `parent_display_name` (LEFT JOIN on
+    `roles.parent_role_id`) so the front-end can render the Domain → Role
+    → Sub-role hierarchy as a nested tree. Response includes `total` so the
+    UI can paginate. Front-end uses this list to render the
+    click-to-trigger-v3 section on the history page.
     """
     import psycopg2  # noqa: F401 — needed for the UndefinedTable catch below
     from jd_similarity_matcher import _pg_connect, _qs
@@ -4626,6 +4896,8 @@ async def admin_roles_needing_v3(limit: int = 50) -> dict:
         SELECT
             r.id, r.slug, r.display_name, r.domain, r.source::text AS source,
             r.is_branchable,
+            r.parent_role_id,
+            p.display_name AS parent_display_name,
             COALESCE(f.classification_count, 0) AS classification_count,
             COALESCE(k.n, 0)                    AS kra_count,
             f.last_classified_at,
@@ -4640,11 +4912,20 @@ async def admin_roles_needing_v3(limit: int = 50) -> dict:
           LEFT JOIN freq        f  ON LOWER(f.slug) = LOWER(r.slug)
           LEFT JOIN kra_counts  k  ON k.role_id     = r.id
           LEFT JOIN existing_v3 ev ON ev.role_slug  = r.slug
+          LEFT JOIN {qs}.roles  p  ON p.id          = r.parent_role_id
          WHERE COALESCE(k.n,0) = 0
             OR r.source = 'AUTOMATED_DISCOVERY'
          ORDER BY COALESCE(f.classification_count, 0) DESC,
                   r.display_name ASC
-         LIMIT %s
+         LIMIT %s OFFSET %s
+    """
+    total_sql = f"""
+        WITH kra_counts AS (
+            SELECT role_id, COUNT(*) AS n FROM {qs}.role_kras GROUP BY role_id
+        )
+        SELECT COUNT(*) FROM {qs}.roles r
+        LEFT JOIN kra_counts k ON k.role_id = r.id
+        WHERE COALESCE(k.n,0) = 0 OR r.source = 'AUTOMATED_DISCOVERY'
     """
     def _run():
         conn = _pg_connect()
@@ -4652,8 +4933,9 @@ async def admin_roles_needing_v3(limit: int = 50) -> dict:
             with conn.cursor() as cur:
                 # v2_run_log may not exist in older deploys — fall back gracefully
                 try:
-                    cur.execute(sql, (limit,))
-                    return cur.fetchall(), [d.name for d in cur.description]
+                    cur.execute(sql, (limit, offset))
+                    rows = cur.fetchall()
+                    cols = [d.name for d in cur.description]
                 except psycopg2.errors.UndefinedTable:
                     conn.rollback()
                     # Retry with an empty CTE in place of v2_run_log
@@ -4665,12 +4947,16 @@ async def admin_roles_needing_v3(limit: int = 50) -> dict:
                         "WHERE FALSE)\n",
                         sql, count=1, flags=_re.DOTALL,
                     )
-                    cur.execute(fallback_sql, (limit,))
-                    return cur.fetchall(), [d.name for d in cur.description]
+                    cur.execute(fallback_sql, (limit, offset))
+                    rows = cur.fetchall()
+                    cols = [d.name for d in cur.description]
+                cur.execute(total_sql)
+                total = int(cur.fetchone()[0])
+                return rows, cols, total
         finally:
             conn.close()
     try:
-        rows, cols = await asyncio.to_thread(_run)
+        rows, cols, total = await asyncio.to_thread(_run)
     except Exception as exc:  # noqa: BLE001
         logger.error("[admin/roles-needing-v3] query failed: %s", exc, exc_info=True)
         return {"roles": [], "error": str(exc)}
@@ -4680,8 +4966,11 @@ async def admin_roles_needing_v3(limit: int = 50) -> dict:
         for ts_key in ("last_classified_at", "last_v3_at"):
             if d.get(ts_key) is not None:
                 d[ts_key] = d[ts_key].isoformat()
+        if d.get("parent_role_id") is not None:
+            d["parent_role_id"] = int(d["parent_role_id"])
         result.append(d)
-    return {"roles": result, "count": len(result)}
+    return {"roles": result, "count": len(result), "total": total,
+            "limit": limit, "offset": offset}
 
 
 # ── Admin: manually trigger v3 enrichment for a specific role ──

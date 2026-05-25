@@ -686,6 +686,7 @@ class JdPipelineRunRepository:
                    llm_cost_api2_usd,
                    llm_cost_api3_usd,
                    api1_response #>> '{{stage4_decision,case}}'              AS stage4_case,
+                   api1_response #>> '{{stage4_decision,sub_role,display_name}}' AS sub_role_display,
                    api1_response #>> '{{stage5_updates,v3_pipeline_triggered}}' AS v3_pipeline_triggered_raw,
                    api1_response #>> '{{stage5_updates,v3_run_id}}'          AS v3_run_id,
                    api1_response #>> '{{stage5_updates,v3_role_slug}}'       AS v3_role_slug

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Literal
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Literal
 
 from excel_role_resolver import (
     resolve_via_excel as _resolve_via_excel,
@@ -17,6 +18,10 @@ from excel_role_resolver import (
 )
 from jd_similarity_matcher import RoleSignal, Stage3Result
 from domain_classifier import classify_domain_role, SubRolePick
+from role_disambiguator import (
+    disambiguate_overlap,
+    load_candidate_enrichment,
+)
 from skill_library_v3.db.repository import slugify as _slugify_canonical
 
 _logger = logging.getLogger(__name__)
@@ -378,6 +383,7 @@ async def stage4_route_decision(
     stage1_resolved: Stage1RoleResolution | None = None,
     llm2_fn: Llm2Fn | None = None,
     nano_aliases: list[str] | None = None,
+    jd_skills: list[str] | None = None,
     cost_acc=None,
 ) -> Stage4Decision:
     """Body-driven Stage 4 routing — skill + KRA are the primary decision
@@ -432,11 +438,67 @@ async def stage4_route_decision(
 
     r_and_r_embedding = getattr(s3, "r_and_r_embedding", None)
 
-    # ── Branch 1: multi-alias-tie → LLM2 disambiguation ───────────────────────
+    # ── Branch 1: multi-alias-tie → deterministic disambiguator → LLM2 ───────
     # 3+ catalog roles share the JD title at score 1.0 — the title is
-    # ambiguous noise. Let LLM2 read the JD body and pick from the cohort.
+    # ambiguous noise. We first try the 3-tier deterministic disambiguator
+    # (Tier A KRA-distinctness → Tier B title-exact-match → Tier C skill
+    # overlap). If all three tiers tie, fall through to LLM2 with the
+    # candidates' KRAs + skills attached (Tier D enrichment).
     tied_alias_cohort = _alias_multi_tie(alias)
     if tied_alias_cohort is not None:
+        # role_id -> Stage 3c KRA score (Tier A signal — already computed,
+        # don't re-embed). Absent role_ids default to 0.0 inside the tier.
+        kra_scores: dict[int, float] = {
+            r.role_id: float(r.score) for r in kra if r.role_id is not None
+        }
+        # Pre-load enrichment ONCE: serves both the disambiguator (shell-row
+        # skip check, Tier C skill_set lookup) AND the LLM2 fallback prompt
+        # (top KRAs + top skills + shell-row flag) downstream.
+        cohort_ids = [c.role_id for c in tied_alias_cohort if c.role_id is not None]
+        enrichment = load_candidate_enrichment(cohort_ids)
+        cand_dicts: list[dict[str, Any]] = [
+            {
+                "role_id": c.role_id,
+                "slug": c.slug,
+                "display_name": c.display_name,
+                "score": c.score,
+            }
+            for c in tied_alias_cohort
+        ]
+        disambig = disambiguate_overlap(
+            cand_dicts,
+            nano_role=role_name_input,
+            nano_aliases=nano_aliases or [],
+            jd_skills=jd_skills or [],
+            kra_scores=kra_scores,
+            enrichment=enrichment,
+        )
+        if disambig is not None:
+            winner_dict, tier = disambig
+            winner = next(
+                (c for c in tied_alias_cohort if c.role_id == winner_dict["role_id"]),
+                None,
+            )
+            if winner is not None:
+                _logger.info(
+                    "[stage4/branch1] disambiguator picked %s via %s — skipping LLM2",
+                    winner.slug, tier,
+                )
+                return Stage4Decision(
+                    case="A",
+                    chosen_role=winner,
+                    confidence=0.95,
+                    llm2_fired=False,
+                    llm2_reasoning=None,
+                    alias_collision_detected=True,
+                    queued=False,
+                    reasoning=(
+                        f"Multi-alias tie ({len(tied_alias_cohort)} roles at 1.0) "
+                        f"resolved by {tier}: {winner.display_name}"
+                    ),
+                )
+
+        # All deterministic tiers inconclusive → LLM2 with enriched prompt.
         return await _resolve_via_llm2(
             case="D",
             tied_candidates=tied_alias_cohort,
@@ -444,6 +506,7 @@ async def stage4_route_decision(
             llm2_fn=llm2_fn,
             alias_collision=True,
             queue_reason="multi_alias_tie",
+            enrichment=enrichment,
         )
 
     # ── Branch 1.5: single unambiguous alias hit → trust it ──────────────────
@@ -705,14 +768,77 @@ def _tied_cohort(kra: list[RoleSignal], band: float) -> list[RoleSignal]:
 
 # ── Production LLM2 wrapper (real Azure call) ────────────────────────────────
 
-_LLM2_SYSTEM_PROMPT = (
+_LLM2_PROMPT_PATH = Path(__file__).resolve().parent / "llm2_disambiguation_prompt.md"
+_LLM2_FALLBACK_SYSTEM_PROMPT = (
     "You break ties between candidate roles for a job description. You are "
-    "given the responsibilities section of the JD and 2–3 candidate roles. "
+    "given the responsibilities section of the JD and 2–6 candidate roles. "
     "Pick the one role whose day-to-day work best matches the JD's "
     "responsibilities. Return JSON with exactly these keys: "
     '"chosen_role_slug" (one of the candidate slugs verbatim), '
     '"confidence" (float 0.0-1.0), "reasoning" (one sentence).'
 )
+_llm2_prompt_cache: dict[str, str] | None = None
+
+
+def _load_llm2_prompt() -> str:
+    """Load the §A SYSTEM prompt from the externalized markdown file. Cached
+    on first call. Falls back to the legacy inline string if the file is
+    missing — never raises."""
+    global _llm2_prompt_cache
+    if _llm2_prompt_cache is not None:
+        return _llm2_prompt_cache["system"]
+    try:
+        text = _LLM2_PROMPT_PATH.read_text(encoding="utf-8")
+        # `## §A — SYSTEM PROMPT` to `## §B — USER TEMPLATE` is the system block.
+        if "## §A — SYSTEM PROMPT" in text and "## §B — USER TEMPLATE" in text:
+            body = text.split("## §A — SYSTEM PROMPT", 1)[1]
+            system_block = body.split("## §B — USER TEMPLATE", 1)[0].strip()
+        else:
+            system_block = _LLM2_FALLBACK_SYSTEM_PROMPT
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "[llm2] couldn't load llm2_disambiguation_prompt.md (%s); using fallback",
+            exc,
+        )
+        system_block = _LLM2_FALLBACK_SYSTEM_PROMPT
+    _llm2_prompt_cache = {"system": system_block}
+    return system_block
+
+
+def _format_candidate_block(
+    candidates: list[RoleSignal],
+    enrichment: dict[int, dict[str, Any]] | None,
+) -> str:
+    """Build the per-candidate block for the LLM2 user message.
+
+    When `enrichment` is provided, each candidate gets aliases + top KRAs +
+    top skills (plus a `[shell-row]` flag for unenriched catalog rows).
+    Without enrichment, falls back to the legacy bare-slug format.
+    """
+    if not enrichment:
+        return "\n".join(
+            f"- {c.slug} ({c.display_name})" for c in candidates
+        )
+    lines: list[str] = []
+    for c in candidates:
+        info = enrichment.get(c.role_id, {}) if c.role_id is not None else {}
+        lines.append(f"- {c.slug} | {c.display_name}")
+        kras = info.get("top_kras", []) or []
+        skills = info.get("top_skills", []) or []
+        if kras:
+            lines.append("  Top KRAs:")
+            for k in kras:
+                k_text = k.strip()
+                if len(k_text) > 200:
+                    k_text = k_text[:200].rstrip() + "…"
+                lines.append(f"    - {k_text}")
+        if skills:
+            lines.append(f"  Top skills: {', '.join(skills)}")
+        n_kras = int(info.get("n_kras", 0) or 0)
+        n_skills = int(info.get("n_skills", 0) or 0)
+        if n_kras == 0 and n_skills == 0:
+            lines.append("  [shell-row: 0 KRAs / 0 skills enriched]")
+    return "\n".join(lines)
 
 
 async def llm2_resolve_role(
@@ -720,8 +846,14 @@ async def llm2_resolve_role(
     candidates: list[RoleSignal],
     *,
     cost_acc=None,
+    enrichment: dict[int, dict[str, Any]] | None = None,
 ) -> Llm2Result:
     """Default production LLM2: o4-mini reasoning tier, JSON-mode response.
+
+    When `enrichment` is provided (dict of role_id → {top_kras, top_skills,
+    n_kras, n_skills}), the candidate block in the LLM prompt is enriched
+    with KRAs + top skills + shell-row flags. Callers without enrichment get
+    the legacy bare-slug format (backwards compatible).
 
     Falls back to a queue-inducing low-confidence result when Azure key is
     not configured or the call fails — defensive: never let LLM2 raise.
@@ -740,12 +872,11 @@ async def llm2_resolve_role(
             reasoning="LLM2 unavailable: no reasoning client",
         )
 
-    candidate_block = "\n".join(
-        f"- {c.slug} ({c.display_name})" for c in candidates
-    )
+    system_prompt = _load_llm2_prompt()
+    candidate_block = _format_candidate_block(candidates, enrichment)
     user_msg = (
         f"JD responsibilities:\n{(r_and_r_text or '')[:6000]}\n\n"
-        f"Candidates:\n{candidate_block}\n\n"
+        f"Candidates ({len(candidates)} total):\n{candidate_block}\n\n"
         "Pick exactly one."
     )
 
@@ -753,7 +884,7 @@ async def llm2_resolve_role(
         kwargs = dict(
             model=REASONING_MODEL,
             messages=[
-                {"role": "system", "content": _LLM2_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             response_format={"type": "json_object"},
@@ -793,9 +924,19 @@ async def _resolve_via_llm2(
     llm2_fn: Llm2Fn | None,
     alias_collision: bool,
     queue_reason: str,
+    enrichment: dict[int, dict[str, Any]] | None = None,
 ) -> Stage4Decision:
     fn = llm2_fn or llm2_resolve_role
-    result = await fn(r_and_r_text=r_and_r_text, candidates=tied_candidates)
+    try:
+        result = await fn(
+            r_and_r_text=r_and_r_text,
+            candidates=tied_candidates,
+            enrichment=enrichment,
+        )
+    except TypeError:
+        # Backwards-compat: callers wrapping llm2_resolve_role with an older
+        # signature that doesn't accept `enrichment`. Retry without it.
+        result = await fn(r_and_r_text=r_and_r_text, candidates=tied_candidates)
 
     if result.confidence < LLM2_MIN_CONFIDENCE:
         return Stage4Decision(
