@@ -2522,11 +2522,30 @@ async def _autochain_steps_2_3(api1: JDSkillPipelineResponse) -> None:
             s.skill_name for s in api1.final_skills
             if s.skill_name and getattr(s, "is_primary", False)
         ]
+        # Build jd_role_hint preferring Stage 4's generalized chosen_role over
+        # the verbatim nano-extracted title. Otherwise API2 falls through to
+        # using the raw title (e.g., "Senior Quantum Algorithms Engineer")
+        # which violates the role-generalization rule and shows up wrong on
+        # the history detail page.
+        s4 = getattr(api1, "stage4_decision", None)
+        s4_chosen = getattr(s4, "chosen_role", None) if s4 else None
+        if s4_chosen and getattr(s4_chosen, "display_name", None):
+            jd_role_hint = {
+                "display_name": s4_chosen.display_name,
+                "slug": getattr(s4_chosen, "slug", "") or "",
+                "role_archetype": (
+                    api1.jd_role.role_archetype if api1.jd_role else None
+                ),
+                "rationale": getattr(s4, "reasoning", None),
+            }
+        else:
+            jd_role_hint = api1.jd_role.model_dump() if api1.jd_role else None
+
         body2: dict = {
             "final_skills": final_skill_names,
             "llm_skills": final_skill_names,
             "primary_skills": primary_skill_names,
-            "jd_role_hint": api1.jd_role.model_dump() if api1.jd_role else None,
+            "jd_role_hint": jd_role_hint,
             "run_id": run_id,
         }
 
