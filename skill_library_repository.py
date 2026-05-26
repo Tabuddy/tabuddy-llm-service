@@ -1146,22 +1146,21 @@ class SkillLibraryRepository:
 
     @staticmethod
     def _linkedin_roles_search_clause(q: str | None) -> tuple[str, list]:
-        """ILIKE on display_name + slug; exact id when ``q`` is all digits."""
+        """ILIKE on display_name + slug (trigram index); exact id match when q is all digits."""
         term = (q or "").strip()
         if not term:
             return "", []
         like = f"%{term}%"
-        parts = ["display_name ILIKE %s", "slug ILIKE %s"]
+        # LOWER(display_name) ILIKE uses the GIN trigram index
+        parts = ["LOWER(display_name) LIKE LOWER(%s)", "slug ILIKE %s"]
         params: list = [like, like]
         if term.isdigit():
             parts.append("id = %s")
             params.append(int(term))
-        else:
-            parts.append("CAST(id AS TEXT) LIKE %s")
-            params.append(like)
         return " WHERE (" + " OR ".join(parts) + ")", params
 
     def count_linkedin_roles(self, q: str | None = None) -> int:
+        """Separate count — used only when caller needs total without fetching rows."""
         where_sql, params = self._linkedin_roles_search_clause(q)
         sql = f"SELECT COUNT(*) FROM {self.schema}.linkedin_roles{where_sql}"
         with self._connect() as conn:
@@ -1170,35 +1169,89 @@ class SkillLibraryRepository:
                 row = cur.fetchone()
         return int(row[0]) if row else 0
 
+    def _linkedin_roles_approx_total(self, conn) -> int:
+        """Instant approximate row count from pg_class statistics.
+        """
+        nspname = self.schema.strip('"')
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT reltuples::bigint
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relname = 'linkedin_roles'
+                   AND n.nspname = %s
+                """,
+                (nspname,),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row and row[0] and row[0] > 0 else 0
+
     def list_linkedin_roles(
         self,
         *,
         q: str | None = None,
+        sort: str = "asc",
         limit: int | None = None,
         offset: int = 0,
-    ) -> list[dict]:
-        """Rows from ``linkedin_roles`` staging table (id, slug, display_name, created_at)."""
-        where_sql, params = self._linkedin_roles_search_clause(q)
-        lim_sql = ""
-        if limit is not None and limit > 0:
-            lim_sql = " LIMIT %s OFFSET %s"
-            params = [*params, int(limit), max(0, int(offset))]
-        order = (
-            "display_name ASC, id ASC"
-            if (q or "").strip()
-            else "id ASC"
-        )
-        sql = f"""
-            SELECT id, slug, display_name, created_at
-              FROM {self.schema}.linkedin_roles
-             {where_sql}
-             ORDER BY {order}
-             {lim_sql}
+    ) -> tuple[list[dict], int]:
+        """Rows + total count in a single connection.
+
+        No-search: approximate total via pg_class (instant, ~4.5M rows case).
+        With search: exact total via COUNT(*) OVER() in the same query.
+        Returns (rows, total).
         """
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, tuple(params) if params else None)
-                return self._rows_to_dicts(cur, cur.fetchall())
+        where_sql, params = self._linkedin_roles_search_clause(q)
+        is_search = bool((q or "").strip())
+        dir_ = "DESC" if sort == "desc" else "ASC"
+
+        if is_search:
+            # COUNT(*) OVER() gives exact filtered total in one pass (trigram index used)
+            row_params = [*params]
+            lim_sql = ""
+            if limit is not None and limit > 0:
+                lim_sql = " LIMIT %s OFFSET %s"
+                row_params = [*row_params, int(limit), max(0, int(offset))]
+            sql = f"""
+                SELECT id, slug, display_name, created_at,
+                       COUNT(*) OVER() AS _total
+                  FROM {self.schema}.linkedin_roles
+                 {where_sql}
+                 ORDER BY LOWER(display_name) {dir_}, id {dir_}
+                 {lim_sql}
+            """
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, tuple(row_params))
+                    raw = cur.fetchall()
+                if not raw:
+                    return [], 0
+                cols = [d[0] for d in cur.description]
+                total = int(raw[0][cols.index("_total")])
+                rows = []
+                for r in raw:
+                    d = dict(zip(cols, r))
+                    d.pop("_total", None)
+                    rows.append(d)
+            return rows, total
+        else:
+            # No filter: use approximate count (instant) + separate paginated SELECT
+            lim_sql = ""
+            row_params: list = []
+            if limit is not None and limit > 0:
+                lim_sql = " LIMIT %s OFFSET %s"
+                row_params = [int(limit), max(0, int(offset))]
+            sql = f"""
+                SELECT id, slug, display_name, created_at
+                  FROM {self.schema}.linkedin_roles
+                 ORDER BY LOWER(display_name) {dir_}, id {dir_}
+                 {lim_sql}
+            """
+            with self._connect() as conn:
+                total = self._linkedin_roles_approx_total(conn)
+                with conn.cursor() as cur:
+                    cur.execute(sql, tuple(row_params) if row_params else None)
+                    return self._rows_to_dicts(cur, cur.fetchall()), total
 
     def display_name_exists_in_role_aliases(self, display_name: str) -> bool:
         """Case-insensitive: ``linkedin_roles.display_name`` vs ``role_aliases.alias_lower``."""

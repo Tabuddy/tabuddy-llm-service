@@ -5733,6 +5733,7 @@ async def resume_ranking_ui(request: Request):
 async def linkedin_role_ui(
     request: Request,
     q: str = "",
+    sort: str = "asc",
     limit: int = 500,
     offset: int = 0,
 ):
@@ -5740,16 +5741,15 @@ async def linkedin_role_ui(
     limit = min(max(1, limit), 2000)
     offset = max(0, offset)
     search_q = (q or "").strip()
+    sort = "desc" if sort == "desc" else "asc"
     repo = SkillLibraryRepository()
     try:
-        rows = await asyncio.to_thread(
+        rows, total = await asyncio.to_thread(
             repo.list_linkedin_roles,
             q=search_q or None,
+            sort=sort,
             limit=limit,
             offset=offset,
-        )
-        total = await asyncio.to_thread(
-            repo.count_linkedin_roles, search_q or None
         )
     except Exception as exc:
         raise HTTPException(
@@ -5772,6 +5772,7 @@ async def linkedin_role_ui(
     has_next = offset + len(display_rows) < total
     prev_offset = max(0, offset - limit)
     next_offset = offset + limit
+    toggle_sort = "desc" if sort == "asc" else "asc"
     return templates.TemplateResponse(
         request,
         "linkedin_roles.html",
@@ -5780,6 +5781,8 @@ async def linkedin_role_ui(
             "total": total,
             "limit": limit,
             "offset": offset,
+            "sort": sort,
+            "toggle_sort": toggle_sort,
             "has_prev": has_prev,
             "has_next": has_next,
             "prev_offset": prev_offset,
@@ -5801,14 +5804,11 @@ async def api_linkedin_roles(
     search_q = (q or "").strip()
     repo = SkillLibraryRepository()
     try:
-        rows = await asyncio.to_thread(
+        rows, total = await asyncio.to_thread(
             repo.list_linkedin_roles,
             q=search_q or None,
             limit=limit,
             offset=offset,
-        )
-        total = await asyncio.to_thread(
-            repo.count_linkedin_roles, search_q or None
         )
     except Exception as exc:
         raise HTTPException(
