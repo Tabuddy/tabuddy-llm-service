@@ -2619,6 +2619,52 @@ def _role_summary_from_llm(role: dict) -> RoleSummary:
     )
 
 
+def _lookup_role_by_slug(slug: str) -> dict | None:
+    """Resolve a role slug to its DB row (id, slug, display_name, role_archetype).
+
+    Used by API 2's Stage-4-authority short-circuit so that when API 1 has
+    already picked a role (carried into API 2 as `jd_role_hint.slug`), we
+    use that exact role from the DB rather than re-running API 2's
+    dimension-based candidate generation + LLM picker. Returns None when
+    the slug is empty or doesn't exist in the catalog.
+    """
+    s = (slug or "").strip()
+    if not s:
+        return None
+    try:
+        from jd_similarity_matcher import _pg_connect, _qs
+        qs = _qs()
+        conn = _pg_connect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[stage6/authority] DB connect failed: %s", exc)
+        return None
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id, slug, display_name, role_archetype "
+                    f"FROM {qs}.roles WHERE slug = %s LIMIT 1",
+                    (s,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return {
+                    "id": int(row[0]),
+                    "slug": row[1],
+                    "display_name": row[2],
+                    "role_archetype": row[3],
+                }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[stage6/authority] _lookup_role_by_slug(%r) failed: %s", s, exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @app.post("/skills/extract-details", response_model=ExtractDetailsResponse)
 async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
     """Reverse planner: alias resolution -> dimension lookup -> role inference.
@@ -3164,7 +3210,35 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
 
     # ── Stage 6: pick a single chosen role ──────────────────────────────────
     chosen_role: ChosenRole | None = None
-    if len(candidate_roles) == 0 and req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
+
+    # Stage 4 authority short-circuit: when API 1 already picked a role
+    # (passed via jd_role_hint by the autochain) AND that slug resolves to
+    # a real DB row, use it verbatim. Stage 4 has access to signals API 2
+    # doesn't (alias multi-tie disambiguator, KRA scoring, DOMAIN classifier
+    # §B/§C). Re-running the role-pick LLM here on a different candidate
+    # set has caused regressions where API 2 picks a fully-enriched peer
+    # (e.g. DevOps Engineer) over Stage 4's correct pick (Cloud Migration
+    # Engineer, which has 0 dimensions so it never enters API 2's
+    # skill→dimension→role candidate list).
+    if (
+        req.jd_role_hint is not None
+        and (req.jd_role_hint.slug or "").strip()
+    ):
+        hint_slug = req.jd_role_hint.slug.strip()
+        db_role_for_hint = await asyncio.to_thread(
+            _lookup_role_by_slug, hint_slug,
+        )
+        if db_role_for_hint is not None:
+            chosen_role = ChosenRole(
+                source="db",
+                id=db_role_for_hint["id"],
+                slug=db_role_for_hint["slug"],
+                display_name=db_role_for_hint["display_name"],
+                role_archetype=db_role_for_hint.get("role_archetype"),
+                rationale=(req.jd_role_hint.rationale or "Stage 4 authoritative pick"),
+            )
+
+    if chosen_role is None and len(candidate_roles) == 0 and req.jd_role_hint is not None and (req.jd_role_hint.display_name or "").strip():
         h = req.jd_role_hint
         chosen_role = ChosenRole(
             source="llm",
@@ -3174,7 +3248,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             role_archetype=h.role_archetype,
             rationale=h.rationale,
         )
-    elif len(candidate_roles) == 1:
+    elif chosen_role is None and len(candidate_roles) == 1:
         c = candidate_roles[0]
         chosen_role = ChosenRole(
             source="single_candidate",
@@ -3184,7 +3258,7 @@ async def extract_skill_details_endpoint(req: ExtractDetailsRequest):
             role_archetype=c.role_archetype,
             rationale=c.rationale,
         )
-    elif len(candidate_roles) > 1:
+    elif chosen_role is None and len(candidate_roles) > 1:
         # Build raw payload, then deduplicate by normalised slug (backend_engineer
         # and backend-engineer are the same role), preferring DB candidates.
         _raw_payload: list[dict] = []
