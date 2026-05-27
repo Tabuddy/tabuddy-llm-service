@@ -212,12 +212,20 @@ def no_skills_in_scope(
                 if f" {alias} " in lower_text:
                     out.append(
                         {
-                            "level": "error",
+                            # Warning, not error — charters for cross-platform / cross-stack
+                            # roles legitimately reference other catalog skills (React Native
+                            # mentions iOS/Android as target platforms; Web Developer
+                            # mentions WordPress/Drupal as content stacks). Per
+                            # `charter_status.decide_charter_status`, warnings are advisory
+                            # and never gate the cascade — the validator output is still
+                            # logged for human review without halting bulk enrichment.
+                            "level": "warning",
                             "code": "skill_in_scope",
                             "location": location,
                             "message": (
                                 f"Skill alias {alias!r} found in {location} — "
-                                "scope statements must be responsibilities, not skills."
+                                "scope statements normally describe responsibilities, "
+                                "not skills."
                             ),
                         }
                     )
@@ -226,12 +234,20 @@ def no_skills_in_scope(
                 if alias in tokens:
                     out.append(
                         {
-                            "level": "error",
+                            # Warning, not error — charters for cross-platform / cross-stack
+                            # roles legitimately reference other catalog skills (React Native
+                            # mentions iOS/Android as target platforms; Web Developer
+                            # mentions WordPress/Drupal as content stacks). Per
+                            # `charter_status.decide_charter_status`, warnings are advisory
+                            # and never gate the cascade — the validator output is still
+                            # logged for human review without halting bulk enrichment.
+                            "level": "warning",
                             "code": "skill_in_scope",
                             "location": location,
                             "message": (
                                 f"Skill alias {alias!r} found in {location} — "
-                                "scope statements must be responsibilities, not skills."
+                                "scope statements normally describe responsibilities, "
+                                "not skills."
                             ),
                         }
                     )
