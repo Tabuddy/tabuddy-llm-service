@@ -4727,16 +4727,26 @@ async def export_jd_pipeline_run(run_id: str, format: str = "clean") -> dict:
         "max": int(exp_obj["max"]) if isinstance(exp_obj.get("max"), (int, float)) else None,
     }
 
-    # ── city (dedup, preserve order) ────────────────────────────────────
-    cities: list[str] = []
-    seen_cities: set[str] = set()
-    for loc in (nano.get("job_locations") or []):
-        if not isinstance(loc, dict):
-            continue
-        city = (loc.get("city") or "").strip()
-        if city and city.lower() not in seen_cities:
-            seen_cities.add(city.lower())
-            cities.append(city)
+    # ── company_name + company_domain (industry) ────────────────────────
+    # Distinct from `role_domain` (Stage 4 role classification). Nano emits
+    # the 25-value industry taxonomy at nano.domain.primary.domain — see
+    # job_parser.txt §2.9.
+    company_name = (nano.get("company_name") or "").strip() or None
+    nano_domain = nano.get("domain") or {}
+    primary_industry = nano_domain.get("primary") or {}
+    company_domain = (primary_industry.get("domain") or "").strip() or None
+
+    # ── city (structured + dedup + canonicalized) ───────────────────────
+    # Static dict catches nano-missed cities + canonicalizes names
+    # (Bangalore→Bengaluru). Nominatim soft-falls back for long-tail global
+    # cities not in the dict. See `geo_cities.py`.
+    from geo_cities import extract_and_resolve_cities
+
+    cities = await asyncio.to_thread(
+        extract_and_resolve_cities,
+        nano.get("job_locations") or [],
+        row.get("jd_text") or "",
+    )
 
     # ── salary ───────────────────────────────────────────────────────────
     ctc = nano.get("ctc") or {}
@@ -4784,7 +4794,9 @@ async def export_jd_pipeline_run(run_id: str, format: str = "clean") -> dict:
         "run_id": str(row.get("id")),
         "format": fmt,
         "final_role": final_role,
-        "domain": role_domain,
+        "company_name": company_name,
+        "company_domain": company_domain,
+        "role_domain": role_domain,
         "exp_range": exp_range,
         "city": cities,
         "salary": salary,

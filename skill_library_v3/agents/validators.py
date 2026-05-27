@@ -152,18 +152,24 @@ def no_skills_in_scope(
     for whole-token or whole-phrase hits in each scope string. Empty
     ``alias_lookup`` (fresh DB, no skills loaded yet) is a no-op.
 
-    Three exemptions stack on top of the raw alias set:
+    Four exemptions stack on top of the raw alias set:
 
     1. **Role-name tokens.** For "Azure Cloud Engineer" the word "azure" in
        the definition is the role's identity, not a skill leak. Strip
        role-name tokens (and the full role name) from the alias set.
 
-    2. **Generic-noun stop-list** (``_GENERIC_NOUN_STOPLIST``). Some catalog
+    2. **Multi-word aliases that substring the role name.** For "React
+       Native Developer" the multi-word alias "react native" appears in
+       the charter definition by necessity — it's the role's own name.
+       The token-based exemption above only covers single-word tokens;
+       multi-word aliases needed their own substring-of-role-name check.
+
+    3. **Generic-noun stop-list** (``_GENERIC_NOUN_STOPLIST``). Some catalog
        skill names are everyday English nouns ("notifications", "move",
        "automation"). These produced ~8/23 false positives in the first
        prod cohort; the stop-list pre-emptively drops them.
 
-    3. **Per-task owner tokens.** For ``out_of_scope[i].task`` only,
+    4. **Per-task owner tokens.** For ``out_of_scope[i].task`` only,
        aliases that are tokens of the same item's ``owned_by`` field are
        exempt — a charter that says "Operate Azure infrastructure"
        owned_by "Azure Cloud Engineer" is naming the boundary, not
@@ -179,6 +185,12 @@ def no_skills_in_scope(
         and a != role_name_lower
         and a not in _GENERIC_NOUN_STOPLIST
         and (" " in a or a not in role_name_tokens)
+        # Multi-word aliases that are substrings of the role name itself
+        # are the role's identity, not skill leaks ("react native" inside
+        # "react native developer", "cloud migration" inside "cloud
+        # migration engineer", etc.). Single-word substrings are already
+        # filtered by `a not in role_name_tokens` above.
+        and not (" " in a and a in role_name_lower)
     }
     if not effective_aliases:
         return []

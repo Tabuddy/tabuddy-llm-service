@@ -12,9 +12,10 @@ will eventually map these to skill_nature when writing to canonical_skills.
 
 from __future__ import annotations
 
-from typing import Literal
+import json
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 TYPOLOGY_VALUES: tuple[str, ...] = (
@@ -97,6 +98,42 @@ class TypedSkill(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=20, max_length=600)
     alternatives_considered: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("alternatives_considered", mode="before")
+    @classmethod
+    def _coerce_alternatives(cls, v: Any) -> Any:
+        """Coerce dict alternatives to flat strings.
+
+        Some LLM responses emit ``alternatives_considered`` as objects like
+        ``{"type": "Framework", "reason": "..."}`` instead of plain strings.
+        The schema declares ``list[str]`` so strict pydantic v2 validation
+        rejects dicts — flatten them to ``"<type>: <reason>"`` before
+        validation so we don't lose data nor explode the cascade.
+        """
+        if not isinstance(v, list):
+            return v
+        out: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                t = str(item.get("type") or item.get("name") or "").strip()
+                r = str(
+                    item.get("reason")
+                    or item.get("rationale")
+                    or item.get("description")
+                    or ""
+                ).strip()
+                if t and r:
+                    out.append(f"{t}: {r}")
+                elif t or r:
+                    out.append(t or r)
+                else:
+                    # Fallback — JSON-dump the dict so we don't lose info.
+                    out.append(json.dumps(item, ensure_ascii=False))
+            else:
+                out.append(str(item))
+        return out
 
 
 class TypedSkillBatch(BaseModel):
