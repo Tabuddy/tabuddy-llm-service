@@ -45,6 +45,7 @@ dependencies = [
     "greenlet>=3.0",
     # ── skill_library_v3: Kaggle JD ingest for charter prompt grounding ──────
     "kagglehub>=0.3.0",
+    "geopy>=2.4.1",
 ]
 
 [dependency-groups]
