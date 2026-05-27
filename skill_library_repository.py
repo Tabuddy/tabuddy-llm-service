@@ -1144,25 +1144,61 @@ class SkillLibraryRepository:
                 cur.execute(sql)
                 return self._rows_to_dicts(cur, cur.fetchall())
 
+    # Two-stage display filter:
+    #
+    #   1. CURATION (applied INSIDE the LIMIT 2639 subquery): picks the
+    #      curated set of rows we'd ever consider showing. Order matters —
+    #      LIMIT prunes based on this ORDER BY, so changing it changes
+    #      which 2639 rows make the cut.
+    #
+    #   2. POST-CURATION (applied AFTER the LIMIT): soft-delete +
+    #      user-supplied search. These filters narrow the curated set,
+    #      so the displayed `total` is at most 2639 and shrinks as rows
+    #      get soft-deleted or filtered out by search.
+    #
+    # ``is_deleted IS NOT TRUE`` (rather than ``!= true``) intentionally
+    # keeps rows where the column is NULL — only explicit ``TRUE`` is
+    # treated as soft-deleted.
+    _LINKEDIN_ROLES_CURATION_FILTER = (
+        "query_match_count IS NOT NULL AND query_match_count > 100"
+    )
+    _LINKEDIN_ROLES_POST_FILTER = "is_deleted IS NOT TRUE"
+    _LINKEDIN_ROLES_CURATION_ORDER = "count ASC NULLS LAST, id ASC"
+    _LINKEDIN_ROLES_HARD_LIMIT = 2639
+
     @staticmethod
-    def _linkedin_roles_search_clause(q: str | None) -> tuple[str, list]:
-        """ILIKE on display_name + slug (trigram index); exact id match when q is all digits."""
+    def _linkedin_roles_search_extra(q: str | None) -> tuple[str, list]:
+        """Optional search clauses applied AFTER curation. Returns the
+        SQL fragment with a leading ``AND`` (or empty string) and the
+        positional params. ILIKE on display_name/slug uses the trigram
+        index; exact id match when q is all digits.
+        """
         term = (q or "").strip()
         if not term:
             return "", []
         like = f"%{term}%"
-        # LOWER(display_name) ILIKE uses the GIN trigram index
         parts = ["LOWER(display_name) LIKE LOWER(%s)", "slug ILIKE %s"]
         params: list = [like, like]
         if term.isdigit():
             parts.append("id = %s")
             params.append(int(term))
-        return " WHERE (" + " OR ".join(parts) + ")", params
+        return " AND (" + " OR ".join(parts) + ")", params
 
     def count_linkedin_roles(self, q: str | None = None) -> int:
-        """Separate count — used only when caller needs total without fetching rows."""
-        where_sql, params = self._linkedin_roles_search_clause(q)
-        sql = f"SELECT COUNT(*) FROM {self.schema}.linkedin_roles{where_sql}"
+        """Separate count — used only when caller needs total without
+        fetching rows. Counts within the curated 2639 ∩ post-filter set."""
+        search_extra_sql, params = self._linkedin_roles_search_extra(q)
+        sql = f"""
+            SELECT COUNT(*) FROM (
+                SELECT id, slug, display_name, is_deleted
+                  FROM {self.schema}.linkedin_roles
+                 WHERE {self._LINKEDIN_ROLES_CURATION_FILTER}
+                 ORDER BY {self._LINKEDIN_ROLES_CURATION_ORDER}
+                 LIMIT {self._LINKEDIN_ROLES_HARD_LIMIT}
+            ) AS curated
+            WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+            {search_extra_sql}
+        """
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params) if params else None)
@@ -1197,61 +1233,60 @@ class SkillLibraryRepository:
     ) -> tuple[list[dict], int]:
         """Rows + total count in a single connection.
 
-        No-search: approximate total via pg_class (instant, ~4.5M rows case).
-        With search: exact total via COUNT(*) OVER() in the same query.
-        Returns (rows, total).
+        Two-stage filter:
+          1. Curate the top ``_LINKEDIN_ROLES_HARD_LIMIT`` (2639) rows
+             matching ``query_match_count > 100``, ordered by ``count
+             ASC``. This is a stable curated set that doesn't shift as
+             rows get soft-deleted.
+          2. From that 2639 apply ``is_deleted IS NOT TRUE`` + optional
+             search. Returned ``total`` is the count after stage 2 —
+             so as rows are soft-deleted the total shrinks from 2639.
         """
-        where_sql, params = self._linkedin_roles_search_clause(q)
-        is_search = bool((q or "").strip())
+        search_extra_sql, search_params = self._linkedin_roles_search_extra(q)
         dir_ = "DESC" if sort == "desc" else "ASC"
+        hard_cap = self._LINKEDIN_ROLES_HARD_LIMIT
 
-        if is_search:
-            # COUNT(*) OVER() gives exact filtered total in one pass (trigram index used)
-            row_params = [*params]
-            lim_sql = ""
-            if limit is not None and limit > 0:
-                lim_sql = " LIMIT %s OFFSET %s"
-                row_params = [*row_params, int(limit), max(0, int(offset))]
-            sql = f"""
-                SELECT id, slug, display_name, created_at,
-                       COUNT(*) OVER() AS _total
-                  FROM {self.schema}.linkedin_roles
-                 {where_sql}
-                 ORDER BY LOWER(display_name) {dir_}, id {dir_}
-                 {lim_sql}
-            """
-            with self._connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, tuple(row_params))
-                    raw = cur.fetchall()
-                if not raw:
-                    return [], 0
-                cols = [d[0] for d in cur.description]
-                total = int(raw[0][cols.index("_total")])
-                rows = []
-                for r in raw:
-                    d = dict(zip(cols, r))
-                    d.pop("_total", None)
-                    rows.append(d)
-            return rows, total
-        else:
-            # No filter: use approximate count (instant) + separate paginated SELECT
-            lim_sql = ""
-            row_params: list = []
-            if limit is not None and limit > 0:
-                lim_sql = " LIMIT %s OFFSET %s"
-                row_params = [int(limit), max(0, int(offset))]
-            sql = f"""
-                SELECT id, slug, display_name, created_at
-                  FROM {self.schema}.linkedin_roles
-                 ORDER BY LOWER(display_name) {dir_}, id {dir_}
-                 {lim_sql}
-            """
-            with self._connect() as conn:
-                total = self._linkedin_roles_approx_total(conn)
-                with conn.cursor() as cur:
-                    cur.execute(sql, tuple(row_params) if row_params else None)
-                    return self._rows_to_dicts(cur, cur.fetchall()), total
+        offset_int = max(0, int(offset))
+        requested = int(limit) if (limit is not None and limit > 0) else hard_cap
+        # Outer page size: can't exceed hard_cap (since at most 2639 rows
+        # survive stage 1). The actual returned count may be smaller if
+        # stage-2 filtering trims further.
+        effective_limit = min(requested, hard_cap)
+
+        # COUNT(*) OVER() runs against the OUTER set (post-curation,
+        # post-stage-2-filters), so total reflects what the user can
+        # actually see / page through.
+        row_params = [*search_params, effective_limit, offset_int]
+        sql = f"""
+            SELECT id, slug, display_name, created_at, count, query_match_count,
+                   COUNT(*) OVER() AS _total
+              FROM (
+                  SELECT id, slug, display_name, created_at, count,
+                         query_match_count, is_deleted
+                    FROM {self.schema}.linkedin_roles
+                   WHERE {self._LINKEDIN_ROLES_CURATION_FILTER}
+                   ORDER BY {self._LINKEDIN_ROLES_CURATION_ORDER}
+                   LIMIT {hard_cap}
+              ) AS curated
+             WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+             {search_extra_sql}
+             ORDER BY count {dir_} NULLS LAST, id {dir_}
+             LIMIT %s OFFSET %s
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(row_params))
+                raw = cur.fetchall()
+            if not raw:
+                return [], 0
+            cols = [d[0] for d in cur.description]
+            total = int(raw[0][cols.index("_total")])
+            rows = []
+            for r in raw:
+                d = dict(zip(cols, r))
+                d.pop("_total", None)
+                rows.append(d)
+        return rows, total
 
     def display_name_exists_in_role_aliases(self, display_name: str) -> bool:
         """Case-insensitive: ``linkedin_roles.display_name`` vs ``role_aliases.alias_lower``."""

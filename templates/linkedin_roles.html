@@ -210,12 +210,17 @@
         <thead>
           <tr>
             <th class="id-col">ID</th>
-            <th>
+            <th>Display name</th>
+            {#
+              Display-name sort UI hidden — the underlying query now orders
+              by `count`, so a display-name sort toggle would be misleading.
+              Re-enable later by restoring the <a class="th-sort"> block:
+
               <a class="th-sort" href="/linkedin-role?limit={{ limit }}&sort={{ toggle_sort }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}"
                  title="Sort {{ 'Z → A' if sort == 'asc' else 'A → Z' }}">
                 Display name<span class="sort-icon">{{ '▲' if sort == 'asc' else '▼' }}</span>
               </a>
-            </th>
+            #}
             <th>Created at</th>
             <th class="actions-col" aria-label="Actions"></th>
           </tr>

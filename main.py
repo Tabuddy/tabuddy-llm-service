@@ -5749,8 +5749,11 @@ async def linkedin_role_ui(
     limit: int = 500,
     offset: int = 0,
 ):
-    """Read-only table of ``linkedin_roles`` (id, display_name, created_at)."""
-    limit = min(max(1, limit), 2000)
+    """Read-only table of curated ``linkedin_roles`` (display set capped
+    at 2639 — see ``SkillLibraryRepository._LINKEDIN_ROLES_HARD_LIMIT``)."""
+    # Cap matches the repo's hard limit so a single-page request can pull
+    # the entire curated set when the user asks for it.
+    limit = min(max(1, limit), 2639)
     offset = max(0, offset)
     search_q = (q or "").strip()
     sort = "desc" if sort == "desc" else "asc"
@@ -5811,7 +5814,7 @@ async def api_linkedin_roles(
     offset: int = 0,
 ):
     """JSON list of ``linkedin_roles`` for clients."""
-    limit = min(max(1, limit), 2000)
+    limit = min(max(1, limit), 2639)
     offset = max(0, offset)
     search_q = (q or "").strip()
     repo = SkillLibraryRepository()
