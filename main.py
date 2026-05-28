@@ -5746,6 +5746,7 @@ async def linkedin_role_ui(
     request: Request,
     q: str = "",
     sort: str = "asc",
+    sort_by: str = "display_name",
     limit: int = 500,
     offset: int = 0,
 ):
@@ -5754,12 +5755,14 @@ async def linkedin_role_ui(
     offset = max(0, offset)
     search_q = (q or "").strip()
     sort = "desc" if sort == "desc" else "asc"
+    sort_by = sort_by if sort_by in ("display_name", "occurrence_count") else "display_name"
     repo = SkillLibraryRepository()
     try:
         rows, total = await asyncio.to_thread(
             repo.list_linkedin_roles,
             q=search_q or None,
             sort=sort,
+            sort_by=sort_by,
             limit=limit,
             offset=offset,
         )
@@ -5778,13 +5781,25 @@ async def linkedin_role_ui(
                 "id": r.get("id"),
                 "display_name": r.get("display_name") or "",
                 "created_at": created,
+                "occurrence_count": r.get("query_match_count"),
             }
         )
     has_prev = offset > 0
     has_next = offset + len(display_rows) < total
     prev_offset = max(0, offset - limit)
     next_offset = offset + limit
-    toggle_sort = "desc" if sort == "asc" else "asc"
+
+    def _next_sort(col: str, default_dir: str) -> str:
+        # Clicking the currently-active column toggles direction;
+        # clicking any other column resets to its semantic default
+        # (asc for names, desc for popularity-style counts).
+        if sort_by == col:
+            return "desc" if sort == "asc" else "asc"
+        return default_dir
+
+    name_next_sort = _next_sort("display_name", "asc")
+    occurrence_next_sort = _next_sort("occurrence_count", "desc")
+
     return templates.TemplateResponse(
         request,
         "linkedin_roles.html",
@@ -5794,7 +5809,9 @@ async def linkedin_role_ui(
             "limit": limit,
             "offset": offset,
             "sort": sort,
-            "toggle_sort": toggle_sort,
+            "sort_by": sort_by,
+            "name_next_sort": name_next_sort,
+            "occurrence_next_sort": occurrence_next_sort,
             "has_prev": has_prev,
             "has_next": has_next,
             "prev_offset": prev_offset,
