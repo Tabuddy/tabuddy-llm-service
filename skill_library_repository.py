@@ -1144,34 +1144,24 @@ class SkillLibraryRepository:
                 cur.execute(sql)
                 return self._rows_to_dicts(cur, cur.fetchall())
 
-    # Two-stage display filter:
-    #
-    #   1. CURATION (applied INSIDE the LIMIT 2639 subquery): picks the
-    #      curated set of rows we'd ever consider showing. Order matters —
-    #      LIMIT prunes based on this ORDER BY, so changing it changes
-    #      which 2639 rows make the cut.
-    #
-    #   2. POST-CURATION (applied AFTER the LIMIT): soft-delete +
-    #      user-supplied search. These filters narrow the curated set,
-    #      so the displayed `total` is at most 2639 and shrinks as rows
-    #      get soft-deleted or filtered out by search.
-    #
-    # ``is_deleted IS NOT TRUE`` (rather than ``!= true``) intentionally
-    # keeps rows where the column is NULL — only explicit ``TRUE`` is
-    # treated as soft-deleted.
-    _LINKEDIN_ROLES_CURATION_FILTER = (
-        "query_match_count IS NOT NULL AND query_match_count > 100"
+    # Display filter — only show roles that (a) have an accurate
+    # substring-based match count above the popularity threshold and
+    # (b) haven't been soft-deleted.
+    # ``IS NOT TRUE`` (rather than ``!= true``) intentionally keeps rows
+    # where the column is NULL — only explicit ``TRUE`` is treated as
+    # soft-deleted.
+    _LINKEDIN_ROLES_POST_FILTER = (
+        "query_match_count IS NOT NULL "
+        "AND query_match_count > 100 "
+        "AND is_deleted IS NOT TRUE"
     )
-    _LINKEDIN_ROLES_POST_FILTER = "is_deleted IS NOT TRUE"
-    _LINKEDIN_ROLES_CURATION_ORDER = "count ASC NULLS LAST, id ASC"
-    _LINKEDIN_ROLES_HARD_LIMIT = 2639
 
     @staticmethod
     def _linkedin_roles_search_extra(q: str | None) -> tuple[str, list]:
-        """Optional search clauses applied AFTER curation. Returns the
-        SQL fragment with a leading ``AND`` (or empty string) and the
-        positional params. ILIKE on display_name/slug uses the trigram
-        index; exact id match when q is all digits.
+        """Optional search clauses appended to the soft-delete filter.
+        Returns the SQL fragment with a leading ``AND`` (or empty string)
+        and the positional params. ILIKE on display_name/slug uses the
+        trigram index; exact id match when q is all digits.
         """
         term = (q or "").strip()
         if not term:
@@ -1186,18 +1176,13 @@ class SkillLibraryRepository:
 
     def count_linkedin_roles(self, q: str | None = None) -> int:
         """Separate count — used only when caller needs total without
-        fetching rows. Counts within the curated 2639 ∩ post-filter set."""
+        fetching rows. Filters out soft-deleted rows."""
         search_extra_sql, params = self._linkedin_roles_search_extra(q)
         sql = f"""
-            SELECT COUNT(*) FROM (
-                SELECT id, slug, display_name, is_deleted
-                  FROM {self.schema}.linkedin_roles
-                 WHERE {self._LINKEDIN_ROLES_CURATION_FILTER}
-                 ORDER BY {self._LINKEDIN_ROLES_CURATION_ORDER}
-                 LIMIT {self._LINKEDIN_ROLES_HARD_LIMIT}
-            ) AS curated
-            WHERE {self._LINKEDIN_ROLES_POST_FILTER}
-            {search_extra_sql}
+            SELECT COUNT(*)
+              FROM {self.schema}.linkedin_roles
+             WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+             {search_extra_sql}
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -1233,45 +1218,28 @@ class SkillLibraryRepository:
     ) -> tuple[list[dict], int]:
         """Rows + total count in a single connection.
 
-        Two-stage filter:
-          1. Curate the top ``_LINKEDIN_ROLES_HARD_LIMIT`` (2639) rows
-             matching ``query_match_count > 100``, ordered by ``count
-             ASC``. This is a stable curated set that doesn't shift as
-             rows get soft-deleted.
-          2. From that 2639 apply ``is_deleted IS NOT TRUE`` + optional
-             search. Returned ``total`` is the count after stage 2 —
-             so as rows are soft-deleted the total shrinks from 2639.
+        Single-stage filter: ``is_deleted IS NOT TRUE`` plus optional
+        search. Orders by display_name asc/desc per the ``sort`` param.
+        The ``total`` returned is the exact post-filter count.
         """
         search_extra_sql, search_params = self._linkedin_roles_search_extra(q)
         dir_ = "DESC" if sort == "desc" else "ASC"
-        hard_cap = self._LINKEDIN_ROLES_HARD_LIMIT
 
         offset_int = max(0, int(offset))
-        requested = int(limit) if (limit is not None and limit > 0) else hard_cap
-        # Outer page size: can't exceed hard_cap (since at most 2639 rows
-        # survive stage 1). The actual returned count may be smaller if
-        # stage-2 filtering trims further.
-        effective_limit = min(requested, hard_cap)
+        lim_sql = ""
+        row_params: list = [*search_params]
+        if limit is not None and limit > 0:
+            lim_sql = " LIMIT %s OFFSET %s"
+            row_params += [int(limit), offset_int]
 
-        # COUNT(*) OVER() runs against the OUTER set (post-curation,
-        # post-stage-2-filters), so total reflects what the user can
-        # actually see / page through.
-        row_params = [*search_params, effective_limit, offset_int]
         sql = f"""
             SELECT id, slug, display_name, created_at, count, query_match_count,
                    COUNT(*) OVER() AS _total
-              FROM (
-                  SELECT id, slug, display_name, created_at, count,
-                         query_match_count, is_deleted
-                    FROM {self.schema}.linkedin_roles
-                   WHERE {self._LINKEDIN_ROLES_CURATION_FILTER}
-                   ORDER BY {self._LINKEDIN_ROLES_CURATION_ORDER}
-                   LIMIT {hard_cap}
-              ) AS curated
+              FROM {self.schema}.linkedin_roles
              WHERE {self._LINKEDIN_ROLES_POST_FILTER}
              {search_extra_sql}
-             ORDER BY count {dir_} NULLS LAST, id {dir_}
-             LIMIT %s OFFSET %s
+             ORDER BY LOWER(display_name) {dir_}, id {dir_}
+             {lim_sql}
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -1393,10 +1361,19 @@ class SkillLibraryRepository:
         return written
 
     def delete_linkedin_roles_row(self, linkedin_role_id: int) -> bool:
-        """Remove a duplicate row from ``linkedin_roles`` staging only."""
+        """Soft-delete a row from ``linkedin_roles`` by flipping
+        ``is_deleted = TRUE``. The row stays in the table (so we can
+        un-delete or audit later) but is hidden by the
+        ``_LINKEDIN_ROLES_POST_FILTER`` applied in list/count queries.
+
+        Returns False if the id doesn't exist OR is already soft-deleted
+        — that way the route returns 404 in either case rather than
+        silently no-op'ing a repeat click."""
         sql = f"""
-            DELETE FROM {self.schema}.linkedin_roles
+            UPDATE {self.schema}.linkedin_roles
+               SET is_deleted = TRUE
              WHERE id = %s
+               AND is_deleted IS NOT TRUE
         """
         with self._connect() as conn:
             with conn.cursor() as cur:

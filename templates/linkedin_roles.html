@@ -55,6 +55,7 @@
     }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(108, 92, 231, 0.06); }
+    .sn-col { width: 4rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
     .id-col { width: 6rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
     .empty { padding: 2rem; text-align: center; color: var(--text-dim); }
     a.back { color: var(--primary); text-decoration: none; font-size: 0.85rem; }
@@ -209,18 +210,14 @@
       <table>
         <thead>
           <tr>
+            <th class="sn-col">S.No</th>
             <th class="id-col">ID</th>
-            <th>Display name</th>
-            {#
-              Display-name sort UI hidden — the underlying query now orders
-              by `count`, so a display-name sort toggle would be misleading.
-              Re-enable later by restoring the <a class="th-sort"> block:
-
+            <th>
               <a class="th-sort" href="/linkedin-role?limit={{ limit }}&sort={{ toggle_sort }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}"
                  title="Sort {{ 'Z → A' if sort == 'asc' else 'A → Z' }}">
                 Display name<span class="sort-icon">{{ '▲' if sort == 'asc' else '▼' }}</span>
               </a>
-            #}
+            </th>
             <th>Created at</th>
             <th class="actions-col" aria-label="Actions"></th>
           </tr>
@@ -228,6 +225,7 @@
         <tbody id="rolesBody">
           {% for row in rows %}
           <tr data-role-id="{{ row.id }}">
+            <td class="sn-col">{{ offset + loop.index }}</td>
             <td class="id-col">{{ row.id }}</td>
             <td>{{ row.display_name }}</td>
             <td>{{ row.created_at or "—" }}</td>
