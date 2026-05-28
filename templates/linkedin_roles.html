@@ -57,6 +57,8 @@
     tr:hover td { background: rgba(108, 92, 231, 0.06); }
     .sn-col { width: 4rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
     .id-col { width: 6rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+    .num-col { width: 10rem; font-variant-numeric: tabular-nums; text-align: right; }
+    th.num-col { text-align: right; }
     .empty { padding: 2rem; text-align: center; color: var(--text-dim); }
     a.back { color: var(--primary); text-decoration: none; font-size: 0.85rem; }
     a.back:hover { text-decoration: underline; }
@@ -186,12 +188,13 @@
     <form class="search-bar" method="get" action="/linkedin-role" role="search">
       <input type="hidden" name="limit" value="{{ limit }}">
       <input type="hidden" name="sort" value="{{ sort }}">
+      <input type="hidden" name="sort_by" value="{{ sort_by }}">
       <input type="search" name="q" value="{{ search_q }}"
              placeholder="Search display name, slug, or id…"
              autocomplete="off" aria-label="Search LinkedIn roles">
       <button type="submit" class="search-btn">Search</button>
       {% if search_q %}
-      <a class="search-clear" href="/linkedin-role?limit={{ limit }}&sort={{ sort }}">Clear</a>
+      <a class="search-clear" href="/linkedin-role?limit={{ limit }}&sort_by={{ sort_by }}&sort={{ sort }}">Clear</a>
       {% endif %}
     </form>
     <p class="meta" id="metaLine">
@@ -213,9 +216,15 @@
             <th class="sn-col">S.No</th>
             <th class="id-col">ID</th>
             <th>
-              <a class="th-sort" href="/linkedin-role?limit={{ limit }}&sort={{ toggle_sort }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}"
-                 title="Sort {{ 'Z → A' if sort == 'asc' else 'A → Z' }}">
-                Display name<span class="sort-icon">{{ '▲' if sort == 'asc' else '▼' }}</span>
+              <a class="th-sort" href="/linkedin-role?limit={{ limit }}&sort_by=display_name&sort={{ name_next_sort }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}"
+                 title="Sort {{ 'Z → A' if sort_by == 'display_name' and sort == 'asc' else 'A → Z' }}">
+                Display name{% if sort_by == 'display_name' %}<span class="sort-icon">{{ '▲' if sort == 'asc' else '▼' }}</span>{% endif %}
+              </a>
+            </th>
+            <th class="num-col">
+              <a class="th-sort" href="/linkedin-role?limit={{ limit }}&sort_by=occurrence_count&sort={{ occurrence_next_sort }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}"
+                 title="Sort {{ 'lowest first' if sort_by == 'occurrence_count' and sort == 'desc' else 'highest first' }}">
+                Occurrence Count{% if sort_by == 'occurrence_count' %}<span class="sort-icon">{{ '▲' if sort == 'asc' else '▼' }}</span>{% endif %}
               </a>
             </th>
             <th>Created at</th>
@@ -228,6 +237,7 @@
             <td class="sn-col">{{ offset + loop.index }}</td>
             <td class="id-col">{{ row.id }}</td>
             <td>{{ row.display_name }}</td>
+            <td class="num-col">{{ '{:,}'.format(row.occurrence_count) if row.occurrence_count is not none else "—" }}</td>
             <td>{{ row.created_at or "—" }}</td>
             <td class="actions-col">
               <button type="button" class="btn-delete" title="Delete role"
@@ -255,12 +265,12 @@
     <nav class="pager" aria-label="Pagination">
       <div class="pager-btns">
         {% if has_prev %}
-        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&sort={{ sort }}&offset={{ prev_offset }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}">Previous</a>
+        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&sort_by={{ sort_by }}&sort={{ sort }}&offset={{ prev_offset }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}">Previous</a>
         {% else %}
         <span class="pager-btn disabled">Previous</span>
         {% endif %}
         {% if has_next %}
-        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&sort={{ sort }}&offset={{ next_offset }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}">Next</a>
+        <a class="pager-btn" href="/linkedin-role?limit={{ limit }}&sort_by={{ sort_by }}&sort={{ sort }}&offset={{ next_offset }}{% if search_q %}&q={{ search_q|urlencode }}{% endif %}">Next</a>
         {% else %}
         <span class="pager-btn disabled">Next</span>
         {% endif %}
@@ -273,7 +283,8 @@
        data-offset="{{ offset }}"
        data-total="{{ total }}"
        data-search="{{ search_q|e }}"
-       data-sort="{{ sort }}"></div>
+       data-sort="{{ sort }}"
+       data-sort-by="{{ sort_by }}"></div>
   <div id="toast" class="toast" role="alert"></div>
   <script>
     (function () {
@@ -283,9 +294,10 @@
       let totalCount = Number(pageState.total) || 0;
       const searchQ = pageState.search || '';
       const pageSort = pageState.sort || 'asc';
+      const pageSortBy = pageState.sortBy || 'display_name';
 
       function pageQuery(extraOffset) {
-        var qs = '?limit=' + pageLimit + '&sort=' + pageSort + '&offset=' + (extraOffset != null ? extraOffset : pageOffset);
+        var qs = '?limit=' + pageLimit + '&sort_by=' + pageSortBy + '&sort=' + pageSort + '&offset=' + (extraOffset != null ? extraOffset : pageOffset);
         if (searchQ) qs += '&q=' + encodeURIComponent(searchQ);
         return qs;
       }

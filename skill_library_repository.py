@@ -1208,22 +1208,39 @@ class SkillLibraryRepository:
             row = cur.fetchone()
         return int(row[0]) if row and row[0] and row[0] > 0 else 0
 
+    # Whitelist for the sortable columns — used directly in the SQL
+    # string, so values MUST come from this set, not from query params.
+    _LINKEDIN_ROLES_SORT_COLUMNS = {
+        "display_name": "LOWER(display_name)",
+        "occurrence_count": "query_match_count",
+    }
+
     def list_linkedin_roles(
         self,
         *,
         q: str | None = None,
         sort: str = "asc",
+        sort_by: str = "display_name",
         limit: int | None = None,
         offset: int = 0,
     ) -> tuple[list[dict], int]:
         """Rows + total count in a single connection.
 
-        Single-stage filter: ``is_deleted IS NOT TRUE`` plus optional
-        search. Orders by display_name asc/desc per the ``sort`` param.
-        The ``total`` returned is the exact post-filter count.
+        Single-stage filter: ``is_deleted IS NOT TRUE`` plus the
+        popularity threshold and optional search. ``sort_by`` chooses
+        the order column (``display_name`` or ``occurrence_count``);
+        ``sort`` is the direction (``asc`` / ``desc``).
         """
         search_extra_sql, search_params = self._linkedin_roles_search_extra(q)
         dir_ = "DESC" if sort == "desc" else "ASC"
+
+        # Resolve sort column with a default + safe fallback.
+        sort_col_expr = self._LINKEDIN_ROLES_SORT_COLUMNS.get(
+            sort_by, self._LINKEDIN_ROLES_SORT_COLUMNS["display_name"],
+        )
+        # NULLS LAST so rows with null counts sink to the bottom in
+        # either direction (query_match_count is nullable).
+        order_clause = f"ORDER BY {sort_col_expr} {dir_} NULLS LAST, id {dir_}"
 
         offset_int = max(0, int(offset))
         lim_sql = ""
@@ -1238,7 +1255,7 @@ class SkillLibraryRepository:
               FROM {self.schema}.linkedin_roles
              WHERE {self._LINKEDIN_ROLES_POST_FILTER}
              {search_extra_sql}
-             ORDER BY LOWER(display_name) {dir_}, id {dir_}
+             {order_clause}
              {lim_sql}
         """
         with self._connect() as conn:
