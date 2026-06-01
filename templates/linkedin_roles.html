@@ -59,6 +59,35 @@
     .id-col { width: 6rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
     .num-col { width: 10rem; font-variant-numeric: tabular-nums; text-align: right; }
     th.num-col { text-align: right; }
+    .syn-col { min-width: 14rem; max-width: 32rem; }
+    .syn-col.has-syn { cursor: pointer; }
+    .syn-none { color: var(--text-dim); }
+    .syn-details > summary {
+      cursor: pointer;
+      color: #a29bfe;
+      font-size: 0.85rem;
+      user-select: none;
+      list-style: none;
+    }
+    .syn-details > summary::-webkit-details-marker { display: none; }
+    .syn-details > summary::before { content: "▸ "; }
+    .syn-details[open] > summary::before { content: "▾ "; }
+    .syn-details > summary:hover { color: #fff; }
+    .syn-list {
+      margin-top: 0.4rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.3rem;
+    }
+    .syn-pill {
+      display: inline-block;
+      padding: 0.15rem 0.55rem;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+    }
     .empty { padding: 2rem; text-align: center; color: var(--text-dim); }
     a.back { color: var(--primary); text-decoration: none; font-size: 0.85rem; }
     a.back:hover { text-decoration: underline; }
@@ -227,6 +256,7 @@
                 Occurrence Count{% if sort_by == 'occurrence_count' %}<span class="sort-icon">{{ '▲' if sort == 'asc' else '▼' }}</span>{% endif %}
               </a>
             </th>
+            <th class="syn-col">Synonyms</th>
             <th>Created at</th>
             <th class="actions-col" aria-label="Actions"></th>
           </tr>
@@ -238,6 +268,18 @@
             <td class="id-col">{{ row.id }}</td>
             <td>{{ row.display_name }}</td>
             <td class="num-col">{{ '{:,}'.format(row.occurrence_count) if row.occurrence_count is not none else "—" }}</td>
+            <td class="syn-col{% if row.synonyms %} has-syn{% endif %}">
+              {% if row.synonyms %}
+              <details class="syn-details">
+                <summary>{{ row.synonyms|length }} synonym{{ 's' if row.synonyms|length != 1 else '' }}</summary>
+                <div class="syn-list">
+                  {% for s in row.synonyms %}<span class="syn-pill">{{ s }}</span>{% endfor %}
+                </div>
+              </details>
+              {% else %}
+              <span class="syn-none">—</span>
+              {% endif %}
+            </td>
             <td>{{ row.created_at or "—" }}</td>
             <td class="actions-col">
               <button type="button" class="btn-delete" title="Delete role"
@@ -326,6 +368,18 @@
         const end = pageOffset + remainingOnPage;
         metaLine.textContent = 'Rows ' + (pageOffset + 1) + '–' + end + ' of ' + newTotal + ' (' + pageLimit + ' per page)';
       }
+
+      // Click anywhere in the synonyms cell — including on a pill —
+      // toggles the expander. The only exception is the summary
+      // itself, which the browser toggles natively (would otherwise
+      // fire twice and net to no-op).
+      document.querySelectorAll('td.syn-col.has-syn').forEach(function (td) {
+        td.addEventListener('click', function (e) {
+          if (e.target.closest('summary')) return;
+          const details = td.querySelector('details.syn-details');
+          if (details) details.open = !details.open;
+        });
+      });
 
       document.querySelectorAll('.btn-delete').forEach(function (btn) {
         btn.addEventListener('click', async function () {

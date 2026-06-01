@@ -1145,45 +1145,91 @@ class SkillLibraryRepository:
                 return self._rows_to_dicts(cur, cur.fetchall())
 
     # Display filter — only show roles that (a) have an accurate
-    # substring-based match count above the popularity threshold and
-    # (b) haven't been soft-deleted.
+    # substring-based match count above the popularity threshold,
+    # (b) haven't been soft-deleted, and (c) are PRIMARY entries (not
+    # synonyms — those are folded into their primary's row).
     # ``IS NOT TRUE`` (rather than ``!= true``) intentionally keeps rows
     # where the column is NULL — only explicit ``TRUE`` is treated as
     # soft-deleted.
     _LINKEDIN_ROLES_POST_FILTER = (
         "query_match_count IS NOT NULL "
         "AND query_match_count > 100 "
-        "AND is_deleted IS NOT TRUE"
+        "AND is_deleted IS NOT TRUE "
+        "AND synonym_id IS NULL"
     )
 
-    @staticmethod
-    def _linkedin_roles_search_extra(q: str | None) -> tuple[str, list]:
-        """Optional search clauses appended to the soft-delete filter.
-        Returns the SQL fragment with a leading ``AND`` (or empty string)
-        and the positional params. ILIKE on display_name/slug uses the
-        trigram index; exact id match when q is all digits.
+    def _linkedin_roles_search_matching_ids_sql(
+        self, q: str
+    ) -> tuple[str, list]:
+        """Build a UNION-of-indexed-branches subquery that returns the
+        primary ids matched by the search term.
+
+        Each branch can use a dedicated index — trigram on
+        display_name, trigram on slug, partial index on synonym_id —
+        whereas a single ``OR``-joined WHERE would force a sequential
+        recheck of millions of rows. The caller wraps this in a JOIN.
+
+        Branches:
+          1. Primary's display_name matches (trigram on LOWER(display_name))
+          2. Primary's slug matches (trigram on slug)
+          3. A synonym's display_name matches; we surface its primary id
+             (synonym_id) so the user finds the right primary even when
+             only a synonym mentions the term
+          4. Exact id match, when q is all digits
+
+        Returns (sql_subquery, params).
         """
-        term = (q or "").strip()
-        if not term:
-            return "", []
-        like = f"%{term}%"
-        parts = ["LOWER(display_name) LIKE LOWER(%s)", "slug ILIKE %s"]
-        params: list = [like, like]
-        if term.isdigit():
-            parts.append("id = %s")
-            params.append(int(term))
-        return " AND (" + " OR ".join(parts) + ")", params
+        like = f"%{q}%"
+        # IMPORTANT: each branch is JUST the trigram (or synonym_id)
+        # filter, nothing else. The outer WHERE on the JOINed table
+        # enforces synonym_id/is_deleted/query_match_count. Including
+        # those filters here would force Postgres into a BitmapAnd
+        # between the tiny trigram bitmap and the huge `synonym_id IS
+        # NULL` bitmap (4.5M rows), wasting ~140ms per branch.
+        branches = [
+            f"""
+            SELECT id
+              FROM {self.schema}.linkedin_roles
+             WHERE LOWER(display_name) LIKE LOWER(%s)
+            """,
+            f"""
+            SELECT id
+              FROM {self.schema}.linkedin_roles
+             WHERE slug ILIKE %s
+            """,
+            f"""
+            SELECT synonym_id AS id
+              FROM {self.schema}.linkedin_roles
+             WHERE LOWER(display_name) LIKE LOWER(%s)
+               AND synonym_id IS NOT NULL
+            """,
+        ]
+        params: list = [like, like, like]
+        if q.isdigit():
+            branches.append("SELECT %s::bigint AS id")
+            params.append(int(q))
+        return " UNION ".join(branches), params
 
     def count_linkedin_roles(self, q: str | None = None) -> int:
         """Separate count — used only when caller needs total without
-        fetching rows. Filters out soft-deleted rows."""
-        search_extra_sql, params = self._linkedin_roles_search_extra(q)
-        sql = f"""
-            SELECT COUNT(*)
-              FROM {self.schema}.linkedin_roles
-             WHERE {self._LINKEDIN_ROLES_POST_FILTER}
-             {search_extra_sql}
-        """
+        fetching rows. With a search term, uses the UNION-of-indexed-
+        branches subquery for speed."""
+        term = (q or "").strip()
+        if term:
+            match_sql, params = self._linkedin_roles_search_matching_ids_sql(term)
+            sql = f"""
+                SELECT COUNT(*)
+                  FROM {self.schema}.linkedin_roles lr
+                  JOIN ({match_sql}) m ON m.id = lr.id
+                 WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+            """
+        else:
+            sql = f"""
+                SELECT COUNT(*)
+                  FROM {self.schema}.linkedin_roles lr
+                 WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+            """
+            params = []
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params) if params else None)
@@ -1231,7 +1277,6 @@ class SkillLibraryRepository:
         the order column (``display_name`` or ``occurrence_count``);
         ``sort`` is the direction (``asc`` / ``desc``).
         """
-        search_extra_sql, search_params = self._linkedin_roles_search_extra(q)
         dir_ = "DESC" if sort == "desc" else "ASC"
 
         # Resolve sort column with a default + safe fallback.
@@ -1244,20 +1289,54 @@ class SkillLibraryRepository:
 
         offset_int = max(0, int(offset))
         lim_sql = ""
-        row_params: list = [*search_params]
         if limit is not None and limit > 0:
             lim_sql = " LIMIT %s OFFSET %s"
-            row_params += [int(limit), offset_int]
 
-        sql = f"""
-            SELECT id, slug, display_name, created_at, count, query_match_count,
-                   COUNT(*) OVER() AS _total
-              FROM {self.schema}.linkedin_roles
-             WHERE {self._LINKEDIN_ROLES_POST_FILTER}
-             {search_extra_sql}
-             {order_clause}
-             {lim_sql}
+        # The synonyms-list subquery — same in both code paths.
+        synonyms_subq = f"""
+            COALESCE(
+                (SELECT array_agg(syn.display_name
+                                  ORDER BY syn.query_match_count DESC NULLS LAST)
+                   FROM {self.schema}.linkedin_roles syn
+                  WHERE syn.synonym_id = lr.id
+                    AND syn.is_deleted IS NOT TRUE),
+                ARRAY[]::text[]
+            ) AS synonyms
         """
+
+        term = (q or "").strip()
+        if term:
+            # Search path: pre-filter via a UNION of indexed branches
+            # (display_name trigram, slug trigram, synonym lookup, id).
+            # Postgres uses each branch's index without the cross-OR
+            # planner penalty, so this is fast even with 1.6M rows.
+            match_sql, search_params = self._linkedin_roles_search_matching_ids_sql(term)
+            sql = f"""
+                SELECT lr.id, lr.slug, lr.display_name, lr.created_at,
+                       lr.count, lr.query_match_count,
+                       {synonyms_subq},
+                       COUNT(*) OVER() AS _total
+                  FROM {self.schema}.linkedin_roles lr
+                  JOIN ({match_sql}) m ON m.id = lr.id
+                 WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+                 {order_clause}
+                 {lim_sql}
+            """
+            row_params: list = [*search_params]
+        else:
+            sql = f"""
+                SELECT lr.id, lr.slug, lr.display_name, lr.created_at,
+                       lr.count, lr.query_match_count,
+                       {synonyms_subq},
+                       COUNT(*) OVER() AS _total
+                  FROM {self.schema}.linkedin_roles lr
+                 WHERE {self._LINKEDIN_ROLES_POST_FILTER}
+                 {order_clause}
+                 {lim_sql}
+            """
+            row_params = []
+        if lim_sql:
+            row_params += [int(limit), offset_int]
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(row_params))

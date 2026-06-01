@@ -5782,6 +5782,7 @@ async def linkedin_role_ui(
                 "display_name": r.get("display_name") or "",
                 "created_at": created,
                 "occurrence_count": r.get("query_match_count"),
+                "synonyms": r.get("synonyms") or [],
             }
         )
     has_prev = offset > 0
