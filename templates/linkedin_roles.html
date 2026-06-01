@@ -381,6 +381,19 @@
         });
       });
 
+      // When a synonyms expander closes, bring the row back into view.
+      // A 100+ pill list can push the row off the top of the viewport
+      // as the user scrolls; on close, the scroll position lingers
+      // far below the row that was just collapsed. ``block: 'nearest'``
+      // is a no-op when the row is already visible.
+      document.querySelectorAll('td.syn-col details.syn-details').forEach(function (details) {
+        details.addEventListener('toggle', function () {
+          if (details.open) return;
+          const tr = details.closest('tr');
+          if (tr) tr.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        });
+      });
+
       document.querySelectorAll('.btn-delete').forEach(function (btn) {
         btn.addEventListener('click', async function () {
           const id = btn.getAttribute('data-id');
